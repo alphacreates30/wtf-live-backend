@@ -24,7 +24,7 @@ app.use(express.json());
 
 // ── Clients ──
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
 const JWT_SECRET = process.env.JWT_SECRET || 'change-me-in-production';
 const ADMIN_USERNAME = 'whatthefind';
