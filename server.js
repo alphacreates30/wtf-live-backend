@@ -6,6 +6,7 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { createClient } = require('@supabase/supabase-js');
+const { AccessToken } = require('livekit-server-sdk');
 
 const app = express();
 const server = http.createServer(app);
@@ -172,6 +173,16 @@ app.post('/auction', requireAuth, async (req, res) => {
 
   if (error) return res.status(500).json({ error: 'Failed to create auction' });
   res.status(201).json(data);
+});
+
+// ── LiveKit token ──
+app.get('/auction/:id/token', requireAuth, async (req, res) => {
+  const { data: auction } = await supabase.from('auctions').select('host_username').eq('id', req.params.id).single();
+  if (!auction) return res.status(404).json({ error: 'Auction not found' });
+  const isHost = auction.host_username === req.user.username;
+  const at = new AccessToken(process.env.LIVEKIT_API_KEY, process.env.LIVEKIT_API_SECRET, { identity: req.user.username, ttl: '4h' });
+  at.addGrant({ roomJoin: true, room: 'auction-' + req.params.id, canPublish: isHost, canSubscribe: true, canPublishData: true });
+  res.json({ token: await at.toJwt(), room: 'auction-' + req.params.id, url: process.env.LIVEKIT_URL, isHost });
 });
 
 // ── Get bid history for an auction ──
