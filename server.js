@@ -17,19 +17,19 @@ const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] }
 });
 
-// Ã¢ÂÂÃ¢ÂÂ Stripe webhook needs raw body Ã¢ÂÂÃ¢ÂÂ
+// ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Stripe webhook needs raw body ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
 app.use('/webhook/stripe', express.raw({ type: 'application/json' }));
 app.use(cors());
 app.use(express.json());
 
-// Ã¢ÂÂÃ¢ÂÂ Clients Ã¢ÂÂÃ¢ÂÂ
+// ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Clients ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
 const JWT_SECRET = process.env.JWT_SECRET || 'change-me-in-production';
 const ADMIN_USERNAME = 'whatthefind';
 
-// Ã¢ÂÂÃ¢ÂÂ Email transport (Nodemailer Ã¢ÂÂ set SMTP_* env vars or swap for Resend) Ã¢ÂÂÃ¢ÂÂ
+// ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Email transport (Nodemailer ÃÂ¢ÃÂÃÂ set SMTP_* env vars or swap for Resend) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
 const mailer = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.gmail.com',
   port: parseInt(process.env.SMTP_PORT || '587'),
@@ -54,7 +54,7 @@ async function sendAdminEmail(subject, text) {
   }
 }
 
-// Ã¢ÂÂÃ¢ÂÂ Auth middleware Ã¢ÂÂÃ¢ÂÂ
+// ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Auth middleware ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
 function requireAuth(req, res, next) {
   const auth = req.headers.authorization;
   if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing token' });
@@ -77,17 +77,17 @@ function verifySocketToken(token) {
   try { return jwt.verify(token, JWT_SECRET); } catch { return null; }
 }
 
-// Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+// ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
 // REST ENDPOINTS
-// Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+// ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
 
-app.get('/', (req, res) => res.json({ status: 'WhatTheFind Live is running Ã°ÂÂÂ¥' }));
+app.get('/', (req, res) => res.json({ status: 'WhatTheFind Live is running ÃÂ°ÃÂÃÂÃÂ¥' }));
 
-// Ã¢ÂÂÃ¢ÂÂ Auth Ã¢ÂÂÃ¢ÂÂ
+// ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Auth ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
 app.post('/auth/register', async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: 'username and password required' });
-  if (username.length < 3 || username.length > 30) return res.status(400).json({ error: 'Username must be 3Ã¢ÂÂ30 characters' });
+  if (username.length < 3 || username.length > 30) return res.status(400).json({ error: 'Username must be 3ÃÂ¢ÃÂÃÂ30 characters' });
   if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
 
   const password_hash = await bcrypt.hash(password, 10);
@@ -111,14 +111,14 @@ app.post('/auth/login', async (req, res) => {
   res.json({ token, user: { id: user.id, username: user.username, created_at: user.created_at } });
 });
 
-// Ã¢ÂÂÃ¢ÂÂ Profile Ã¢ÂÂÃ¢ÂÂ
+// ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Profile ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
 app.post('/profile', requireAuth, async (req, res) => {
   const { full_name, email, phone, address_line1, address_line2, city, state, zip, country } = req.body;
   if (!full_name || !phone || !address_line1 || !city || !state || !zip) {
     return res.status(400).json({ error: 'full_name, phone, address_line1, city, state, zip are required' });
   }
 
-  // Check if existing profile is already approved/blocked Ã¢ÂÂ don't allow edit
+  // Check if existing profile is already approved/blocked ÃÂ¢ÃÂÃÂ don't allow edit
   const { data: existing } = await supabase.from('profiles').select('status').eq('user_id', req.user.id).single();
   if (existing && (existing.status === 'approved' || existing.status === 'blocked')) {
     return res.status(400).json({ error: `Profile is ${existing.status} and cannot be edited` });
@@ -157,7 +157,7 @@ app.get('/profile', requireAuth, async (req, res) => {
   res.json(data || null);
 });
 
-// Ã¢ÂÂÃ¢ÂÂ Stripe: create SetupIntent (save card on file) Ã¢ÂÂÃ¢ÂÂ
+// ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Stripe: create SetupIntent (save card on file) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
 app.post('/create-setup-intent', requireAuth, async (req, res) => {
   try {
     // Get or create Stripe customer
@@ -171,7 +171,7 @@ app.post('/create-setup-intent', requireAuth, async (req, res) => {
         metadata: { user_id: String(req.user.id), username: req.user.username },
       });
       customerId = customer.id;
-      // Store customer ID Ã¢ÂÂ profile may not exist yet so use upsert
+      // Store customer ID ÃÂ¢ÃÂÃÂ profile may not exist yet so use upsert
       await supabase.from('profiles').upsert({ user_id: String(req.user.id), stripe_customer_id: customerId }, { onConflict: 'user_id' });
     }
 
@@ -206,7 +206,7 @@ app.post('/save-payment-method', requireAuth, async (req, res) => {
   }
 });
 
-// Ã¢ÂÂÃ¢ÂÂ Stripe: charge winner Ã¢ÂÂÃ¢ÂÂ
+// ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Stripe: charge winner ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
 app.post('/charge-winner', requireAuth, async (req, res) => {
   const { auction_id, winner_username, amount_cents } = req.body;
   if (!auction_id || !winner_username || !amount_cents) {
@@ -244,17 +244,17 @@ app.post('/charge-winner', requireAuth, async (req, res) => {
     res.json({ success: true, payment_intent_id: paymentIntent.id });
   } catch (e) {
     console.error('Charge error:', e.message);
-    // Flag payment failed Ã¢ÂÂ buyer stays approved, admin decides next steps
+    // Flag payment failed ÃÂ¢ÃÂÃÂ buyer stays approved, admin decides next steps
     await supabase.from('profiles').update({ payment_status: 'failed' }).eq('user_id', String(winner.id));
     await sendAdminEmail(
-      `Ã¢ÂÂ Ã¯Â¸Â Payment failed Ã¢ÂÂ ${winner_username}`,
+      `ÃÂ¢ÃÂÃÂ ÃÂ¯ÃÂ¸ÃÂ Payment failed ÃÂ¢ÃÂÃÂ ${winner_username}`,
       `Payment failed for auction ${auction_id}.\nWinner: ${winner_username}\nAmount: $${(amount_cents / 100).toFixed(2)}\nError: ${e.message}`
     );
     res.status(402).json({ error: 'Payment failed', detail: e.message });
   }
 });
 
-// Ã¢ÂÂÃ¢ÂÂ Stripe webhook Ã¢ÂÂÃ¢ÂÂ
+// ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Stripe webhook ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
 app.post('/webhook/stripe', async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
@@ -270,11 +270,11 @@ app.post('/webhook/stripe', async (req, res) => {
     if (winner_username) {
       const { data: winnerUser } = await supabase.from('users').select('id').eq('username', winner_username).single();
       if (winnerUser) {
-        // Flag only Ã¢ÂÂ buyer stays approved, admin handles manually
+        // Flag only ÃÂ¢ÃÂÃÂ buyer stays approved, admin handles manually
         await supabase.from('profiles').update({ payment_status: 'failed' }).eq('user_id', String(winnerUser.id));
       }
       await sendAdminEmail(
-        `Ã¢ÂÂ Ã¯Â¸Â Stripe payment failed Ã¢ÂÂ ${winner_username}`,
+        `ÃÂ¢ÃÂÃÂ ÃÂ¯ÃÂ¸ÃÂ Stripe payment failed ÃÂ¢ÃÂÃÂ ${winner_username}`,
         `Stripe payment_intent.payment_failed\nWinner: ${winner_username}\nAuction: ${auction_id}\nError: ${pi.last_payment_error?.message || 'unknown'}`
       );
     }
@@ -283,7 +283,7 @@ app.post('/webhook/stripe', async (req, res) => {
   res.json({ received: true });
 });
 
-// Ã¢ÂÂÃ¢ÂÂ Admin: buyers Ã¢ÂÂÃ¢ÂÂ
+// ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Admin: buyers ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
 app.get('/admin/buyers', requireAdmin, async (req, res) => {
   const { data, error } = await supabase
     .from('profiles')
@@ -325,7 +325,7 @@ app.patch('/admin/buyers/:userId', requireAdmin, async (req, res) => {
   res.json(data);
 });
 
-// Ã¢ÂÂÃ¢ÂÂ Auctions Ã¢ÂÂÃ¢ÂÂ
+// ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Auctions ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
 app.get('/auctions', async (req, res) => {
   const { status } = req.query;
   let query = supabase.from('auctions')
@@ -382,9 +382,9 @@ app.get('/auction/:id/chat', async (req, res) => {
   res.json(data);
 });
 
-// Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+// ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
 // AUCTION LIFECYCLE
-// Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+// ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
 
 const viewers = {};
 const auctionTimers = {};
@@ -401,7 +401,8 @@ function startAuctionTimer(auctionId, endsAt) {
       const { data: auction } = await supabase.from('auctions').update({ status: 'ended' }).eq('id', auctionId).eq('status', 'live').select().single();
       if (auction) {
         io.to(auctionId).emit('auction_ended', { auctionId, winner: auction.leading_bidder, final_bid: auction.current_bid });
-        console.log(`Ã°ÂÂÂ Auction ${auctionId} ended Ã¢ÂÂ winner: ${auction.leading_bidder} at $${auction.current_bid}`);
+        await createOrderOnWin(auctionId, auction.leading_bidder, auction.current_bid);
+        console.log(`ÃÂ°ÃÂÃÂÃÂ Auction ${auctionId} ended ÃÂ¢ÃÂÃÂ winner: ${auction.leading_bidder} at $${auction.current_bid}`);
       }
     }
   }, 1000);
@@ -411,17 +412,17 @@ async function resumeLiveAuctions() {
   const { data: liveAuctions } = await supabase.from('auctions').select('id, ends_at').eq('status', 'live');
   if (!liveAuctions) return;
   for (const auction of liveAuctions) {
-    console.log(`Ã¢ÂÂ± Resuming timer for auction ${auction.id}`);
+    console.log(`ÃÂ¢ÃÂÃÂ± Resuming timer for auction ${auction.id}`);
     startAuctionTimer(auction.id, auction.ends_at);
   }
 }
 
-// Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+// ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
 // SOCKET.IO
-// Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+// ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
 
 io.on('connection', (socket) => {
-  console.log(`Ã¢ÂÂ User connected: ${socket.id}`);
+  console.log(`ÃÂ¢ÃÂÃÂ User connected: ${socket.id}`);
 
   socket.on('join_auction', async ({ auctionId, token } = {}) => {
     // Support legacy string-only calls
@@ -475,7 +476,7 @@ io.on('connection', (socket) => {
     const { data: chatHistory } = await supabase.from('chat_messages').select('*').eq('auction_id', auctionId).eq('flagged', false).order('created_at', { ascending: true }).limit(50);
     if (chatHistory) socket.emit('chat_history', chatHistory);
 
-    console.log(`Ã°ÂÂÂ ${socket.id} joined auction ${auctionId} Ã¢ÂÂ ${viewers[auctionId].size} watching`);
+    console.log(`ÃÂ°ÃÂÃÂÃÂ ${socket.id} joined auction ${auctionId} ÃÂ¢ÃÂÃÂ ${viewers[auctionId].size} watching`);
   });
 
   socket.on('place_bid', async ({ auctionId, amount, token }) => {
@@ -494,8 +495,8 @@ io.on('connection', (socket) => {
     if (error || !data.success) { socket.emit('bid_error', { message: (data && data.error) || 'Failed to place bid' }); return; }
 
     io.to(auctionId).emit('new_bid', data.bid);
-    io.to(auctionId).emit('new_chat', { type: 'bid', text: `Ã°ÂÂÂ° ${user.username} bid $${amount}`, auction_id: auctionId, created_at: new Date().toISOString() });
-    console.log(`Ã°ÂÂÂ° ${user.username} bid $${amount} on auction ${auctionId}`);
+    io.to(auctionId).emit('new_chat', { type: 'bid', text: `ÃÂ°ÃÂÃÂÃÂ° ${user.username} bid $${amount}`, auction_id: auctionId, created_at: new Date().toISOString() });
+    console.log(`ÃÂ°ÃÂÃÂÃÂ° ${user.username} bid $${amount} on auction ${auctionId}`);
   });
 
   socket.on('send_chat', async ({ auctionId, text, token }) => {
@@ -517,7 +518,7 @@ io.on('connection', (socket) => {
     io.to(auctionId).emit('new_chat', { id: msg.id, type: 'msg', auction_id: auctionId, username: user.username, text: clean, role, created_at: msg.created_at });
   });
 
-  // Ã¢ÂÂÃ¢ÂÂ Admin: block user mid-auction Ã¢ÂÂÃ¢ÂÂ
+  // ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Admin: block user mid-auction ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
   socket.on('block_user', async ({ targetUserId, targetUsername, auctionId, token }) => {
     const admin = verifySocketToken(token);
     if (!admin || admin.username !== ADMIN_USERNAME) {
@@ -550,7 +551,7 @@ io.on('connection', (socket) => {
     }
 
     socket.emit('block_success', { targetUserId, targetUsername });
-    console.log(`Ã°ÂÂÂ« Admin blocked user ${targetUsername} (${targetUserId}) from auction ${auctionId}`);
+    console.log(`ÃÂ°ÃÂÃÂÃÂ« Admin blocked user ${targetUsername} (${targetUserId}) from auction ${auctionId}`);
   });
 
   socket.on('start_auction', async ({ auctionId, token }) => {
@@ -562,7 +563,7 @@ io.on('connection', (socket) => {
     await supabase.from('auctions').update({ status: 'live', starts_at: new Date().toISOString() }).eq('id', auctionId);
     io.to(auctionId).emit('auction_started', { auctionId });
     startAuctionTimer(auctionId, auction.ends_at);
-    console.log(`Ã¢ÂÂ¶Ã¯Â¸Â Host ${user.username} started auction ${auctionId}`);
+    console.log(`ÃÂ¢ÃÂÃÂ¶ÃÂ¯ÃÂ¸ÃÂ Host ${user.username} started auction ${auctionId}`);
   });
 
   socket.on('end_auction', async ({ auctionId, token }) => {
@@ -573,7 +574,7 @@ io.on('connection', (socket) => {
     if (auctionTimers[auctionId]) { clearInterval(auctionTimers[auctionId]); delete auctionTimers[auctionId]; }
     await supabase.from('auctions').update({ status: 'ended' }).eq('id', auctionId);
     io.to(auctionId).emit('auction_ended', { auctionId, winner: auction.leading_bidder, final_bid: auction.current_bid });
-    console.log(`Ã°ÂÂÂ Host ${user.username} ended auction ${auctionId} early`);
+    console.log(`ÃÂ°ÃÂÃÂÃÂ Host ${user.username} ended auction ${auctionId} early`);
   });
 
   socket.on('extend_auction', async ({ auctionId, extraSeconds, token }) => {
@@ -587,7 +588,7 @@ io.on('connection', (socket) => {
     if (auctionTimers[auctionId]) { clearInterval(auctionTimers[auctionId]); delete auctionTimers[auctionId]; }
     startAuctionTimer(auctionId, newEndsAt);
     io.to(auctionId).emit('auction_extended', { auctionId, new_ends_at: newEndsAt });
-    console.log(`Ã¢ÂÂ© Host ${user.username} extended auction ${auctionId} by ${extraSeconds}s`);
+    console.log(`ÃÂ¢ÃÂÃÂ© Host ${user.username} extended auction ${auctionId} by ${extraSeconds}s`);
   });
 
   socket.on('disconnect', () => {
@@ -601,14 +602,14 @@ io.on('connection', (socket) => {
       userSockets[socket.userId].delete(socket.id);
       if (userSockets[socket.userId].size === 0) delete userSockets[socket.userId];
     }
-    console.log(`Ã¢ÂÂ User disconnected: ${socket.id}`);
+    console.log(`ÃÂ¢ÃÂÃÂ User disconnected: ${socket.id}`);
   });
 });
 
 
-// ââââââââââââââââââââââââââââââââââââââââââââ
+// Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
 // ORDERS & SHIPPO
-// ââââââââââââââââââââââââââââââââââââââââââââ
+// Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
 
 const SHIPPO_API_KEY = process.env.SHIPPO_API_KEY;
 
@@ -648,13 +649,13 @@ async function createOrderOnWin(auctionId, winnerUsername, finalBid) {
       ship_country: profile?.country || 'US',
       status: 'pending',
     });
-    console.log('ð¦ Order created for ' + winnerUsername + ' â auction ' + auctionId);
+    console.log('Ã°ÂÂÂ¦ Order created for ' + winnerUsername + ' Ã¢ÂÂ auction ' + auctionId);
   } catch (e) {
     console.error('Order creation error:', e.message);
   }
 }
 
-// ââ Admin: orders ââ
+// Ã¢ÂÂÃ¢ÂÂ Admin: orders Ã¢ÂÂÃ¢ÂÂ
 app.get('/admin/orders', requireAdmin, async (req, res) => {
   const { data, error } = await supabase
     .from('orders')
@@ -773,7 +774,7 @@ app.post('/webhook/shippo', async (req, res) => {
       if (shippoStatus === 'DELIVERED') status = 'delivered';
       if (status && tracking_number) {
         await supabase.from('orders').update({ status }).eq('tracking_number', tracking_number);
-        console.log('ð¬ Tracking update: ' + tracking_number + ' -> ' + status);
+        console.log('Ã°ÂÂÂ¬ Tracking update: ' + tracking_number + ' -> ' + status);
       }
     }
   } catch (e) {
@@ -784,6 +785,6 @@ app.post('/webhook/shippo', async (req, res) => {
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, async () => {
-  console.log(`Ã°ÂÂÂ WhatTheFind Live server running on port ${PORT}`);
+  console.log(`ÃÂ°ÃÂÃÂÃÂ WhatTheFind Live server running on port ${PORT}`);
   await resumeLiveAuctions();
 });
