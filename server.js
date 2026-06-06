@@ -370,6 +370,14 @@ app.get('/auction/:id/token', requireAuth, async (req, res) => {
   res.json({ token: await at.toJwt(), room: 'auction-' + req.params.id, url: process.env.LIVEKIT_URL, isHost });
 });
 
+
+app.delete('/auction/:id', requireAdmin, async (req, res) => {
+  await supabase.from('auction_items').delete().eq('auction_id', req.params.id);
+  await supabase.from('bids').delete().eq('auction_id', req.params.id);
+  await supabase.from('chat_messages').delete().eq('auction_id', req.params.id);
+  await supabase.from('auctions').delete().eq('id', req.params.id);
+  res.json({ success: true });
+});
 app.get('/auction/:id/bids', async (req, res) => {
   const { data, error } = await supabase.from('bids').select('*').eq('auction_id', req.params.id).order('created_at', { ascending: false }).limit(50);
   if (error) return res.status(500).json({ error });
