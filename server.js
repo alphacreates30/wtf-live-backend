@@ -597,298 +597,16 @@ io.on('connection', (socket) => {
     const user = verifySocketToken(token);
     if (!user || user.username !== ADMIN_USERNAME) return socket.emit('host_error', { message: 'Admin only' });
     await supabase.from('auction_items').update({ status: 'sold' }).eq('auction_id', auctionId).eq('status', 'active');
-    const { data: nextItem } = await supabase.from('auction_items')
-      .select('*').eq('auction_id', auctionId).eq('status', 'pending')
-      .order('position', { ascending: true }).limit(1).single();
+    const { data: nextItem } = await supabase.from('auction_items').select('*').eq('auction_id', auctionId).eq('status', 'pending').order('position', { ascending: true }).limit(1).single();
     if (!nextItem) { io.to(auctionId).emit('items_finished', { auctionId }); return; }
     const { data: preBids } = await supabase.from('pre_bids').select('*').eq('item_id', nextItem.id).order('max_amount', { ascending: false });
     let openingBid = parseFloat(nextItem.starting_bid);
     let openingBidder = null;
-    if (preBids && preBids.length) {
-      openingBid = Math.max(openingBid, parseFloat(preBids[0].max_amount));
-      openingBidder = preBids[0].buyer_username;
-    }
-    const { data: activeItem } = await supabase.from('auction_items').update({
-      status: 'active', current_bid: openingBid, leading_bidder: openingBidder,
-    }).eq('id', nextItem.id).select().single();
+    if (preBids && preBids.length) { openingBid = Math.max(openingBid, parseFloat(preBids[0].max_amount)); openingBidder = preBids[0].buyer_username; }
+    const { data: activeItem } = await supabase.from('auction_items').update({ status: 'active', current_bid: openingBid, leading_bidder: openingBidder }).eq('id', nextItem.id).select().single();
     io.to(auctionId).emit('item_activated', { item: activeItem, pre_bid_count: preBids ? preBids.length : 0 });
-    console.log('Next item: ' + nextItem.title + ' opening 
-    const auctionId = socket.auctionId;
-    if (auctionId && viewers[auctionId]) {
-      viewers[auctionId].delete(socket.id);
-      io.to(auctionId).emit('viewer_count', viewers[auctionId].size);
-    }
-    // Clean up userSockets tracking
-    if (socket.userId && userSockets[socket.userId]) {
-      userSockets[socket.userId].delete(socket.id);
-      if (userSockets[socket.userId].size === 0) delete userSockets[socket.userId];
-    }
-    console.log(`ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ User disconnected: ${socket.id}`);
   });
-});
 
-
-// ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-// ORDERS & SHIPPO
-// ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-
-const SHIPPO_API_KEY = process.env.SHIPPO_API_KEY;
-
-async function shippoFetch(method, path, body) {
-  const res = await fetch('https://api.goshippo.com' + path, {
-    method,
-    headers: {
-      'Authorization': 'ShippoToken ' + SHIPPO_API_KEY,
-      'Content-Type': 'application/json',
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  return res.json();
-}
-
-async function createOrderOnWin(auctionId, winnerUsername, finalBid) {
-  if (!winnerUsername) return;
-  try {
-    const { data: winner } = await supabase.from('users').select('id').eq('username', winnerUsername).single();
-    if (!winner) return;
-    const { data: profile } = await supabase.from('profiles').select('*').eq('user_id', String(winner.id)).single();
-    const { data: auction } = await supabase.from('auctions').select('title, description').eq('id', auctionId).single();
-    if (!auction) return;
-    await supabase.from('orders').insert({
-      auction_id: auctionId,
-      buyer_username: winnerUsername,
-      buyer_user_id: String(winner.id),
-      item_title: auction.title,
-      item_description: auction.description || '',
-      final_bid: finalBid || 0,
-      ship_name: profile?.full_name || '',
-      ship_address1: profile?.address_line1 || '',
-      ship_address2: profile?.address_line2 || '',
-      ship_city: profile?.city || '',
-      ship_state: profile?.state || '',
-      ship_zip: profile?.zip || '',
-      ship_country: profile?.country || 'US',
-      status: 'pending',
-    });
-    console.log('ÃÂ°ÃÂÃÂÃÂ¦ Order created for ' + winnerUsername + ' ÃÂ¢ÃÂÃÂ auction ' + auctionId);
-  } catch (e) {
-    console.error('Order creation error:', e.message);
-  }
-}
-
-// ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Admin: orders ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
-app.get('/admin/orders', requireAdmin, async (req, res) => {
-  const { data, error } = await supabase
-    .from('orders')
-    .select('*')
-    .order('created_at', { ascending: false });
-  if (error) return res.status(500).json({ error });
-  res.json(data);
-});
-
-app.post('/admin/orders/label', requireAdmin, async (req, res) => {
-  const { order_ids } = req.body;
-  if (!order_ids?.length) return res.status(400).json({ error: 'order_ids required' });
-
-  const { data: orders } = await supabase.from('orders').select('*').in('id', order_ids);
-  if (!orders?.length) return res.status(404).json({ error: 'Orders not found' });
-
-  const o = orders[0];
-  const itemsSummary = orders.map(x => x.item_title).join(', ');
-
-  if (!SHIPPO_API_KEY) return res.status(500).json({ error: 'SHIPPO_API_KEY not configured' });
-
-  try {
-    const shipment = await shippoFetch('POST', '/shipments/', {
-      address_from: {
-        name: process.env.SHIP_FROM_NAME || 'WhatTheFind',
-        street1: process.env.SHIP_FROM_STREET1 || '',
-        city: process.env.SHIP_FROM_CITY || '',
-        state: process.env.SHIP_FROM_STATE || '',
-        zip: process.env.SHIP_FROM_ZIP || '',
-        country: process.env.SHIP_FROM_COUNTRY || 'US',
-      },
-      address_to: {
-        name: o.ship_name,
-        street1: o.ship_address1,
-        street2: o.ship_address2 || '',
-        city: o.ship_city,
-        state: o.ship_state,
-        zip: o.ship_zip,
-        country: o.ship_country || 'US',
-      },
-      parcels: [{
-        length: '12', width: '10', height: '6',
-        distance_unit: 'in',
-        weight: '2',
-        mass_unit: 'lb',
-      }],
-      async: false,
-      metadata: itemsSummary,
-    });
-
-    if (!shipment.rates?.length) {
-      return res.status(400).json({ error: 'No shipping rates available', detail: shipment.messages });
-    }
-
-    const rate = shipment.rates.sort((a, b) => parseFloat(a.amount) - parseFloat(b.amount))[0];
-    const transaction = await shippoFetch('POST', '/transactions/', {
-      rate: rate.object_id,
-      label_file_type: 'PDF',
-      async: false,
-    });
-
-    if (transaction.status !== 'SUCCESS') {
-      return res.status(400).json({ error: 'Label generation failed', detail: transaction.messages });
-    }
-
-    const groupId = orders[0].group_id || orders[0].id;
-    await supabase.from('orders').update({
-      status: 'label_created',
-      group_id: groupId,
-      shippo_transaction_id: transaction.object_id,
-      label_url: transaction.label_url,
-      tracking_number: transaction.tracking_number,
-      tracking_carrier: transaction.tracking_carrier_account,
-    }).in('id', order_ids);
-
-    res.json({
-      label_url: transaction.label_url,
-      tracking_number: transaction.tracking_number,
-    });
-  } catch (e) {
-    console.error('Shippo error:', e.message);
-    res.status(500).json({ error: 'Shippo request failed', detail: e.message });
-  }
-});
-
-app.post('/admin/orders/group', requireAdmin, async (req, res) => {
-  const { order_ids } = req.body;
-  if (!order_ids?.length) return res.status(400).json({ error: 'order_ids required' });
-  const groupId = require('crypto').randomUUID();
-  await supabase.from('orders').update({ group_id: groupId }).in('id', order_ids);
-  res.json({ group_id: groupId });
-});
-
-app.post('/admin/orders/:id/ungroup', requireAdmin, async (req, res) => {
-  await supabase.from('orders').update({ group_id: null }).eq('id', req.params.id);
-  res.json({ success: true });
-});
-
-app.patch('/admin/orders/:id/status', requireAdmin, async (req, res) => {
-  const { status } = req.body;
-  const valid = ['pending', 'label_created', 'shipped', 'delivered'];
-  if (!valid.includes(status)) return res.status(400).json({ error: 'Invalid status' });
-  const { data, error } = await supabase.from('orders').update({ status }).eq('id', req.params.id).select().single();
-  if (error) return res.status(500).json({ error });
-  res.json(data);
-});
-
-app.post('/webhook/shippo', async (req, res) => {
-  try {
-    const event = req.body;
-    if (event.event === 'track_updated') {
-      const tracking_number = event.data?.tracking_number;
-      const shippoStatus = event.data?.tracking_status?.status;
-      let status;
-      if (shippoStatus === 'TRANSIT' || shippoStatus === 'PRE_TRANSIT') status = 'shipped';
-      if (shippoStatus === 'DELIVERED') status = 'delivered';
-      if (status && tracking_number) {
-        await supabase.from('orders').update({ status }).eq('tracking_number', tracking_number);
-        console.log('ÃÂ°ÃÂÃÂÃÂ¬ Tracking update: ' + tracking_number + ' -> ' + status);
-      }
-    }
-  } catch (e) {
-    console.error('Shippo webhook error:', e.message);
-  }
-  res.json({ received: true });
-});
-
-
-// ============================================
-// AUCTION ITEMS AND PRE-BIDS
-// ============================================
-
-app.get('/auction/:id/items', async (req, res) => {
-  const { data, error } = await supabase
-    .from('auction_items')
-    .select('*')
-    .eq('auction_id', req.params.id)
-    .order('position', { ascending: true });
-  if (error) return res.status(500).json({ error });
-  res.json(data);
-});
-
-app.post('/auction/:id/items', requireAdmin, async (req, res) => {
-  const { title, description, image_url, starting_bid } = req.body;
-  if (!title) return res.status(400).json({ error: 'title is required' });
-  const { data: existing } = await supabase.from('auction_items').select('position').eq('auction_id', req.params.id).order('position', { ascending: false }).limit(1);
-  const position = existing && existing.length ? existing[0].position + 1 : 0;
-  const { data, error } = await supabase.from('auction_items').insert({
-    auction_id: req.params.id, title, description, image_url,
-    starting_bid: starting_bid || 1, position, status: 'pending'
-  }).select().single();
-  if (error) return res.status(500).json({ error });
-  res.status(201).json(data);
-});
-
-app.patch('/auction/:id/items/:itemId', requireAdmin, async (req, res) => {
-  const { title, description, image_url, starting_bid, position } = req.body;
-  const updates = {};
-  if (title !== undefined) updates.title = title;
-  if (description !== undefined) updates.description = description;
-  if (image_url !== undefined) updates.image_url = image_url;
-  if (starting_bid !== undefined) updates.starting_bid = starting_bid;
-  if (position !== undefined) updates.position = position;
-  const { data, error } = await supabase.from('auction_items').update(updates).eq('id', req.params.itemId).eq('auction_id', req.params.id).select().single();
-  if (error || !data) return res.status(404).json({ error: 'Item not found' });
-  res.json(data);
-});
-
-app.delete('/auction/:id/items/:itemId', requireAdmin, async (req, res) => {
-  await supabase.from('auction_items').delete().eq('id', req.params.itemId).eq('auction_id', req.params.id);
-  res.json({ success: true });
-});
-
-app.post('/auction/:id/items/:itemId/prebid', requireAuth, async (req, res) => {
-  const { max_amount } = req.body;
-  if (!max_amount || max_amount < 1) return res.status(400).json({ error: 'max_amount must be at least 1' });
-  const { data: item } = await supabase.from('auction_items').select('*').eq('id', req.params.itemId).single();
-  if (!item) return res.status(404).json({ error: 'Item not found' });
-  if (item.status !== 'pending') return res.status(400).json({ error: 'Pre-bidding is closed for this item' });
-  const { data, error } = await supabase.from('pre_bids').upsert({
-    item_id: req.params.itemId,
-    auction_id: req.params.id,
-    buyer_username: req.user.username,
-    buyer_user_id: String(req.user.id),
-    max_amount,
-  }, { onConflict: 'item_id,buyer_username' }).select().single();
-  if (error) return res.status(500).json({ error });
-  const { data: allBids } = await supabase.from('pre_bids').select('max_amount').eq('item_id', req.params.itemId);
-  const top = allBids ? Math.max(...allBids.map(b => parseFloat(b.max_amount))) : max_amount;
-  await supabase.from('auction_items').update({ pre_bid_count: allBids ? allBids.length : 1, top_pre_bid: top }).eq('id', req.params.itemId);
-  res.json({ success: true, pre_bid: data });
-});
-
-app.get('/auction/:id/items/:itemId/prebid', requireAuth, async (req, res) => {
-  const { data } = await supabase.from('pre_bids').select('max_amount').eq('item_id', req.params.itemId).eq('buyer_username', req.user.username).single();
-  res.json(data || null);
-});
-
-app.delete('/auction/:id/items/:itemId/prebid', requireAuth, async (req, res) => {
-  await supabase.from('pre_bids').delete().eq('item_id', req.params.itemId).eq('buyer_username', req.user.username);
-  const { data: allBids } = await supabase.from('pre_bids').select('max_amount').eq('item_id', req.params.itemId);
-  const top = allBids && allBids.length ? Math.max(...allBids.map(b => parseFloat(b.max_amount))) : null;
-  await supabase.from('auction_items').update({ pre_bid_count: allBids ? allBids.length : 0, top_pre_bid: top }).eq('id', req.params.itemId);
-  res.json({ success: true });
-});
-const PORT = process.env.PORT || 3001;
-server.listen(PORT, async () => {
-  console.log(`ÃÂÃÂ°ÃÂÃÂÃÂÃÂÃÂÃÂ WhatTheFind Live server running on port ${PORT}`);
-  await resumeLiveAuctions();
-});
- + openingBid);
-  });
   socket.on('disconnect', () => {
     const auctionId = socket.auctionId;
     if (auctionId && viewers[auctionId]) {
@@ -1082,16 +800,11 @@ app.post('/webhook/shippo', async (req, res) => {
 });
 
 
-// ============================================
 // AUCTION ITEMS AND PRE-BIDS
-// ============================================
 
 app.get('/auction/:id/items', async (req, res) => {
   const { data, error } = await supabase
-    .from('auction_items')
-    .select('*')
-    .eq('auction_id', req.params.id)
-    .order('position', { ascending: true });
+    .from('auction_items').select('*').eq('auction_id', req.params.id).order('position', { ascending: true });
   if (error) return res.status(500).json({ error });
   res.json(data);
 });
@@ -1099,25 +812,22 @@ app.get('/auction/:id/items', async (req, res) => {
 app.post('/auction/:id/items', requireAdmin, async (req, res) => {
   const { title, description, image_url, starting_bid } = req.body;
   if (!title) return res.status(400).json({ error: 'title is required' });
-  const { data: existing } = await supabase.from('auction_items').select('position').eq('auction_id', req.params.id).order('position', { ascending: false }).limit(1);
-  const position = existing && existing.length ? existing[0].position + 1 : 0;
-  const { data, error } = await supabase.from('auction_items').insert({
-    auction_id: req.params.id, title, description, image_url,
-    starting_bid: starting_bid || 1, position, status: 'pending'
-  }).select().single();
+  const { data: ex } = await supabase.from('auction_items').select('position').eq('auction_id', req.params.id).order('position', { ascending: false }).limit(1);
+  const position = ex && ex.length ? ex[0].position + 1 : 0;
+  const { data, error } = await supabase.from('auction_items').insert({ auction_id: req.params.id, title, description, image_url, starting_bid: starting_bid || 1, position, status: 'pending' }).select().single();
   if (error) return res.status(500).json({ error });
   res.status(201).json(data);
 });
 
 app.patch('/auction/:id/items/:itemId', requireAdmin, async (req, res) => {
   const { title, description, image_url, starting_bid, position } = req.body;
-  const updates = {};
-  if (title !== undefined) updates.title = title;
-  if (description !== undefined) updates.description = description;
-  if (image_url !== undefined) updates.image_url = image_url;
-  if (starting_bid !== undefined) updates.starting_bid = starting_bid;
-  if (position !== undefined) updates.position = position;
-  const { data, error } = await supabase.from('auction_items').update(updates).eq('id', req.params.itemId).eq('auction_id', req.params.id).select().single();
+  const u = {};
+  if (title !== undefined) u.title = title;
+  if (description !== undefined) u.description = description;
+  if (image_url !== undefined) u.image_url = image_url;
+  if (starting_bid !== undefined) u.starting_bid = starting_bid;
+  if (position !== undefined) u.position = position;
+  const { data, error } = await supabase.from('auction_items').update(u).eq('id', req.params.itemId).eq('auction_id', req.params.id).select().single();
   if (error || !data) return res.status(404).json({ error: 'Item not found' });
   res.json(data);
 });
@@ -1129,21 +839,15 @@ app.delete('/auction/:id/items/:itemId', requireAdmin, async (req, res) => {
 
 app.post('/auction/:id/items/:itemId/prebid', requireAuth, async (req, res) => {
   const { max_amount } = req.body;
-  if (!max_amount || max_amount < 1) return res.status(400).json({ error: 'max_amount must be at least 1' });
-  const { data: item } = await supabase.from('auction_items').select('*').eq('id', req.params.itemId).single();
+  if (!max_amount || max_amount < 1) return res.status(400).json({ error: 'max_amount required' });
+  const { data: item } = await supabase.from('auction_items').select('status').eq('id', req.params.itemId).single();
   if (!item) return res.status(404).json({ error: 'Item not found' });
-  if (item.status !== 'pending') return res.status(400).json({ error: 'Pre-bidding is closed for this item' });
-  const { data, error } = await supabase.from('pre_bids').upsert({
-    item_id: req.params.itemId,
-    auction_id: req.params.id,
-    buyer_username: req.user.username,
-    buyer_user_id: String(req.user.id),
-    max_amount,
-  }, { onConflict: 'item_id,buyer_username' }).select().single();
+  if (item.status !== 'pending') return res.status(400).json({ error: 'Pre-bidding closed' });
+  const { data, error } = await supabase.from('pre_bids').upsert({ item_id: req.params.itemId, auction_id: req.params.id, buyer_username: req.user.username, buyer_user_id: String(req.user.id), max_amount }, { onConflict: 'item_id,buyer_username' }).select().single();
   if (error) return res.status(500).json({ error });
-  const { data: allBids } = await supabase.from('pre_bids').select('max_amount').eq('item_id', req.params.itemId);
-  const top = allBids ? Math.max(...allBids.map(b => parseFloat(b.max_amount))) : max_amount;
-  await supabase.from('auction_items').update({ pre_bid_count: allBids ? allBids.length : 1, top_pre_bid: top }).eq('id', req.params.itemId);
+  const { data: all } = await supabase.from('pre_bids').select('max_amount').eq('item_id', req.params.itemId);
+  const top = all ? Math.max(...all.map(b => parseFloat(b.max_amount))) : max_amount;
+  await supabase.from('auction_items').update({ pre_bid_count: all ? all.length : 1, top_pre_bid: top }).eq('id', req.params.itemId);
   res.json({ success: true, pre_bid: data });
 });
 
@@ -1154,11 +858,12 @@ app.get('/auction/:id/items/:itemId/prebid', requireAuth, async (req, res) => {
 
 app.delete('/auction/:id/items/:itemId/prebid', requireAuth, async (req, res) => {
   await supabase.from('pre_bids').delete().eq('item_id', req.params.itemId).eq('buyer_username', req.user.username);
-  const { data: allBids } = await supabase.from('pre_bids').select('max_amount').eq('item_id', req.params.itemId);
-  const top = allBids && allBids.length ? Math.max(...allBids.map(b => parseFloat(b.max_amount))) : null;
-  await supabase.from('auction_items').update({ pre_bid_count: allBids ? allBids.length : 0, top_pre_bid: top }).eq('id', req.params.itemId);
+  const { data: all } = await supabase.from('pre_bids').select('max_amount').eq('item_id', req.params.itemId);
+  const top = all && all.length ? Math.max(...all.map(b => parseFloat(b.max_amount))) : null;
+  await supabase.from('auction_items').update({ pre_bid_count: all ? all.length : 0, top_pre_bid: top }).eq('id', req.params.itemId);
   res.json({ success: true });
 });
+
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, async () => {
   console.log(`ÃÂÃÂ°ÃÂÃÂÃÂÃÂÃÂÃÂ WhatTheFind Live server running on port ${PORT}`);
