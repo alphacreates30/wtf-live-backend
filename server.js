@@ -396,6 +396,7 @@ app.get('/auction/:id/chat', async (req, res) => {
 
 const viewers = {};
 const auctionTimers = {};
+const itemTimers = {}; // auctionId -> interval
 const userSockets = {}; // userId (string) -> Set of socket IDs
 
 function startAuctionTimer(auctionId, endsAt) {
@@ -413,6 +414,17 @@ function startAuctionTimer(auctionId, endsAt) {
         console.log(`ÃÂÃÂ°ÃÂÃÂÃÂÃÂÃÂÃÂ Auction ${auctionId} ended ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ winner: ${auction.leading_bidder} at $${auction.current_bid}`);
       }
     }
+  }, 1000);
+}
+
+
+function startItemTimer(auctionId, seconds) {
+  if (itemTimers[auctionId]) { clearInterval(itemTimers[auctionId]); delete itemTimers[auctionId]; }
+  let remaining = seconds;
+  itemTimers[auctionId] = setInterval(() => {
+    remaining--;
+    io.to(auctionId).emit('item_timer_tick', { seconds: remaining });
+    if (remaining <= 0) { clearInterval(itemTimers[auctionId]); delete itemTimers[auctionId]; }
   }, 1000);
 }
 
@@ -601,18 +613,21 @@ io.on('connection', (socket) => {
   });
 
 
-  socket.on('next_item', async ({ auctionId, token }) => {
+  socket.on('next_item', async ({ auctionId, token, timerSeconds = 60 }) => {
     const user = verifySocketToken(token);
     if (!user || user.username !== ADMIN_USERNAME) return socket.emit('host_error', { message: 'Admin only' });
     await supabase.from('auction_items').update({ status: 'sold' }).eq('auction_id', auctionId).eq('status', 'active');
     const { data: nextItem } = await supabase.from('auction_items').select('*').eq('auction_id', auctionId).eq('status', 'pending').order('position', { ascending: true }).limit(1).single();
-    if (!nextItem) { io.to(auctionId).emit('items_finished', { auctionId }); return; }
+    if (!nextItem) { if (itemTimers[auctionId]) { clearInterval(itemTimers[auctionId]); delete itemTimers[auctionId]; } io.to(auctionId).emit('items_finished', { auctionId }); return; }
     const { data: preBids } = await supabase.from('pre_bids').select('*').eq('item_id', nextItem.id).order('max_amount', { ascending: false });
     let openingBid = parseFloat(nextItem.starting_bid);
     let openingBidder = null;
     if (preBids && preBids.length) { openingBid = Math.max(openingBid, parseFloat(preBids[0].max_amount)); openingBidder = preBids[0].buyer_username; }
     const { data: activeItem } = await supabase.from('auction_items').update({ status: 'active', current_bid: openingBid, leading_bidder: openingBidder }).eq('id', nextItem.id).select().single();
-    io.to(auctionId).emit('item_activated', { item: activeItem, pre_bid_count: preBids ? preBids.length : 0 });
+    const ts = timerSeconds || 60;
+  startItemTimer(auctionId, ts);
+  io.to(auctionId).emit('item_timer_tick', { seconds: ts });
+  io.to(auctionId).emit('item_activated', { item: activeItem, pre_bid_count: preBids ? preBids.length : 0, timer_seconds: ts });
   });
 
   socket.on('disconnect', () => {
