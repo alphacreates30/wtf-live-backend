@@ -629,6 +629,7 @@ io.on('connection', (socket) => {
     let openingBidder = null;
     if (preBids && preBids.length) { openingBid = Math.max(openingBid, parseFloat(preBids[0].max_amount)); openingBidder = preBids[0].buyer_username; }
     const { data: activeItem } = await supabase.from('auction_items').update({ status: 'active', current_bid: openingBid, leading_bidder: openingBidder }).eq('id', nextItem.id).select().single();
+  await supabase.from('auctions').update({ current_bid: openingBid, leading_bidder: openingBidder || null }).eq('id', auctionId);
     const ts = timerSeconds || 60;
   startItemTimer(auctionId, ts);
   io.to(auctionId).emit('item_timer_tick', { seconds: ts });
