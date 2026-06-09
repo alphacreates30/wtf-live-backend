@@ -419,12 +419,13 @@ function startAuctionTimer(auctionId, endsAt) {
 
 
 function startItemTimer(auctionId, seconds) {
-  if (itemTimers[auctionId]) { clearInterval(itemTimers[auctionId]); delete itemTimers[auctionId]; }
-  let remaining = seconds;
-  itemTimers[auctionId] = setInterval(() => {
-    remaining--;
-    io.to(auctionId).emit('item_timer_tick', { seconds: remaining });
-    if (remaining <= 0) { clearInterval(itemTimers[auctionId]); delete itemTimers[auctionId]; }
+  if (itemTimers[auctionId]) { clearInterval(itemTimers[auctionId].interval); delete itemTimers[auctionId]; }
+  itemTimers[auctionId] = { remaining: seconds };
+  itemTimers[auctionId].interval = setInterval(() => {
+    if (!itemTimers[auctionId]) return;
+    itemTimers[auctionId].remaining--;
+    io.to(auctionId).emit('item_timer_tick', { seconds: itemTimers[auctionId].remaining });
+    if (itemTimers[auctionId].remaining <= 0) { clearInterval(itemTimers[auctionId].interval); delete itemTimers[auctionId]; }
   }, 1000);
 }
 
@@ -515,7 +516,11 @@ io.on('connection', (socket) => {
     if (error || !data.success) { socket.emit('bid_error', { message: (data && data.error) || 'Failed to place bid' }); return; }
 
     io.to(auctionId).emit('new_bid', data.bid);
-    io.to(auctionId).emit('new_chat', { type: 'bid', text: `ÃÂÃÂ°ÃÂÃÂÃÂÃÂÃÂÃÂ° ${user.username} bid $${amount}`, auction_id: auctionId, created_at: new Date().toISOString() });
+    // Snipe protection: last-second bid adds 5s
+    if (itemTimers[auctionId] && itemTimers[auctionId].remaining > 0 && itemTimers[auctionId].remaining <= 5) {
+      startItemTimer(auctionId, 5);
+      io.to(auctionId).emit('item_timer_tick', { seconds: 5 });
+    }
     console.log(`ÃÂÃÂ°ÃÂÃÂÃÂÃÂÃÂÃÂ° ${user.username} bid $${amount} on auction ${auctionId}`);
   });
 
@@ -618,7 +623,7 @@ io.on('connection', (socket) => {
     if (!user || user.username !== ADMIN_USERNAME) return socket.emit('host_error', { message: 'Admin only' });
     await supabase.from('auction_items').update({ status: 'sold' }).eq('auction_id', auctionId).eq('status', 'active');
     const { data: nextItem } = await supabase.from('auction_items').select('*').eq('auction_id', auctionId).eq('status', 'pending').order('position', { ascending: true }).limit(1).single();
-    if (!nextItem) { if (itemTimers[auctionId]) { clearInterval(itemTimers[auctionId]); delete itemTimers[auctionId]; } io.to(auctionId).emit('items_finished', { auctionId }); return; }
+    if (!nextItem) { if (itemTimers[auctionId]) { clearInterval(itemTimers[auctionId].interval); delete itemTimers[auctionId]; } io.to(auctionId).emit('items_finished', { auctionId }); return; }
     const { data: preBids } = await supabase.from('pre_bids').select('*').eq('item_id', nextItem.id).order('max_amount', { ascending: false });
     let openingBid = parseFloat(nextItem.starting_bid);
     let openingBidder = null;
