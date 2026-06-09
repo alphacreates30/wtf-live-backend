@@ -112,6 +112,22 @@ app.post('/auth/login', async (req, res) => {
 });
 
 // ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ Profile ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ
+app.post('/auth/change-password', requireAdmin, async (req, res) => {
+  const { current_password, new_password } = req.body;
+  if (!current_password || !new_password)
+    return res.status(400).json({ error: 'current_password and new_password required' });
+  if (new_password.length < 6)
+    return res.status(400).json({ error: 'New password must be at least 6 characters' });
+  const { data: user } = await supabase.from('users').select('*').eq('username', ADMIN_USERNAME).single();
+  if (!user) return res.status(404).json({ error: 'Admin user not found' });
+  const valid = await bcrypt.compare(current_password, user.password_hash);
+  if (!valid) return res.status(401).json({ error: 'Current password is incorrect' });
+  const password_hash = await bcrypt.hash(new_password, 10);
+  const { error: updateErr } = await supabase.from('users').update({ password_hash }).eq('username', ADMIN_USERNAME);
+  if (updateErr) return res.status(500).json({ error: 'Failed to update password' });
+  res.json({ success: true });
+});
+
 app.post('/profile', requireAuth, async (req, res) => {
   const { full_name, email, phone, address_line1, address_line2, city, state, zip, country } = req.body;
   if (!full_name || !phone || !address_line1 || !city || !state || !zip) {
