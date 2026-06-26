@@ -345,7 +345,7 @@ app.patch('/admin/buyers/:userId', requireAdmin, async (req, res) => {
 app.get('/auctions', async (req, res) => {
   const { status } = req.query;
   let query = supabase.from('auctions')
-    .select('id,title,description,image_url,category,starting_bid,current_bid,leading_bidder,status,starts_at,ends_at,host_username,created_at')
+        .select('id,title,description,image_url,category,starting_bid,current_bid,leading_bidder,status,starts_at,ends_at,mode,host_username,created_at')
     .order('created_at', { ascending: false });
   if (status) query = query.eq('status', status);
   const { data, error } = await query;
