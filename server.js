@@ -364,10 +364,7 @@ app.post('/auction', requireAuth, async (req, res) => {
     const auctionMode = mode === 'standard' ? 'standard' : 'live';
     if (!title) return res.status(400).json({ error: 'title is required' });
     if (!starting_bid || starting_bid < 1) return res.status(400).json({ error: 'starting_bid must be at least 1' });
-    if (auctionMode === 'live') {
-          if (!ends_at) return res.status(400).json({ error: 'ends_at is required' });
-          if (new Date(ends_at) <= new Date()) return res.status(400).json({ error: 'ends_at must be in the future' });
-    }
+      if (ends_at && new Date(ends_at) <= new Date()) return res.status(400).json({ error: 'ends_at must be in the future' });
   const { data, error } = await supabase.from('auctions').insert({
     title, description, image_url, category, starting_bid, current_bid: starting_bid,
         status: starts_at && new Date(starts_at) > new Date() ? 'upcoming' : 'live',
