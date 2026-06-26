@@ -360,17 +360,20 @@ app.get('/auction/:id', async (req, res) => {
 });
 
 app.post('/auction', requireAuth, async (req, res) => {
-  const { title, description, image_url, category, starting_bid, starts_at, ends_at } = req.body;
-  if (!title) return res.status(400).json({ error: 'title is required' });
-  if (!starting_bid || starting_bid < 1) return res.status(400).json({ error: 'starting_bid must be at least 1' });
-  if (!ends_at) return res.status(400).json({ error: 'ends_at is required' });
-  if (new Date(ends_at) <= new Date()) return res.status(400).json({ error: 'ends_at must be in the future' });
-
+  const { title, description, image_url, category, starting_bid, starts_at, ends_at, mode } = req.body;
+    const auctionMode = mode === 'standard' ? 'standard' : 'live';
+    if (!title) return res.status(400).json({ error: 'title is required' });
+    if (!starting_bid || starting_bid < 1) return res.status(400).json({ error: 'starting_bid must be at least 1' });
+    if (auctionMode === 'live') {
+          if (!ends_at) return res.status(400).json({ error: 'ends_at is required' });
+          if (new Date(ends_at) <= new Date()) return res.status(400).json({ error: 'ends_at must be in the future' });
+    }
   const { data, error } = await supabase.from('auctions').insert({
     title, description, image_url, category, starting_bid, current_bid: starting_bid,
-    status: starts_at && new Date(starts_at) > new Date() ? 'upcoming' : 'live',
-    starts_at: starts_at || new Date().toISOString(), ends_at,
-    host_username: req.user.username
+        status: starts_at && new Date(starts_at) > new Date() ? 'upcoming' : 'live',
+        starts_at: starts_at || new Date().toISOString(), ends_at: ends_at || null,
+        mode: auctionMode,
+        host_username: req.user.username
   }).select().single();
 
   if (error) return res.status(500).json({ error: 'Failed to create auction' });
@@ -452,6 +455,25 @@ async function resumeLiveAuctions() {
     console.log(`ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ± Resuming timer for auction ${auction.id}`);
     startAuctionTimer(auction.id, auction.ends_at);
   }
+}
+async function sweepExpiredStandardItems() {
+    try {
+          const { data: expired, error } = await supabase.rpc('get_expired_standard_items');
+          if (error) { console.error('Sweep error:', error.message); return; }
+          if (!expired || !expired.length) return;
+          for (const item of expired) {
+                  const { data: bidRows } = await supabase.from('bids').select('username, amount').eq('item_id', item.id).order('amount', { ascending: false }).limit(1);
+                  const winner = bidRows && bidRows.length ? bidRows[0] : null;
+                  const newStatus = winner ? 'sold' : 'unsold';
+                  await supabase.from('auction_items').update({ status: newStatus }).eq('id', item.id);
+                  if (winner) {
+                            await createOrderOnWin(item.auction_id, winner.username, winner.amount);
+                  }
+                  console.log(`... Standard item ${item.id} closed: ${newStatus}`);
+          }
+    } catch (e) {
+          console.error('Sweep exception:', e.message);
+    }
 }
 
 // ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ
@@ -855,23 +877,26 @@ app.get('/auction/:id/items', async (req, res) => {
 });
 
 app.post('/auction/:id/items', requireAdmin, async (req, res) => {
-  const { title, description, image_url, starting_bid } = req.body;
-  if (!title) return res.status(400).json({ error: 'title is required' });
-  const { data: ex } = await supabase.from('auction_items').select('position').eq('auction_id', req.params.id).order('position', { ascending: false }).limit(1);
-  const position = ex && ex.length ? ex[0].position + 1 : 0;
-  const { data, error } = await supabase.from('auction_items').insert({ auction_id: req.params.id, title, description, image_url, starting_bid: starting_bid || 1, position, status: 'pending' }).select().single();
-  if (error) return res.status(500).json({ error });
+  const { title, description, image_url, starting_bid, ends_at } = req.body;
+      if (!title) return res.status(400).json({ error: 'title is required' });
+      const { data: ex } = await supabase.from('auction_items').select('position').eq('auction_id', req.params.id).order('position', { ascending: false }).limit(1);
+      const position = ex && ex.length ? ex[0].position + 1 : 0;
+      const { data: auctionRow } = await supabase.from('auctions').select('mode').eq('id', req.params.id).single();
+      const isStandard = auctionRow && auctionRow.mode === 'standard';
+      const { data, error } = await supabase.from('auction_items').insert({ auction_id: req.params.id, title, description, image_url, starting_bid: starting_bid || 1, position, status: isStandard ? 'open' : 'pending', current_bid: isStandard ? (starting_bid || 1) : null, ends_at: isStandard ? (ends_at || null) : null }).select().single();
+      if (error) return res.status(500).json({ error });
   res.status(201).json(data);
 });
 
 app.patch('/auction/:id/items/:itemId', requireAdmin, async (req, res) => {
-  const { title, description, image_url, starting_bid, position } = req.body;
+  const { title, description, image_url, starting_bid, position, ends_at } = req.body;
   const u = {};
   if (title !== undefined) u.title = title;
   if (description !== undefined) u.description = description;
   if (image_url !== undefined) u.image_url = image_url;
   if (starting_bid !== undefined) u.starting_bid = starting_bid;
   if (position !== undefined) u.position = position;
+      if (ends_at !== undefined) u.ends_at = ends_at;
   const { data, error } = await supabase.from('auction_items').update(u).eq('id', req.params.itemId).eq('auction_id', req.params.id).select().single();
   if (error || !data) return res.status(404).json({ error: 'Item not found' });
   res.json(data);
@@ -909,8 +934,30 @@ app.delete('/auction/:id/items/:itemId/prebid', requireAuth, async (req, res) =>
   res.json({ success: true });
 });
 
+// STANDARD AUCTION: proxy (max) bidding via place_standard_bid RPC
+  app.post('/auction/:id/items/:itemId/bid', requireAuth, async (req, res) => {
+        const { max_amount } = req.body;
+        if (!max_amount || max_amount < 1) return res.status(400).json({ error: 'max_amount required' });
+        const { data, error } = await supabase.rpc('place_standard_bid', {
+                p_item_id: req.params.itemId,
+                p_user_id: String(req.user.id),
+                p_username: req.user.username,
+                p_max_amount: max_amount
+        });
+        if (error) return res.status(400).json({ error: error.message || 'Bid failed' });
+        res.json(data);
+  });
+
+  app.get('/auction/:id/items/standard-status', async (req, res) => {
+        const { data, error } = await supabase.from('auction_items').select('*').eq('auction_id', req.params.id).order('position', { ascending: true });
+        if (error) return res.status(500).json({ error: 'Failed to load items' });
+        res.json(data);
+  });
+
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, async () => {
   console.log(`ÃÂÃÂ°ÃÂÃÂÃÂÃÂÃÂÃÂ WhatTheFind Live server running on port ${PORT}`);
   await resumeLiveAuctions();
+      sweepExpiredStandardItems();
+      setInterval(sweepExpiredStandardItems, 15000);
 });
