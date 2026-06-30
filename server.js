@@ -952,6 +952,34 @@ app.delete('/auction/:id/items/:itemId/prebid', requireAuth, async (req, res) =>
   });
 
 const PORT = process.env.PORT || 3001;
+
+// -- Item Images --
+app.get('/auction/:auctionId/items/:itemId/images', async (req, res) => {
+    const { data, error } = await supabase
+          .from('item_images')
+          .select('id, url, position, created_at')
+          .eq('item_id', req.params.itemId)
+          .order('position', { ascending: true });
+    if (error) return res.status(500).json({ error });
+    res.json(data || []);
+});
+
+app.post('/auction/:auctionId/items/:itemId/images', requireAuth, async (req, res) => {
+    const { url, position } = req.body;
+    if (!url) return res.status(400).json({ error: 'url is required' });
+    const { data: auction } = await supabase.from('auctions').select('host_username').eq('id', req.params.auctionId).single();
+    if (!auction || auction.host_username !== req.user.username) return res.status(403).json({ error: 'Not authorized' });
+    const { data, error } = await supabase.from('item_images').insert({ item_id: req.params.itemId, url, position: position ?? 0 }).select().single();
+    if (error) return res.status(500).json({ error: 'Failed to add image' });
+    res.status(201).json(data);
+});
+
+app.delete('/item-image/:imageId', requireAuth, async (req, res) => {
+    const { error } = await supabase.from('item_images').delete().eq('id', req.params.imageId);
+    if (error) return res.status(500).json({ error: 'Failed to delete image' });
+    res.status(204).send();
+});
+
 server.listen(PORT, async () => {
   console.log(`ÃÂÃÂ°ÃÂÃÂÃÂÃÂÃÂÃÂ WhatTheFind Live server running on port ${PORT}`);
   await resumeLiveAuctions();
