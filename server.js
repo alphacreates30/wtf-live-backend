@@ -1,4 +1,4 @@
-require('dotenv').config();
+ equire('dotenv').config();
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -987,9 +987,39 @@ app.delete('/item-image/:imageId', requireAuth, async (req, res) => {
     res.status(204).send();
 });
 
+// ── Image upload ──
+async function initStorage() {
+  try {
+    const { data: buckets } = await supabase.storage.listBuckets();
+    if (!buckets?.some(b => b.name === 'item-images')) {
+      await supabase.storage.createBucket('item-images', { public: true, fileSizeLimit: 5242880 });
+      console.log('Created item-images bucket');
+    }
+  } catch (e) { console.error('Storage init error:', e.message); }
+}
+
+app.post('/upload-image', requireAuth, async (req, res) => {
+  try {
+    const { base64, mimeType } = req.body;
+    if (!base64) return res.status(400).json({ error: 'base64 required' });
+    const buffer = Buffer.from(base64, 'base64');
+    const ext = mimeType === 'image/png' ? 'png' : mimeType === 'image/webp' ? 'webp' : 'jpg';
+    const filePath = `items/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+    const { error: upErr } = await supabase.storage
+      .from('item-images')
+      .upload(filePath, buffer, { contentType: mimeType || 'image/jpeg', upsert: false });
+    if (upErr) return res.status(500).json({ error: upErr.message });
+    const { data: { publicUrl } } = supabase.storage.from('item-images').getPublicUrl(filePath);
+    res.json({ url: publicUrl });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 server.listen(PORT, async () => {
   console.log(`ÃÂÃÂ°ÃÂÃÂÃÂÃÂÃÂÃÂ WhatTheFind Live server running on port ${PORT}`);
   await resumeLiveAuctions();
       sweepExpiredStandardItems();
       setInterval(sweepExpiredStandardItems, 15000);
+  initStorage();
 });
