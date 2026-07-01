@@ -1016,6 +1016,12 @@ app.post('/upload-image', requireAuth, express.raw({ type: 'image/*', limit: '5m
   }
 });
 
+server.keepAliveTimeout = 61000; // keep connections open longer than Railway's proxy timeout
+server.headersTimeout = 65000;
+
+server.keepAliveTimeout = 61000; // keep connections alive longer than proxy timeout
+server.headersTimeout = 65000;
+
 server.listen(PORT, async () => {
   console.log(`ÃÂÃÂ°ÃÂÃÂÃÂÃÂÃÂÃÂ WhatTheFind Live server running on port ${PORT}`);
   await resumeLiveAuctions();
