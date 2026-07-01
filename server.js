@@ -579,16 +579,23 @@ io.on('connection', (socket) => {
   });
 
   // ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ Admin: block user mid-auction ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ
-  socket.on('block_user', async ({ targetUserId, targetUsername, auctionId, token }) => {
+    socket.on('block_user', async ({ targetUserId, targetUsername, auctionId, token }) => {
     const admin = verifySocketToken(token);
     if (!admin || admin.username !== ADMIN_USERNAME) {
       socket.emit('host_error', { message: 'Admin only' }); return;
     }
 
+    // Resolve actual UUID — frontend passes username as targetUserId placeholder
+    let resolvedUserId = String(targetUserId);
+    if (targetUsername) {
+      const { data: targetUser } = await supabase.from('users').select('id').eq('username', targetUsername).single();
+      if (targetUser) resolvedUserId = String(targetUser.id);
+    }
+
     // Update profile to blocked
     await supabase.from('profiles')
       .update({ status: 'blocked', reviewed_by: admin.username, reviewed_at: new Date().toISOString() })
-      .eq('user_id', String(targetUserId));
+      .eq('user_id', resolvedUserId);
 
     // Flag their recent messages in this auction
     if (targetUsername) {
@@ -598,7 +605,7 @@ io.on('connection', (socket) => {
     }
 
     // Force-disconnect all their sockets
-    const socketIds = userSockets[String(targetUserId)];
+    const socketIds = userSockets[resolvedUserId];
     if (socketIds) {
       for (const sid of socketIds) {
         const s = io.sockets.sockets.get(sid);
@@ -607,11 +614,11 @@ io.on('connection', (socket) => {
           s.disconnect(true);
         }
       }
-      delete userSockets[String(targetUserId)];
+      delete userSockets[resolvedUserId];
     }
 
-    socket.emit('block_success', { targetUserId, targetUsername });
-    console.log(`ÃÂÃÂ°ÃÂÃÂÃÂÃÂÃÂÃÂ« Admin blocked user ${targetUsername} (${targetUserId}) from auction ${auctionId}`);
+    socket.emit('block_success', { targetUserId: resolvedUserId, targetUsername });
+    console.log(`🚫 Admin blocked user ${targetUsername} (${resolvedUserId}) from auction ${auctionId}`);
   });
 
   socket.on('start_auction', async ({ auctionId, token }) => {
