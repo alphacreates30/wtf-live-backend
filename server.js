@@ -1,4 +1,4 @@
- equire('dotenv').config();
+  equire('dotenv').config();
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -998,16 +998,16 @@ async function initStorage() {
   } catch (e) { console.error('Storage init error:', e.message); }
 }
 
-app.post('/upload-image', requireAuth, async (req, res) => {
+app.post('/upload-image', requireAuth, express.raw({ type: 'image/*', limit: '5mb' }), async (req, res) => {
   try {
-    const { base64, mimeType } = req.body;
-    if (!base64) return res.status(400).json({ error: 'base64 required' });
-    const buffer = Buffer.from(base64, 'base64');
-    const ext = mimeType === 'image/png' ? 'png' : mimeType === 'image/webp' ? 'webp' : 'jpg';
+    const mimeType = (req.headers['content-type'] || 'image/jpeg').split(';')[0];
+    const buffer = req.body;
+    if (!buffer || !buffer.length) return res.status(400).json({ error: 'No image data' });
+    const ext = mimeType.includes('png') ? 'png' : mimeType.includes('webp') ? 'webp' : 'jpg';
     const filePath = `items/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
     const { error: upErr } = await supabase.storage
       .from('item-images')
-      .upload(filePath, buffer, { contentType: mimeType || 'image/jpeg', upsert: false });
+      .upload(filePath, buffer, { contentType: mimeType, upsert: false });
     if (upErr) return res.status(500).json({ error: upErr.message });
     const { data: { publicUrl } } = supabase.storage.from('item-images').getPublicUrl(filePath);
     res.json({ url: publicUrl });
