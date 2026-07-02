@@ -342,6 +342,47 @@ app.patch('/admin/buyers/:userId', requireAdmin, async (req, res) => {
 });
 
 // ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ Auctions ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ
+// ── My Bids / My Wins ──
+app.get('/my-bids', requireAuth, async (req, res) => {
+  const username = req.user.username
+
+  // Get all pre-bids placed by this user (standard auction items)
+  const { data: prebids, error } = await supabase
+    .from('pre_bids')
+    .select('item_id, auction_id, max_amount')
+    .eq('buyer_username', username)
+
+  if (error) return res.status(500).json({ error })
+  if (!prebids || !prebids.length) return res.json([])
+
+  const itemIds = prebids.map(p => p.item_id)
+  const auctionIds = [...new Set(prebids.map(p => p.auction_id))]
+
+  const [{ data: items }, { data: auctions }] = await Promise.all([
+    supabase.from('auction_items').select('id, lot_number, title, current_bid, highest_bidder, ends_at, auction_id').in('id', itemIds),
+    supabase.from('auctions').select('id, title, status, mode').in('id', auctionIds),
+  ])
+
+  const auctionMap = Object.fromEntries((auctions || []).map(a => [a.id, a]))
+  const itemMap = Object.fromEntries((items || []).map(i => [i.id, i]))
+
+  const result = prebids
+    .map(pb => {
+      const item = itemMap[pb.item_id]
+      if (!item) return null
+      return {
+        ...item,
+        max_bid: pb.max_amount,
+        won: item.highest_bidder === username,
+        auction: auctionMap[pb.auction_id] || null,
+      }
+    })
+    .filter(Boolean)
+    .sort((a, b) => new Date(b.ends_at) - new Date(a.ends_at))
+
+  res.json(result)
+})
+
 app.get('/auctions', async (req, res) => {
   const { status } = req.query;
   let query = supabase.from('auctions')
