@@ -983,6 +983,16 @@ app.delete('/auction/:id/items/:itemId/prebid', requireAuth, async (req, res) =>
   app.post('/auction/:id/items/:itemId/bid', requireAuth, async (req, res) => {
         const { max_amount } = req.body;
         if (!max_amount || max_amount < 1) return res.status(400).json({ error: 'max_amount required' });
+        // Server-side bid increment validation
+        const { data: bidItem } = await supabase.from('auction_items').select('current_bid,starting_bid,bid_count,leading_bidder,status,ends_at').eq('id', req.params.itemId).single()
+        if (!bidItem) return res.status(404).json({ error: 'Item not found' })
+        if (bidItem.status === 'sold' || bidItem.status === 'unsold') return res.status(400).json({ error: 'Lot is closed' })
+        if (bidItem.ends_at && new Date(bidItem.ends_at) <= new Date()) return res.status(400).json({ error: 'Lot has closed' })
+        const floor = bidItem.current_bid || bidItem.starting_bid || 0
+        const minInc = floor < 50 ? 1 : floor < 100 ? 2 : floor < 200 ? 5 : floor < 500 ? 10 : floor < 1000 ? 25 : 50
+        const isLeader = bidItem.leading_bidder === req.user.username
+        const minBid = isLeader ? floor : floor + (bidItem.bid_count > 0 ? minInc : 0)
+        if (max_amount < minBid) return res.status(400).json({ error: `Min bid: $${minBid.toFixed(2)}` })
         const { data, error } = await supabase.rpc('place_standard_bid', {
                 p_item_id: req.params.itemId,
                 p_user_id: String(req.user.id),
