@@ -1063,6 +1063,39 @@ server.headersTimeout = 65000;
 server.keepAliveTimeout = 61000; // keep connections alive longer than proxy timeout
 server.headersTimeout = 65000;
 
+// Auto-close standard auction items when their ends_at passes
+async function autoCloseStandardItems() {
+  try {
+    const now = new Date().toISOString()
+    const { data: expiredItems, error } = await supabase
+      .from('auction_items')
+      .select('id, auction_id, bid_count, leading_bidder')
+      .lt('ends_at', now)
+      .not('status', 'in', '("sold","unsold")')
+    if (error || !expiredItems?.length) return
+    for (const item of expiredItems) {
+      const newStatus = (item.bid_count > 0 || item.leading_bidder) ? 'sold' : 'unsold'
+      await supabase.from('auction_items').update({ status: newStatus }).eq('id', item.id)
+    }
+    const auctionIds = [...new Set(expiredItems.map(i => i.auction_id))]
+    for (const auctionId of auctionIds) {
+      const { data: remaining } = await supabase
+        .from('auction_items')
+        .select('id')
+        .eq('auction_id', auctionId)
+        .not('status', 'in', '("sold","unsold")')
+      if (!remaining?.length) {
+        await supabase.from('auctions').update({ status: 'ended' }).eq('id', auctionId).eq('mode', 'standard').eq('status', 'live')
+        console.log('Auto-closed standard auction:', auctionId)
+      }
+    }
+  } catch (e) {
+    console.error('autoCloseStandardItems error:', e)
+  }
+}
+setInterval(autoCloseStandardItems, 30000)
+autoCloseStandardItems()
+
 server.listen(PORT, async () => {
   console.log(`ÃÂÃÂ°ÃÂÃÂÃÂÃÂÃÂÃÂ WhatTheFind Live server running on port ${PORT}`);
   await resumeLiveAuctions();
