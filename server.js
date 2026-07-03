@@ -1067,26 +1067,41 @@ server.headersTimeout = 65000;
 async function autoCloseStandardItems() {
   try {
     const now = new Date().toISOString()
-    const { data: expiredItems, error } = await supabase
+
+    // Step 1: Close any items whose ends_at has passed and aren't already closed
+    const { data: expiredItems } = await supabase
       .from('auction_items')
       .select('id, auction_id, bid_count, leading_bidder')
       .lt('ends_at', now)
       .not('status', 'in', '("sold","unsold")')
-    if (error || !expiredItems?.length) return
-    for (const item of expiredItems) {
-      const newStatus = (item.bid_count > 0 || item.leading_bidder) ? 'sold' : 'unsold'
-      await supabase.from('auction_items').update({ status: newStatus }).eq('id', item.id)
+    if (expiredItems?.length) {
+      for (const item of expiredItems) {
+        const newStatus = (item.bid_count > 0 || item.leading_bidder) ? 'sold' : 'unsold'
+        await supabase.from('auction_items').update({ status: newStatus }).eq('id', item.id)
+      }
     }
-    const auctionIds = [...new Set(expiredItems.map(i => i.auction_id))]
-    for (const auctionId of auctionIds) {
-      const { data: remaining } = await supabase
+
+    // Step 2: End any standard live auctions where ALL items are now closed
+    const { data: liveAuctions } = await supabase
+      .from('auctions')
+      .select('id')
+      .eq('mode', 'standard')
+      .eq('status', 'live')
+    if (!liveAuctions?.length) return
+
+    for (const auction of liveAuctions) {
+      const { data: openItems } = await supabase
         .from('auction_items')
         .select('id')
-        .eq('auction_id', auctionId)
+        .eq('auction_id', auction.id)
         .not('status', 'in', '("sold","unsold")')
-      if (!remaining?.length) {
-        await supabase.from('auctions').update({ status: 'ended' }).eq('id', auctionId).eq('mode', 'standard').eq('status', 'live')
-        console.log('Auto-closed standard auction:', auctionId)
+      if (!openItems?.length) {
+        const { data: allItems } = await supabase
+          .from('auction_items').select('id').eq('auction_id', auction.id)
+        if (allItems?.length > 0) {
+          await supabase.from('auctions').update({ status: 'ended' }).eq('id', auction.id)
+          console.log('Auto-ended standard auction:', auction.id)
+        }
       }
     }
   } catch (e) {
@@ -1095,6 +1110,7 @@ async function autoCloseStandardItems() {
 }
 setInterval(autoCloseStandardItems, 30000)
 autoCloseStandardItems()
+
 
 server.listen(PORT, async () => {
   console.log(`ÃÂÃÂ°ÃÂÃÂÃÂÃÂÃÂÃÂ WhatTheFind Live server running on port ${PORT}`);
