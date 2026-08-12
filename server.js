@@ -17,19 +17,19 @@ const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] }
 });
 
-// ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ Stripe webhook needs raw body ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ
+// -- Stripe webhook needs raw body --
 app.use('/webhook/stripe', express.raw({ type: 'application/json' }));
 app.use(cors());
 app.use(express.json());
 
-// ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ Clients ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ
+// -- Clients --
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
 const JWT_SECRET = process.env.JWT_SECRET || 'change-me-in-production';
 const ADMIN_USERNAME = 'whatthefind';
 
-// ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ Email transport (Nodemailer ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ set SMTP_* env vars or swap for Resend) ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ
+// -- Email transport (Nodemailer - set SMTP_* env vars or swap for Resend) --
 const mailer = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.gmail.com',
   port: parseInt(process.env.SMTP_PORT || '587'),
@@ -54,7 +54,7 @@ async function sendAdminEmail(subject, text) {
   }
 }
 
-// ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ Auth middleware ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ
+// -- Auth middleware --
 function requireAuth(req, res, next) {
   const auth = req.headers.authorization;
   if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing token' });
@@ -77,17 +77,17 @@ function verifySocketToken(token) {
   try { return jwt.verify(token, JWT_SECRET); } catch { return null; }
 }
 
-// ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ
+// ------------------------------------------------------------
 // REST ENDPOINTS
-// ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ
+// ------------------------------------------------------------
 
-app.get('/', (req, res) => res.json({ status: 'WhatTheFind Live is running ÃÂÃÂ°ÃÂÃÂÃÂÃÂÃÂÃÂ¥' }));
+app.get('/', (req, res) => res.json({ status: 'WhatTheFind Live is running' }));
 
-// ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ Auth ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ
+// -- Auth --
 app.post('/auth/register', async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: 'username and password required' });
-  if (username.length < 3 || username.length > 30) return res.status(400).json({ error: 'Username must be 3ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ30 characters' });
+  if (username.length < 3 || username.length > 30) return res.status(400).json({ error: 'Username must be 3-30 characters' });
   if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
 
   const password_hash = await bcrypt.hash(password, 10);
@@ -111,7 +111,7 @@ app.post('/auth/login', async (req, res) => {
   res.json({ token, user: { id: user.id, username: user.username, created_at: user.created_at } });
 });
 
-// ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ Profile ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ
+// -- Profile --
 app.post('/auth/change-password', requireAdmin, async (req, res) => {
   const { current_password, new_password } = req.body;
   if (!current_password || !new_password)
@@ -134,7 +134,7 @@ app.post('/profile', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'full_name, phone, address_line1, city, state, zip are required' });
   }
 
-  // Check if existing profile is already approved/blocked ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ don't allow edit
+  // Check if existing profile is already approved/blocked - don't allow edit
   const { data: existing } = await supabase.from('profiles').select('status').eq('user_id', req.user.id).single();
   if (existing && (existing.status === 'approved' || existing.status === 'blocked')) {
     return res.status(400).json({ error: `Profile is ${existing.status} and cannot be edited` });
@@ -173,7 +173,7 @@ app.get('/profile', requireAuth, async (req, res) => {
   res.json(data || null);
 });
 
-// ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ Stripe: create SetupIntent (save card on file) ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ
+// -- Stripe: create SetupIntent (save card on file) --
 app.post('/create-setup-intent', requireAuth, async (req, res) => {
   try {
     // Get or create Stripe customer
@@ -187,7 +187,7 @@ app.post('/create-setup-intent', requireAuth, async (req, res) => {
         metadata: { user_id: String(req.user.id), username: req.user.username },
       });
       customerId = customer.id;
-      // Store customer ID ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ profile may not exist yet so use upsert
+      // Store customer ID - profile may not exist yet so use upsert
       await supabase.from('profiles').upsert({ user_id: String(req.user.id), stripe_customer_id: customerId }, { onConflict: 'user_id' });
     }
 
@@ -222,7 +222,7 @@ app.post('/save-payment-method', requireAuth, async (req, res) => {
   }
 });
 
-// ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ Stripe: charge winner ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ
+// -- Stripe: charge winner --
 app.post('/charge-winner', requireAuth, async (req, res) => {
   const { auction_id, winner_username, amount_cents } = req.body;
   if (!auction_id || !winner_username || !amount_cents) {
@@ -260,17 +260,17 @@ app.post('/charge-winner', requireAuth, async (req, res) => {
     res.json({ success: true, payment_intent_id: paymentIntent.id });
   } catch (e) {
     console.error('Charge error:', e.message);
-    // Flag payment failed ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ buyer stays approved, admin decides next steps
+    // Flag payment failed - buyer stays approved, admin decides next steps
     await supabase.from('profiles').update({ payment_status: 'failed' }).eq('user_id', String(winner.id));
     await sendAdminEmail(
-      `ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ ÃÂÃÂ¯ÃÂÃÂ¸ÃÂÃÂ Payment failed ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ ${winner_username}`,
+      `Payment failed - ${winner_username}`,
       `Payment failed for auction ${auction_id}.\nWinner: ${winner_username}\nAmount: $${(amount_cents / 100).toFixed(2)}\nError: ${e.message}`
     );
     res.status(402).json({ error: 'Payment failed', detail: e.message });
   }
 });
 
-// ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ Stripe webhook ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ
+// -- Stripe webhook --
 app.post('/webhook/stripe', async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
@@ -286,11 +286,11 @@ app.post('/webhook/stripe', async (req, res) => {
     if (winner_username) {
       const { data: winnerUser } = await supabase.from('users').select('id').eq('username', winner_username).single();
       if (winnerUser) {
-        // Flag only ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ buyer stays approved, admin handles manually
+        // Flag only - buyer stays approved, admin handles manually
         await supabase.from('profiles').update({ payment_status: 'failed' }).eq('user_id', String(winnerUser.id));
       }
       await sendAdminEmail(
-        `ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ ÃÂÃÂ¯ÃÂÃÂ¸ÃÂÃÂ Stripe payment failed ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ ${winner_username}`,
+        `Stripe payment failed - ${winner_username}`,
         `Stripe payment_intent.payment_failed\nWinner: ${winner_username}\nAuction: ${auction_id}\nError: ${pi.last_payment_error?.message || 'unknown'}`
       );
     }
@@ -299,7 +299,7 @@ app.post('/webhook/stripe', async (req, res) => {
   res.json({ received: true });
 });
 
-// ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ Admin: buyers ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ
+// -- Admin: buyers --
 app.get('/admin/buyers', requireAdmin, async (req, res) => {
   const { data, error } = await supabase
     .from('profiles')
@@ -341,44 +341,58 @@ app.patch('/admin/buyers/:userId', requireAdmin, async (req, res) => {
   res.json(data);
 });
 
-// ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ Auctions ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ
-// ── My Bids / My Wins ──
+// -- Auctions --
+// -- My Bids / My Wins --
 app.get('/my-bids', requireAuth, async (req, res) => {
   const username = req.user.username
 
-  // Get all pre-bids placed by this user (standard auction items)
-  const { data: prebids, error } = await supabase
-    .from('pre_bids')
-    .select('item_id, auction_id, max_amount')
-    .eq('buyer_username', username)
-
-  if (error) return res.status(500).json({ error })
-  if (!prebids || !prebids.length) return res.json([])
-
-  const itemIds = prebids.map(p => p.item_id)
-  const auctionIds = [...new Set(prebids.map(p => p.auction_id))]
-
-  const [{ data: items }, { data: auctions }] = await Promise.all([
-    supabase.from('auction_items').select('id, lot_number, title, current_bid, highest_bidder, ends_at, auction_id').in('id', itemIds),
-    supabase.from('auctions').select('id, title, status, mode').in('id', auctionIds),
+  // Gather this user's activity from BOTH sources:
+  // - pre_bids: max bids placed before the auction opened
+  // - bids:     actual bids placed while the auction was running
+  const [{ data: prebids }, { data: liveBids }] = await Promise.all([
+    supabase.from('pre_bids').select('item_id, auction_id, max_amount').eq('buyer_username', username),
+    supabase.from('bids').select('item_id, auction_id, amount').eq('username', username).not('item_id', 'is', null),
   ])
 
-  const auctionMap = Object.fromEntries((auctions || []).map(a => [a.id, a]))
-  const itemMap = Object.fromEntries((items || []).map(i => [i.id, i]))
+  // Highest max per item from pre-bids
+  const preByItem = {}
+  for (const p of prebids || []) {
+    const amt = parseFloat(p.max_amount) || 0
+    if (!preByItem[p.item_id] || amt > preByItem[p.item_id]) preByItem[p.item_id] = amt
+  }
 
-  const result = prebids
-    .map(pb => {
-      const item = itemMap[pb.item_id]
-      if (!item) return null
-      return {
-        ...item,
-        max_bid: pb.max_amount,
-        won: item.highest_bidder === username,
-        auction: auctionMap[pb.auction_id] || null,
-      }
-    })
-    .filter(Boolean)
-    .sort((a, b) => new Date(b.ends_at) - new Date(a.ends_at))
+  // Highest amount per item from live bids
+  const liveByItem = {}
+  for (const b of liveBids || []) {
+    const amt = parseFloat(b.amount) || 0
+    if (!liveByItem[b.item_id] || amt > liveByItem[b.item_id]) liveByItem[b.item_id] = amt
+  }
+
+  const itemIds = [...new Set([...Object.keys(preByItem), ...Object.keys(liveByItem)])]
+  if (!itemIds.length) return res.json([])
+
+  const { data: items, error: itemsErr } = await supabase
+    .from('auction_items')
+    .select('id, position, title, current_bid, leading_bidder, status, ends_at, auction_id')
+    .in('id', itemIds)
+  if (itemsErr) return res.status(500).json({ error: 'Failed to load items' })
+
+  const auctionIds = [...new Set((items || []).map(i => i.auction_id))]
+  const { data: auctions } = await supabase
+    .from('auctions').select('id, title, status, mode').in('id', auctionIds)
+  const auctionMap = Object.fromEntries((auctions || []).map(a => [a.id, a]))
+
+  const result = (items || []).map(item => {
+    const myMax = Math.max(preByItem[item.id] || 0, liveByItem[item.id] || 0)
+    return {
+      ...item,
+      lot_number: item.position != null ? item.position + 1 : null,
+      max_bid: myMax || null,
+      won: item.leading_bidder === username,
+      closed: item.status === 'sold' || item.status === 'unsold',
+      auction: auctionMap[item.auction_id] || null,
+    }
+  }).sort((a, b) => new Date(b.ends_at) - new Date(a.ends_at))
 
   res.json(result)
 })
@@ -447,9 +461,9 @@ app.get('/auction/:id/chat', async (req, res) => {
   res.json(data);
 });
 
-// ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ
+// ------------------------------------------------------------
 // AUCTION LIFECYCLE
-// ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ
+// ------------------------------------------------------------
 
 const viewers = {};
 const auctionTimers = {};
@@ -468,7 +482,7 @@ function startAuctionTimer(auctionId, endsAt) {
       if (auction) {
         io.to(auctionId).emit('auction_ended', { auctionId, winner: auction.leading_bidder, final_bid: auction.current_bid });
         await createOrderOnWin(auctionId, auction.leading_bidder, auction.current_bid);
-        console.log(`ÃÂÃÂ°ÃÂÃÂÃÂÃÂÃÂÃÂ Auction ${auctionId} ended ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ winner: ${auction.leading_bidder} at $${auction.current_bid}`);
+        console.log(`- Auction ${auctionId} ended - winner: ${auction.leading_bidder} at $${auction.current_bid}`);
       }
     }
   }, 1000);
@@ -490,36 +504,22 @@ async function resumeLiveAuctions() {
   const { data: liveAuctions } = await supabase.from('auctions').select('id, ends_at').eq('status', 'live');
   if (!liveAuctions) return;
   for (const auction of liveAuctions) {
-    console.log(`ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ± Resuming timer for auction ${auction.id}`);
+    console.log(`- Resuming timer for auction ${auction.id}`);
     startAuctionTimer(auction.id, auction.ends_at);
   }
 }
-async function sweepExpiredStandardItems() {
-    try {
-          const { data: expired, error } = await supabase.rpc('get_expired_standard_items');
-          if (error) { console.error('Sweep error:', error.message); return; }
-          if (!expired || !expired.length) return;
-          for (const item of expired) {
-                  const { data: bidRows } = await supabase.from('bids').select('username, amount').eq('item_id', item.id).order('amount', { ascending: false }).limit(1);
-                  const winner = bidRows && bidRows.length ? bidRows[0] : null;
-                  const newStatus = winner ? 'sold' : 'unsold';
-                  await supabase.from('auction_items').update({ status: newStatus }).eq('id', item.id);
-                  if (winner) {
-                            await createOrderOnWin(item.auction_id, winner.username, winner.amount);
-                  }
-                  console.log(`... Standard item ${item.id} closed: ${newStatus}`);
-          }
-    } catch (e) {
-          console.error('Sweep exception:', e.message);
-    }
-}
+// NOTE: superseded by autoCloseStandardItems(), which is now the single
+// source of truth for closing standard lots. Kept as a no-op so any stray
+// callers don't crash. Do not re-enable: two closers caused a race where
+// orders were silently skipped.
+async function sweepExpiredStandardItems() { /* intentionally disabled */ }
 
-// ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ
+// ------------------------------------------------------------
 // SOCKET.IO
-// ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ
+// ------------------------------------------------------------
 
 io.on('connection', (socket) => {
-  console.log(`ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ User connected: ${socket.id}`);
+  console.log(`- User connected: ${socket.id}`);
 
   socket.on('join_auction', async ({ auctionId, token } = {}) => {
     // Support legacy string-only calls
@@ -573,7 +573,7 @@ io.on('connection', (socket) => {
     const { data: chatHistory } = await supabase.from('chat_messages').select('*').eq('auction_id', auctionId).eq('flagged', false).order('created_at', { ascending: true }).limit(50);
     if (chatHistory) socket.emit('chat_history', chatHistory);
 
-    console.log(`ÃÂÃÂ°ÃÂÃÂÃÂÃÂÃÂÃÂ ${socket.id} joined auction ${auctionId} ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ ${viewers[auctionId].size} watching`);
+    console.log(`- ${socket.id} joined auction ${auctionId} - ${viewers[auctionId].size} watching`);
   });
 
   socket.on('place_bid', async ({ auctionId, amount, token }) => {
@@ -597,7 +597,7 @@ io.on('connection', (socket) => {
       startItemTimer(auctionId, 5);
       io.to(auctionId).emit('item_timer_tick', { seconds: 5 });
     }
-    console.log(`ÃÂÃÂ°ÃÂÃÂÃÂÃÂÃÂÃÂ° ${user.username} bid $${amount} on auction ${auctionId}`);
+    console.log(`- -  ${user.username} bid $${amount} on auction ${auctionId}`);
   });
 
   socket.on('send_chat', async ({ auctionId, text, token }) => {
@@ -619,14 +619,14 @@ io.on('connection', (socket) => {
     io.to(auctionId).emit('new_chat', { id: msg.id, type: 'msg', auction_id: auctionId, username: user.username, text: clean, role, created_at: msg.created_at });
   });
 
-  // ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ Admin: block user mid-auction ÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂ
+  // -- Admin: block user mid-auction --
     socket.on('block_user', async ({ targetUserId, targetUsername, auctionId, token }) => {
     const admin = verifySocketToken(token);
     if (!admin || admin.username !== ADMIN_USERNAME) {
       socket.emit('host_error', { message: 'Admin only' }); return;
     }
 
-    // Resolve actual UUID — frontend passes username as targetUserId placeholder
+    // Resolve actual UUID - frontend passes username as targetUserId placeholder
     let resolvedUserId = String(targetUserId);
     if (targetUsername) {
       const { data: targetUser } = await supabase.from('users').select('id').eq('username', targetUsername).single();
@@ -659,7 +659,7 @@ io.on('connection', (socket) => {
     }
 
     socket.emit('block_success', { targetUserId: resolvedUserId, targetUsername });
-    console.log(`🚫 Admin blocked user ${targetUsername} (${resolvedUserId}) from auction ${auctionId}`);
+    console.log(`- Admin blocked user ${targetUsername} (${resolvedUserId}) from auction ${auctionId}`);
   });
 
   socket.on('start_auction', async ({ auctionId, token }) => {
@@ -671,7 +671,7 @@ io.on('connection', (socket) => {
     await supabase.from('auctions').update({ status: 'live', starts_at: new Date().toISOString() }).eq('id', auctionId);
     io.to(auctionId).emit('auction_started', { auctionId });
     startAuctionTimer(auctionId, auction.ends_at);
-    console.log(`ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ¶ÃÂÃÂ¯ÃÂÃÂ¸ÃÂÃÂ Host ${user.username} started auction ${auctionId}`);
+    console.log(`- Host ${user.username} started auction ${auctionId}`);
   });
 
   socket.on('end_auction', async ({ auctionId, token }) => {
@@ -683,7 +683,7 @@ io.on('connection', (socket) => {
     await supabase.from('auctions').update({ status: 'ended' }).eq('id', auctionId);
     await createOrderOnWin(auctionId, auction.leading_bidder, auction.current_bid);
     io.to(auctionId).emit('auction_ended', { auctionId, winner: auction.leading_bidder, final_bid: auction.current_bid });
-    console.log(`ÃÂÃÂ°ÃÂÃÂÃÂÃÂÃÂÃÂ Host ${user.username} ended auction ${auctionId} early`);
+    console.log(`- Host ${user.username} ended auction ${auctionId} early`);
   });
 
   socket.on('extend_auction', async ({ auctionId, extraSeconds, token }) => {
@@ -697,7 +697,7 @@ io.on('connection', (socket) => {
     if (auctionTimers[auctionId]) { clearInterval(auctionTimers[auctionId]); delete auctionTimers[auctionId]; }
     startAuctionTimer(auctionId, newEndsAt);
     io.to(auctionId).emit('auction_extended', { auctionId, new_ends_at: newEndsAt });
-    console.log(`ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ© Host ${user.username} extended auction ${auctionId} by ${extraSeconds}s`);
+    console.log(`- Host ${user.username} extended auction ${auctionId} by ${extraSeconds}s`);
   });
 
 
@@ -730,14 +730,14 @@ io.on('connection', (socket) => {
       userSockets[socket.userId].delete(socket.id);
       if (userSockets[socket.userId].size === 0) delete userSockets[socket.userId];
     }
-    console.log(`ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ User disconnected: ${socket.id}`);
+    console.log(`- User disconnected: ${socket.id}`);
   });
 });
 
 
-// ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+// ------------------------------------------------------------
 // ORDERS & SHIPPO
-// ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+// ------------------------------------------------------------
 
 const SHIPPO_API_KEY = process.env.SHIPPO_API_KEY;
 
@@ -753,20 +753,42 @@ async function shippoFetch(method, path, body) {
   return res.json();
 }
 
-async function createOrderOnWin(auctionId, winnerUsername, finalBid) {
+async function createOrderOnWin(auctionId, winnerUsername, finalBid, itemId) {
   if (!winnerUsername) return;
   try {
+    // Idempotency: never create a second order for the same lot
+    if (itemId) {
+      const { data: existing } = await supabase
+        .from('orders').select('id').eq('item_id', itemId).limit(1);
+      if (existing && existing.length) return;
+    }
+
     const { data: winner } = await supabase.from('users').select('id').eq('username', winnerUsername).single();
     if (!winner) return;
     const { data: profile } = await supabase.from('profiles').select('*').eq('user_id', String(winner.id)).single();
     const { data: auction } = await supabase.from('auctions').select('title, description').eq('id', auctionId).single();
     if (!auction) return;
+
+    // Use the actual LOT title/description when we have an item; fall back to the auction
+    let itemTitle = auction.title;
+    let itemDescription = auction.description || '';
+    if (itemId) {
+      const { data: lot } = await supabase
+        .from('auction_items').select('title, description, position').eq('id', itemId).single();
+      if (lot) {
+        const lotNo = lot.position != null ? `Lot ${lot.position + 1}: ` : '';
+        itemTitle = `${lotNo}${lot.title}`;
+        itemDescription = lot.description || '';
+      }
+    }
+
     await supabase.from('orders').insert({
       auction_id: auctionId,
+      item_id: itemId || null,
       buyer_username: winnerUsername,
       buyer_user_id: String(winner.id),
-      item_title: auction.title,
-      item_description: auction.description || '',
+      item_title: itemTitle,
+      item_description: itemDescription,
       final_bid: finalBid || 0,
       ship_name: profile?.full_name || '',
       ship_address1: profile?.address_line1 || '',
@@ -777,13 +799,12 @@ async function createOrderOnWin(auctionId, winnerUsername, finalBid) {
       ship_country: profile?.country || 'US',
       status: 'pending',
     });
-    console.log('ÃÂ°ÃÂÃÂÃÂ¦ Order created for ' + winnerUsername + ' ÃÂ¢ÃÂÃÂ auction ' + auctionId);
+    console.log('Order created for ' + winnerUsername + ' - auction ' + auctionId + (itemId ? ' item ' + itemId : ''));
   } catch (e) {
     console.error('Order creation error:', e.message);
   }
 }
 
-// ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Admin: orders ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
 app.get('/admin/orders', requireAdmin, async (req, res) => {
   const { data, error } = await supabase
     .from('orders')
@@ -902,7 +923,7 @@ app.post('/webhook/shippo', async (req, res) => {
       if (shippoStatus === 'DELIVERED') status = 'delivered';
       if (status && tracking_number) {
         await supabase.from('orders').update({ status }).eq('tracking_number', tracking_number);
-        console.log('ÃÂ°ÃÂÃÂÃÂ¬ Tracking update: ' + tracking_number + ' -> ' + status);
+        console.log('- Tracking update: ' + tracking_number + ' -> ' + status);
       }
     }
   } catch (e) {
@@ -980,34 +1001,69 @@ app.delete('/auction/:id/items/:itemId/prebid', requireAuth, async (req, res) =>
 });
 
 // STANDARD AUCTION: proxy (max) bidding via place_standard_bid RPC
-  app.post('/auction/:id/items/:itemId/bid', requireAuth, async (req, res) => {
-        const { max_amount } = req.body;
-        if (!max_amount || max_amount < 1) return res.status(400).json({ error: 'max_amount required' });
-        // Server-side bid increment validation
-        const { data: bidItem } = await supabase.from('auction_items').select('current_bid,starting_bid,bid_count,leading_bidder,status,ends_at').eq('id', req.params.itemId).single()
-        if (!bidItem) return res.status(404).json({ error: 'Item not found' })
-        if (bidItem.status === 'sold' || bidItem.status === 'unsold') return res.status(400).json({ error: 'Lot is closed' })
-        if (bidItem.ends_at && new Date(bidItem.ends_at) <= new Date()) return res.status(400).json({ error: 'Lot has closed' })
-        const floor = bidItem.current_bid || bidItem.starting_bid || 0
-        const minInc = floor < 50 ? 1 : floor < 100 ? 2 : floor < 200 ? 5 : floor < 500 ? 10 : floor < 1000 ? 25 : 50
-        const isLeader = bidItem.leading_bidder === req.user.username
-        const minBid = isLeader ? floor : floor + (bidItem.bid_count > 0 ? minInc : 0)
-        if (max_amount < minBid) return res.status(400).json({ error: `Min bid: $${minBid.toFixed(2)}` })
-        const { data, error } = await supabase.rpc('place_standard_bid', {
-                p_item_id: req.params.itemId,
-                p_user_id: String(req.user.id),
-                p_username: req.user.username,
-                p_max_amount: max_amount
-        });
-        if (error) return res.status(400).json({ error: error.message || 'Bid failed' });
-        res.json(data);
-  });
+// Soft close: a bid inside this window pushes the lot's end time out,
+// so nobody can win by sniping in the final seconds.
+const SOFT_CLOSE_WINDOW_MS = 3 * 60 * 1000; // 3 minutes
 
-  app.get('/auction/:id/items/standard-status', async (req, res) => {
-        const { data, error } = await supabase.from('auction_items').select('*').eq('auction_id', req.params.id).order('position', { ascending: true });
-        if (error) return res.status(500).json({ error: 'Failed to load items' });
-        res.json(data);
+app.post('/auction/:id/items/:itemId/bid', requireAuth, async (req, res) => {
+  const { max_amount } = req.body;
+  if (!max_amount || max_amount < 1) return res.status(400).json({ error: 'max_amount required' });
+
+  // Server-side bid increment validation
+  const { data: bidItem } = await supabase
+    .from('auction_items')
+    .select('current_bid,starting_bid,bid_count,leading_bidder,status,ends_at')
+    .eq('id', req.params.itemId).single();
+  if (!bidItem) return res.status(404).json({ error: 'Item not found' });
+  if (bidItem.status === 'sold' || bidItem.status === 'unsold') return res.status(400).json({ error: 'Lot is closed' });
+  if (bidItem.ends_at && new Date(bidItem.ends_at) <= new Date()) return res.status(400).json({ error: 'Lot has closed' });
+
+  const floor = bidItem.current_bid || bidItem.starting_bid || 0;
+  const minInc = floor < 50 ? 1 : floor < 100 ? 2 : floor < 200 ? 5 : floor < 500 ? 10 : floor < 1000 ? 25 : 50;
+  const isLeader = bidItem.leading_bidder === req.user.username;
+  const minBid = isLeader ? floor : floor + (bidItem.bid_count > 0 ? minInc : 0);
+  if (max_amount < minBid) return res.status(400).json({ error: `Min bid: $${minBid.toFixed(2)}` });
+
+  const { data, error } = await supabase.rpc('place_standard_bid', {
+    p_item_id: req.params.itemId,
+    p_user_id: String(req.user.id),
+    p_username: req.user.username,
+    p_max_amount: max_amount
   });
+  if (error) return res.status(400).json({ error: error.message || 'Bid failed' });
+
+  // Soft close / anti-snipe: if this bid landed inside the window, extend the lot.
+  let extendedTo = null;
+  try {
+    if (bidItem.ends_at) {
+      const endsAt = new Date(bidItem.ends_at);
+      const msLeft = endsAt.getTime() - Date.now();
+      if (msLeft > 0 && msLeft < SOFT_CLOSE_WINDOW_MS) {
+        const newEnd = new Date(Date.now() + SOFT_CLOSE_WINDOW_MS);
+        const { error: extErr } = await supabase
+          .from('auction_items').update({ ends_at: newEnd.toISOString() }).eq('id', req.params.itemId);
+        if (!extErr) {
+          extendedTo = newEnd.toISOString();
+          io.to(req.params.id).emit('item_extended', {
+            item_id: req.params.itemId,
+            ends_at: extendedTo,
+          });
+          console.log(`Soft close: lot ${req.params.itemId} extended to ${extendedTo}`);
+        }
+      }
+    }
+  } catch (e) {
+    console.error('Soft close error:', e.message); // never fail the bid over this
+  }
+
+  res.json({ ...data, ends_at: extendedTo || bidItem.ends_at, extended: !!extendedTo });
+});
+
+app.get('/auction/:id/items/standard-status', async (req, res) => {
+  const { data, error } = await supabase.from('auction_items').select('*').eq('auction_id', req.params.id).order('position', { ascending: true });
+  if (error) return res.status(500).json({ error: 'Failed to load items' });
+  res.json(data);
+});
 
 const PORT = process.env.PORT || 3001;
 
@@ -1033,12 +1089,29 @@ app.post('/auction/:auctionId/items/:itemId/images', requireAuth, async (req, re
 });
 
 app.delete('/item-image/:imageId', requireAuth, async (req, res) => {
+    // Verify the caller actually hosts the auction this image belongs to
+    const { data: img } = await supabase
+      .from('item_images').select('item_id').eq('id', req.params.imageId).single();
+    if (!img) return res.status(404).json({ error: 'Image not found' });
+
+    const { data: item } = await supabase
+      .from('auction_items').select('auction_id').eq('id', img.item_id).single();
+    if (!item) return res.status(404).json({ error: 'Item not found' });
+
+    const { data: auction } = await supabase
+      .from('auctions').select('host_username').eq('id', item.auction_id).single();
+    if (!auction) return res.status(404).json({ error: 'Auction not found' });
+
+    if (req.user.username !== ADMIN_USERNAME && req.user.username !== auction.host_username) {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+
     const { error } = await supabase.from('item_images').delete().eq('id', req.params.imageId);
     if (error) return res.status(500).json({ error: 'Failed to delete image' });
     res.status(204).send();
 });
 
-// ── Image upload ──
+// -- Image upload --
 async function initStorage() {
   try {
     const { data: buckets } = await supabase.storage.listBuckets();
@@ -1070,24 +1143,40 @@ app.post('/upload-image', requireAuth, express.raw({ type: 'image/*', limit: '5m
 server.keepAliveTimeout = 61000; // keep connections open longer than Railway's proxy timeout
 server.headersTimeout = 65000;
 
-server.keepAliveTimeout = 61000; // keep connections alive longer than proxy timeout
-server.headersTimeout = 65000;
-
 // Auto-close standard auction items when their ends_at passes
 async function autoCloseStandardItems() {
   try {
     const now = new Date().toISOString()
 
-    // Step 1: Close any items whose ends_at has passed and aren't already closed
+    // Step 1: Close any items whose ends_at has passed and aren't already closed.
+    // This is the ONLY place standard lots get closed - see note on
+    // sweepExpiredStandardItems above.
     const { data: expiredItems } = await supabase
       .from('auction_items')
-      .select('id, auction_id, bid_count, leading_bidder')
+      .select('id, auction_id, bid_count, leading_bidder, current_bid, reserve_price')
       .lt('ends_at', now)
       .not('status', 'in', '("sold","unsold")')
+
     if (expiredItems?.length) {
       for (const item of expiredItems) {
-        const newStatus = (item.bid_count > 0 || item.leading_bidder) ? 'sold' : 'unsold'
-        await supabase.from('auction_items').update({ status: newStatus }).eq('id', item.id)
+        const hasWinner = !!item.leading_bidder && item.bid_count > 0
+
+        // Respect a reserve price if one is set
+        const reserve = item.reserve_price != null ? parseFloat(item.reserve_price) : null
+        const metReserve = reserve == null || parseFloat(item.current_bid || 0) >= reserve
+
+        const sold = hasWinner && metReserve
+        const newStatus = sold ? 'sold' : 'unsold'
+
+        const { error: updErr } = await supabase
+          .from('auction_items').update({ status: newStatus }).eq('id', item.id)
+        if (updErr) { console.error('Close item failed:', item.id, updErr.message); continue }
+
+        // Create the order for the winner. createOrderOnWin is idempotent.
+        if (sold) {
+          await createOrderOnWin(item.auction_id, item.leading_bidder, item.current_bid, item.id)
+        }
+        console.log(`Standard item ${item.id} closed: ${newStatus}`)
       }
     }
 
@@ -1123,9 +1212,7 @@ autoCloseStandardItems()
 
 
 server.listen(PORT, async () => {
-  console.log(`ÃÂÃÂ°ÃÂÃÂÃÂÃÂÃÂÃÂ WhatTheFind Live server running on port ${PORT}`);
+  console.log(`WhatTheFind Live server running on port ${PORT}`);
   await resumeLiveAuctions();
-      sweepExpiredStandardItems();
-      setInterval(sweepExpiredStandardItems, 15000);
   initStorage();
 });
