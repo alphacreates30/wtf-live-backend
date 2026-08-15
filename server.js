@@ -1042,7 +1042,8 @@ app.post('/auction/:id/items/:itemId/bid', requireAuth, async (req, res) => {
     p_item_id: req.params.itemId,
     p_user_id: String(req.user.id),
     p_username: req.user.username,
-    p_max_amount: max_amount
+    p_max_amount: max_amount,
+    p_opening_min: OPENING_BID_MIN
   });
   if (error) return res.status(400).json({ error: error.message || 'Bid failed' });
 
