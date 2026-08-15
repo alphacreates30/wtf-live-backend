@@ -9,6 +9,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { AccessToken } = require('livekit-server-sdk');
 const Stripe = require('stripe');
 const nodemailer = require('nodemailer');
+const aiLots = require('./ai_lots');
 
 const app = express();
 const server = http.createServer(app);
@@ -20,7 +21,10 @@ const io = new Server(server, {
 // -- Stripe webhook needs raw body --
 app.use('/webhook/stripe', express.raw({ type: 'application/json' }));
 app.use(cors());
-app.use(express.json());
+// 60mb to accommodate base64 photo batches on the AI lot endpoints - Express
+// only applies the first body parser it hits, so a route-specific limit
+// declared later (e.g. on /ai/analyze-lot) never overrides this default.
+app.use(express.json({ limit: '60mb' }));
 
 // -- Clients --
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
@@ -418,7 +422,8 @@ app.post('/auction', requireAuth, async (req, res) => {
   const { title, description, image_url, category, starting_bid, starts_at, ends_at, mode } = req.body;
     const auctionMode = mode === 'standard' ? 'standard' : 'live';
     if (!title) return res.status(400).json({ error: 'title is required' });
-    if (!starting_bid || starting_bid < 1) return res.status(400).json({ error: 'starting_bid must be at least 1' });
+    // Standard auction lots start at $0.00 by design - only reject missing/negative.
+    if (starting_bid == null || Number(starting_bid) < 0) return res.status(400).json({ error: 'starting_bid must be 0 or more' });
       if (ends_at && new Date(ends_at) <= new Date()) return res.status(400).json({ error: 'ends_at must be in the future' });
   const { data, error } = await supabase.from('auctions').insert({
     title, description, image_url, category, starting_bid, current_bid: starting_bid,
@@ -949,7 +954,7 @@ app.post('/auction/:id/items', requireAdmin, async (req, res) => {
       const position = ex && ex.length ? ex[0].position + 1 : 0;
       const { data: auctionRow } = await supabase.from('auctions').select('mode').eq('id', req.params.id).single();
       const isStandard = auctionRow && auctionRow.mode === 'standard';
-      const { data, error } = await supabase.from('auction_items').insert({ auction_id: req.params.id, title, description, image_url, starting_bid: starting_bid || 1, position, status: isStandard ? 'open' : 'pending', current_bid: isStandard ? (starting_bid || 1) : null, ends_at: isStandard ? (ends_at || null) : null }).select().single();
+      const { data, error } = await supabase.from('auction_items').insert({ auction_id: req.params.id, title, description, image_url, starting_bid: starting_bid ?? 0, position, status: isStandard ? 'open' : 'pending', current_bid: isStandard ? (starting_bid ?? 0) : null, ends_at: isStandard ? (ends_at || null) : null }).select().single();
       if (error) return res.status(500).json({ error });
   res.status(201).json(data);
 });
@@ -1005,6 +1010,11 @@ app.delete('/auction/:id/items/:itemId/prebid', requireAuth, async (req, res) =>
 // so nobody can win by sniping in the final seconds.
 const SOFT_CLOSE_WINDOW_MS = 3 * 60 * 1000; // 3 minutes
 
+// Lots open at $0.00, so "current bid + increment" would allow a $0 opening
+// bid. This is the floor for the first bid on a lot; every bid after it
+// follows the normal increment tiers.
+const OPENING_BID_MIN = 1;
+
 app.post('/auction/:id/items/:itemId/bid', requireAuth, async (req, res) => {
   const { max_amount } = req.body;
   if (!max_amount || max_amount < 1) return res.status(400).json({ error: 'max_amount required' });
@@ -1018,10 +1028,14 @@ app.post('/auction/:id/items/:itemId/bid', requireAuth, async (req, res) => {
   if (bidItem.status === 'sold' || bidItem.status === 'unsold') return res.status(400).json({ error: 'Lot is closed' });
   if (bidItem.ends_at && new Date(bidItem.ends_at) <= new Date()) return res.status(400).json({ error: 'Lot has closed' });
 
-  const floor = bidItem.current_bid || bidItem.starting_bid || 0;
+  const floor = Number(bidItem.current_bid ?? bidItem.starting_bid ?? 0);
   const minInc = floor < 50 ? 1 : floor < 100 ? 2 : floor < 200 ? 5 : floor < 500 ? 10 : floor < 1000 ? 25 : 50;
   const isLeader = bidItem.leading_bidder === req.user.username;
-  const minBid = isLeader ? floor : floor + (bidItem.bid_count > 0 ? minInc : 0);
+  // Lots start at $0.00, so the opening bid can't just be the floor - it would
+  // be $0. OPENING_BID_MIN is the smallest first bid on a lot with no bids yet.
+  const minBid = isLeader
+    ? floor
+    : (bidItem.bid_count > 0 ? floor + minInc : Math.max(floor, OPENING_BID_MIN));
   if (max_amount < minBid) return res.status(400).json({ error: `Min bid: $${minBid.toFixed(2)}` });
 
   const { data, error } = await supabase.rpc('place_standard_bid', {
@@ -1066,6 +1080,134 @@ app.get('/auction/:id/items/standard-status', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
+
+// ---------------------------------------------------------------------------
+// AI bulk lot creation
+//
+// Grouping and analysis are stateless: the browser holds the photos and sends
+// base64 straight to these endpoints. Nothing is written to storage or the DB
+// until the host confirms and calls the bulk-create endpoint below, so an
+// abandoned batch costs a couple of API calls and no cleanup.
+// ---------------------------------------------------------------------------
+
+// JSON bodies of base64 photos are far larger than the default 100kb limit.
+const aiJson = express.json({ limit: '60mb' });
+
+// Step 1: which photos belong to the same lot. Thumbnails only - small and
+// cheap, since this pass only needs to tell items apart, not read maker marks.
+app.post('/ai/group-photos', requireAdmin, aiJson, async (req, res) => {
+    const thumbnails = req.body?.thumbnails;
+    if (!Array.isArray(thumbnails) || !thumbnails.length) {
+        return res.status(400).json({ error: 'thumbnails array is required' });
+    }
+    if (thumbnails.length > aiLots.PHOTO_SOFT_CAP) {
+        return res.status(400).json({
+            error: `That's ${thumbnails.length} photos - please keep batches at or under ` +
+                   `${aiLots.PHOTO_SOFT_CAP} and split the rest into another batch.`
+        });
+    }
+    try {
+        const groups = await aiLots.groupPhotos(thumbnails);
+        res.json({ groups, photo_count: thumbnails.length, lot_count: groups.length });
+    } catch (e) {
+        console.error('AI grouping failed:', e.message);
+        res.status(502).json({ error: `AI grouping failed: ${e.message}` });
+    }
+});
+
+// Step 2: catalogue one confirmed group. Higher-resolution images than step 1,
+// because this pass reads labels, signatures and damage.
+app.post('/ai/analyze-lot', requireAdmin, aiJson, async (req, res) => {
+    const { images, condition } = req.body || {};
+    if (!Array.isArray(images) || !images.length) {
+        return res.status(400).json({ error: 'images array is required' });
+    }
+    try {
+        const analysis = await aiLots.analyzeLot(images, condition || '');
+        res.json(analysis);
+    } catch (e) {
+        console.error('AI analysis failed:', e.message);
+        res.status(502).json({ error: `AI analysis failed: ${e.message}` });
+    }
+});
+
+// Step 2b: host corrected a wrong title and wants the body rewritten to match.
+// Text-only - no photos, so it is fast and cheap.
+app.post('/ai/regenerate-description', requireAdmin, async (req, res) => {
+    const { title, condition } = req.body || {};
+    if (!title) return res.status(400).json({ error: 'title is required' });
+    try {
+        const result = await aiLots.regenerateDescription(title, condition || '');
+        res.json(result);
+    } catch (e) {
+        console.error('AI regeneration failed:', e.message);
+        res.status(502).json({ error: `AI regeneration failed: ${e.message}` });
+    }
+});
+
+// Step 3: commit the reviewed lots. Images must already be uploaded via
+// /upload-image - this takes URLs, not base64, so the payload stays small.
+//
+// Partial success is deliberate: on a 200-lot batch, failing everything
+// because lot 147 had a bad field would be worse than reporting which ones
+// failed and keeping the rest.
+app.post('/auction/:id/items/bulk', requireAdmin, express.json({ limit: '10mb' }), async (req, res) => {
+    const lots = req.body?.lots;
+    if (!Array.isArray(lots) || !lots.length) {
+        return res.status(400).json({ error: 'lots array is required' });
+    }
+
+    const { data: auction } = await supabase.from('auctions').select('id, mode').eq('id', req.params.id).single();
+    if (!auction) return res.status(404).json({ error: 'Auction not found' });
+
+    // Append after any lots already on this auction.
+    const { data: existing } = await supabase
+        .from('auction_items').select('position').eq('auction_id', req.params.id)
+        .order('position', { ascending: false }).limit(1);
+    let position = existing && existing.length ? (existing[0].position + 1) : 0;
+
+    const created = [];
+    const failed = [];
+
+    for (let i = 0; i < lots.length; i++) {
+        const lot = lots[i] || {};
+        if (!lot.title) { failed.push({ index: i, error: 'title is required' }); continue; }
+        try {
+            const { data: item, error } = await supabase.from('auction_items').insert({
+                auction_id: req.params.id,
+                title: lot.title,
+                description: lot.description || null,
+                condition: lot.condition || null,
+                starting_bid: 0,           // every lot opens at $0.00
+                current_bid: 0,
+                reserve_price: lot.reserve_price != null && lot.reserve_price !== ''
+                    ? Number(lot.reserve_price) : null,
+                image_url: (lot.image_urls && lot.image_urls[0]) || null,
+                position: position++,
+                status: 'open',
+                ends_at: lot.ends_at || null,
+            }).select().single();
+
+            if (error) { failed.push({ index: i, title: lot.title, error: error.message }); continue; }
+
+            // Remaining photos become gallery images for the lot.
+            const extra = (lot.image_urls || []).slice(1);
+            for (let p = 0; p < extra.length; p++) {
+                await supabase.from('item_images').insert({ item_id: item.id, url: extra[p], position: p + 1 });
+            }
+            created.push({ index: i, id: item.id, title: item.title, position: item.position });
+        } catch (e) {
+            failed.push({ index: i, title: lot.title, error: e.message });
+        }
+    }
+
+    res.status(created.length ? 201 : 400).json({
+        created_count: created.length,
+        failed_count: failed.length,
+        created,
+        failed,
+    });
+});
 
 // -- Item Images --
 app.get('/auction/:auctionId/items/:itemId/images', async (req, res) => {
