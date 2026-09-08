@@ -1006,9 +1006,10 @@ app.delete('/auction/:id/items/:itemId/prebid', requireAuth, async (req, res) =>
 });
 
 // STANDARD AUCTION: proxy (max) bidding via place_standard_bid RPC
-// Soft close: a bid inside this window pushes the lot's end time out,
-// so nobody can win by sniping in the final seconds.
-const SOFT_CLOSE_WINDOW_MS = 3 * 60 * 1000; // 3 minutes
+// Soft close: the RPC extends ends_at atomically inside its own
+// transaction/row lock when a bid lands inside this window. Passed
+// through so the window value lives in one place.
+const SOFT_CLOSE_MINUTES = 2;
 
 // Lots open at $0.00, so "current bid + increment" would allow a $0 opening
 // bid. This is the floor for the first bid on a lot; every bid after it
@@ -1043,35 +1044,22 @@ app.post('/auction/:id/items/:itemId/bid', requireAuth, async (req, res) => {
     p_user_id: String(req.user.id),
     p_username: req.user.username,
     p_max_amount: max_amount,
-    p_opening_min: OPENING_BID_MIN
+    p_opening_min: OPENING_BID_MIN,
+    p_soft_close_minutes: SOFT_CLOSE_MINUTES
   });
   if (error) return res.status(400).json({ error: error.message || 'Bid failed' });
 
-  // Soft close / anti-snipe: if this bid landed inside the window, extend the lot.
-  let extendedTo = null;
-  try {
-    if (bidItem.ends_at) {
-      const endsAt = new Date(bidItem.ends_at);
-      const msLeft = endsAt.getTime() - Date.now();
-      if (msLeft > 0 && msLeft < SOFT_CLOSE_WINDOW_MS) {
-        const newEnd = new Date(Date.now() + SOFT_CLOSE_WINDOW_MS);
-        const { error: extErr } = await supabase
-          .from('auction_items').update({ ends_at: newEnd.toISOString() }).eq('id', req.params.itemId);
-        if (!extErr) {
-          extendedTo = newEnd.toISOString();
-          io.to(req.params.id).emit('item_extended', {
-            item_id: req.params.itemId,
-            ends_at: extendedTo,
-          });
-          console.log(`Soft close: lot ${req.params.itemId} extended to ${extendedTo}`);
-        }
-      }
-    }
-  } catch (e) {
-    console.error('Soft close error:', e.message); // never fail the bid over this
+  // The RPC already extended ends_at atomically if this bid landed inside
+  // the soft-close window. Detect it by comparing to the pre-call read
+  // instead of doing a second write.
+  const prevEndsAt = bidItem.ends_at ? new Date(bidItem.ends_at).getTime() : null;
+  const newEndsAt = data.ends_at ? new Date(data.ends_at).getTime() : null;
+  const extended = prevEndsAt !== null && newEndsAt !== null && newEndsAt !== prevEndsAt;
+  if (extended) {
+    io.to(req.params.id).emit('item_extended', { item_id: req.params.itemId, ends_at: data.ends_at });
+    console.log(`Soft close: lot ${req.params.itemId} extended to ${data.ends_at}`);
   }
-
-  res.json({ ...data, ends_at: extendedTo || bidItem.ends_at, extended: !!extendedTo });
+  res.json({ ...data, extended });
 });
 
 app.get('/auction/:id/items/standard-status', async (req, res) => {
