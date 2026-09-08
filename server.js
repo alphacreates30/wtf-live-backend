@@ -418,6 +418,27 @@ app.get('/auction/:id', async (req, res) => {
   res.json(data);
 });
 
+app.patch('/auction/:id', requireAdmin, async (req, res) => {
+  const { title, description, category, buyers_premium_pct } = req.body;
+  const u = {};
+  if (title !== undefined) {
+    if (!title) return res.status(400).json({ error: 'title cannot be empty' });
+    u.title = title;
+  }
+  if (description !== undefined) u.description = description;
+  if (category !== undefined) u.category = category;
+  if (buyers_premium_pct !== undefined) {
+    const pct = Number(buyers_premium_pct);
+    if (!Number.isFinite(pct) || pct < 0 || pct > 50) {
+      return res.status(400).json({ error: 'buyers_premium_pct must be between 0 and 50' });
+    }
+    u.buyers_premium_pct = pct;
+  }
+  const { data, error } = await supabase.from('auctions').update(u).eq('id', req.params.id).select().single();
+  if (error || !data) return res.status(404).json({ error: 'Auction not found' });
+  res.json(data);
+});
+
 app.post('/auction', requireAuth, async (req, res) => {
   const { title, description, image_url, category, starting_bid, starts_at, ends_at, mode } = req.body;
     const auctionMode = mode === 'standard' ? 'standard' : 'live';
@@ -771,8 +792,15 @@ async function createOrderOnWin(auctionId, winnerUsername, finalBid, itemId) {
     const { data: winner } = await supabase.from('users').select('id').eq('username', winnerUsername).single();
     if (!winner) return;
     const { data: profile } = await supabase.from('profiles').select('*').eq('user_id', String(winner.id)).single();
-    const { data: auction } = await supabase.from('auctions').select('title, description').eq('id', auctionId).single();
+    const { data: auction } = await supabase.from('auctions').select('title, description, buyers_premium_pct').eq('id', auctionId).single();
     if (!auction) return;
+
+    // Money math in integer cents only - store the computed amounts, not the
+    // rate, so a later premium-rate change can't rewrite past orders.
+    const hammerCents = Math.round((finalBid || 0) * 100);
+    const premiumPct = auction.buyers_premium_pct ?? 15;
+    const premiumCents = Math.round(hammerCents * premiumPct / 100);
+    const totalCents = hammerCents + premiumCents;
 
     // Use the actual LOT title/description when we have an item; fall back to the auction
     let itemTitle = auction.title;
@@ -803,6 +831,9 @@ async function createOrderOnWin(auctionId, winnerUsername, finalBid, itemId) {
       ship_zip: profile?.zip || '',
       ship_country: profile?.country || 'US',
       status: 'pending',
+      hammer_cents: hammerCents,
+      premium_cents: premiumCents,
+      total_cents: totalCents,
     });
     console.log('Order created for ' + winnerUsername + ' - auction ' + auctionId + (itemId ? ' item ' + itemId : ''));
   } catch (e) {
