@@ -191,8 +191,7 @@ app.post('/create-setup-intent', requireAuth, async (req, res) => {
         metadata: { user_id: String(req.user.id), username: req.user.username },
       });
       customerId = customer.id;
-      // Store customer ID - profile may not exist yet so use upsert
-      await supabase.from('profiles').upsert({ user_id: String(req.user.id), stripe_customer_id: customerId }, { onConflict: 'user_id' });
+      await supabase.from('profiles').update({ stripe_customer_id: customerId }).eq('user_id', String(req.user.id));
     }
 
     const setupIntent = await stripe.setupIntents.create({
