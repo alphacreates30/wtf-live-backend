@@ -219,6 +219,29 @@ app.post('/save-payment-method', requireAuth, async (req, res) => {
     await supabase.from('profiles').update({ stripe_payment_method_id: payment_method_id, payment_status: 'ok' })
       .eq('user_id', String(req.user.id));
 
+    // $1 authorization, released immediately - proves the card can actually
+    // be charged, without moving any money. The card is already saved above,
+    // so a failure here shouldn't fail this request; just record the result.
+    try {
+      const pi = await stripe.paymentIntents.create({
+        amount: 100,
+        currency: 'usd',
+        customer: customer_id,
+        payment_method: payment_method_id,
+        confirm: true,
+        off_session: true,
+        capture_method: 'manual',
+      });
+      await stripe.paymentIntents.cancel(pi.id);
+      await supabase.from('profiles')
+        .update({ card_verified_at: new Date().toISOString(), card_verify_error: null })
+        .eq('user_id', String(req.user.id));
+    } catch (verifyErr) {
+      await supabase.from('profiles')
+        .update({ card_verified_at: null, card_verify_error: verifyErr.message })
+        .eq('user_id', String(req.user.id));
+    }
+
     res.json({ success: true });
   } catch (e) {
     console.error('Save payment method error:', e.message);
