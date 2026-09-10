@@ -250,49 +250,46 @@ app.post('/save-payment-method', requireAuth, async (req, res) => {
 
 // -- Stripe: charge winner --
 app.post('/charge-winner', requireAuth, async (req, res) => {
-  const { auction_id, winner_username, amount_cents } = req.body;
-  if (!auction_id || !winner_username || !amount_cents) {
-    return res.status(400).json({ error: 'auction_id, winner_username, amount_cents required' });
+  const { auction_id, winner_username, order_id } = req.body;
+  if (!order_id && (!auction_id || !winner_username)) {
+    return res.status(400).json({ error: 'order_id, or auction_id and winner_username, required' });
   }
 
   // Must be admin or host
-  const { data: auction } = await supabase.from('auctions').select('host_username').eq('id', auction_id).single();
+  let auctionIdForAuth = auction_id;
+  if (!auctionIdForAuth) {
+    const { data: orderForAuth } = await supabase.from('orders').select('auction_id').eq('id', order_id).single();
+    auctionIdForAuth = orderForAuth?.auction_id;
+  }
+  const { data: auction } = await supabase.from('auctions').select('host_username').eq('id', auctionIdForAuth).single();
   if (!auction) return res.status(404).json({ error: 'Auction not found' });
   if (req.user.username !== ADMIN_USERNAME && req.user.username !== auction.host_username) {
     return res.status(403).json({ error: 'Not authorized to charge' });
   }
 
-  // Get winner's user_id
-  const { data: winner } = await supabase.from('users').select('id').eq('username', winner_username).single();
-  if (!winner) return res.status(404).json({ error: 'Winner not found' });
-
-  const { data: profile } = await supabase.from('profiles').select('stripe_customer_id, stripe_payment_method_id').eq('user_id', String(winner.id)).single();
-  if (!profile?.stripe_payment_method_id) {
-    return res.status(400).json({ error: 'Winner has no payment method on file' });
+  let targetOrderId = order_id;
+  if (!targetOrderId) {
+    // Legacy lookup by auction + winner. A standard auction where the same
+    // buyer won multiple lots has multiple unpaid orders here - refuse to
+    // guess which one; the caller must pass order_id.
+    const { data: orders } = await supabase
+      .from('orders')
+      .select('id')
+      .eq('auction_id', auction_id)
+      .eq('buyer_username', winner_username)
+      .eq('payment_status', 'unpaid');
+    if (!orders?.length) return res.status(404).json({ error: 'No unpaid order found for this winner on this auction' });
+    if (orders.length > 1) {
+      return res.status(400).json({ error: 'Multiple unpaid orders match this winner on this auction - pass order_id' });
+    }
+    targetOrderId = orders[0].id;
   }
 
-  try {
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: amount_cents,
-      currency: 'usd',
-      customer: profile.stripe_customer_id,
-      payment_method: profile.stripe_payment_method_id,
-      confirm: true,
-      off_session: true,
-      metadata: { auction_id, winner_username },
-    });
-
-    await supabase.from('profiles').update({ payment_status: 'ok' }).eq('user_id', String(winner.id));
-    res.json({ success: true, payment_intent_id: paymentIntent.id });
-  } catch (e) {
-    console.error('Charge error:', e.message);
-    // Flag payment failed - buyer stays approved, admin decides next steps
-    await supabase.from('profiles').update({ payment_status: 'failed' }).eq('user_id', String(winner.id));
-    await sendAdminEmail(
-      `Payment failed - ${winner_username}`,
-      `Payment failed for auction ${auction_id}.\nWinner: ${winner_username}\nAmount: $${(amount_cents / 100).toFixed(2)}\nError: ${e.message}`
-    );
-    res.status(402).json({ error: 'Payment failed', detail: e.message });
+  const result = await chargeOrder(targetOrderId);
+  if (result.success) {
+    res.json({ success: true, payment_intent_id: result.payment_intent_id });
+  } else {
+    res.status(402).json({ error: 'Payment failed', detail: result.error });
   }
 });
 
@@ -308,16 +305,17 @@ app.post('/webhook/stripe', async (req, res) => {
 
   if (event.type === 'payment_intent.payment_failed') {
     const pi = event.data.object;
-    const { winner_username, auction_id } = pi.metadata;
+    const { order_id, winner_username, auction_id } = pi.metadata || {};
+    const reason = pi.last_payment_error?.message || 'unknown';
+    if (order_id) {
+      // Source of truth for whether an order is paid - not profiles, which
+      // Phase D's UI doesn't read for this.
+      await supabase.from('orders').update({ payment_status: 'failed', payment_error: reason }).eq('id', order_id);
+    }
     if (winner_username) {
-      const { data: winnerUser } = await supabase.from('users').select('id').eq('username', winner_username).single();
-      if (winnerUser) {
-        // Flag only - buyer stays approved, admin handles manually
-        await supabase.from('profiles').update({ payment_status: 'failed' }).eq('user_id', String(winnerUser.id));
-      }
       await sendAdminEmail(
         `Stripe payment failed - ${winner_username}`,
-        `Stripe payment_intent.payment_failed\nWinner: ${winner_username}\nAuction: ${auction_id}\nError: ${pi.last_payment_error?.message || 'unknown'}`
+        `Stripe payment_intent.payment_failed\nOrder: ${order_id || 'unknown'}\nWinner: ${winner_username}\nAuction: ${auction_id}\nError: ${reason}`
       );
     }
   }
@@ -863,6 +861,78 @@ async function createOrderOnWin(auctionId, winnerUsername, finalBid, itemId) {
   }
 }
 
+// Charges an order's buyer off-session for total_cents. Idempotent - a no-op
+// if payment_intent_id is already set, so re-running the close job (or a
+// retry) can never double-charge. Never throws: every path resolves with
+// {success, ...}, so a Stripe outage can't take down a caller like the
+// auto-close job.
+async function chargeOrder(orderId) {
+  try {
+    const { data: order } = await supabase.from('orders').select('*').eq('id', orderId).single();
+    if (!order) return { success: false, error: 'Order not found' };
+    if (order.payment_intent_id) {
+      return { success: true, payment_intent_id: order.payment_intent_id, alreadyCharged: true };
+    }
+
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('stripe_customer_id, stripe_payment_method_id')
+      .eq('user_id', order.buyer_user_id)
+      .single();
+
+    if (!profile?.stripe_customer_id || !profile?.stripe_payment_method_id) {
+      const reason = 'No payment method on file';
+      await supabase.from('orders').update({ payment_status: 'failed', payment_error: reason }).eq('id', orderId);
+      await sendAdminEmail(
+        `Payment failed - ${order.buyer_username}`,
+        `Order: ${orderId}\nAuction: ${order.auction_id}\nBuyer: ${order.buyer_username}\nAmount: $${((order.total_cents || 0) / 100).toFixed(2)}\nReason: ${reason}`
+      );
+      return { success: false, error: reason };
+    }
+
+    if (!stripe) {
+      const reason = 'Stripe not configured';
+      await supabase.from('orders').update({ payment_status: 'failed', payment_error: reason }).eq('id', orderId);
+      await sendAdminEmail(`Payment failed - ${order.buyer_username}`, `Order: ${orderId}\nReason: ${reason}`);
+      return { success: false, error: reason };
+    }
+
+    // Idempotency key keyed on the order id: the payment_intent_id check
+    // above is read-then-write and can race (e.g. the auto-close job and a
+    // manual retry landing at once) - this makes Stripe itself refuse to
+    // create a second PaymentIntent for the same order no matter how the
+    // race falls. Stable per order by design for this phase; a real retry
+    // after a genuine decline (Phase D) will need its own key strategy so
+    // it isn't served the cached failure.
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: order.total_cents || 0,
+      currency: 'usd',
+      customer: profile.stripe_customer_id,
+      payment_method: profile.stripe_payment_method_id,
+      confirm: true,
+      off_session: true,
+      metadata: { order_id: orderId, auction_id: order.auction_id, winner_username: order.buyer_username },
+    }, { idempotencyKey: `order-${orderId}` });
+
+    await supabase.from('orders')
+      .update({ payment_intent_id: paymentIntent.id, payment_status: 'paid', payment_error: null })
+      .eq('id', orderId);
+    return { success: true, payment_intent_id: paymentIntent.id };
+  } catch (e) {
+    console.error('chargeOrder error:', orderId, e.message);
+    try {
+      await supabase.from('orders').update({ payment_status: 'failed', payment_error: e.message }).eq('id', orderId);
+    } catch (updateErr) {
+      console.error('chargeOrder: failed to record failure on order', orderId, updateErr.message);
+    }
+    await sendAdminEmail(
+      `Payment failed - order ${orderId}`,
+      `chargeOrder failed.\nOrder: ${orderId}\nError: ${e.message}`
+    );
+    return { success: false, error: e.message };
+  }
+}
+
 app.get('/admin/orders', requireAdmin, async (req, res) => {
   const { data, error } = await supabase
     .from('orders')
@@ -1359,6 +1429,16 @@ async function autoCloseStandardItems() {
         // Create the order for the winner. createOrderOnWin is idempotent.
         if (sold) {
           await createOrderOnWin(item.auction_id, item.leading_bidder, item.current_bid, item.id)
+
+          // Auto-charge, in its own try/catch: a Stripe outage must never
+          // stop a lot from closing. chargeOrder itself never throws, but
+          // this stays defensive in case the order lookup below fails.
+          try {
+            const { data: newOrders } = await supabase.from('orders').select('id').eq('item_id', item.id).limit(1)
+            if (newOrders?.[0]) await chargeOrder(newOrders[0].id)
+          } catch (chargeErr) {
+            console.error('Auto-charge failed for item', item.id, chargeErr.message)
+          }
         }
         console.log(`Standard item ${item.id} closed: ${newStatus}`)
       }
