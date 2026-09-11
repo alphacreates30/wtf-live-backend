@@ -34,6 +34,12 @@ const JWT_SECRET = process.env.JWT_SECRET || 'change-me-in-production';
 const ADMIN_USERNAME = 'whatthefind';
 
 // -- Email transport (Nodemailer - set SMTP_* env vars or swap for Resend) --
+// Short timeouts: nodemailer's defaults (connectionTimeout alone is 2
+// minutes) mean a wrong host/port/credential silently blocks every caller
+// of sendAdminEmail for that long - including chargeOrder on its way to
+// resolving, and the sequential auto-close loop's processing of every
+// other lot in that same tick. sendAdminEmail already never throws past
+// this file; this makes sure it also never hangs.
 const mailer = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.gmail.com',
   port: parseInt(process.env.SMTP_PORT || '587'),
@@ -42,6 +48,9 @@ const mailer = nodemailer.createTransport({
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS,
   },
+  connectionTimeout: 8000,
+  greetingTimeout: 8000,
+  socketTimeout: 8000,
 });
 
 async function sendAdminEmail(subject, text) {
@@ -873,16 +882,38 @@ async function createOrderOnWin(auctionId, winnerUsername, finalBid, itemId) {
 }
 
 // Charges an order's buyer off-session for total_cents. Idempotent - a no-op
-// if payment_intent_id is already set, so re-running the close job (or a
-// retry) can never double-charge. Never throws: every path resolves with
-// {success, ...}, so a Stripe outage can't take down a caller like the
-// auto-close job.
+// if payment_intent_id is already set, and any other in-flight or already-
+// resolved order is skipped by an atomic claim before the charge, so two
+// callers (the auto-close job, a manual Charge/Retry click) can never both
+// charge the same order. Never throws: every path resolves with {success,
+// ...}, so a Stripe outage can't take down a caller like the auto-close job.
 async function chargeOrder(orderId) {
   try {
     const { data: order } = await supabase.from('orders').select('*').eq('id', orderId).single();
     if (!order) return { success: false, error: 'Order not found' };
     if (order.payment_intent_id) {
       return { success: true, payment_intent_id: order.payment_intent_id, alreadyCharged: true };
+    }
+
+    // Atomically claim this order before charging - the real defense against
+    // two callers (the auto-close job, a manual Charge/Retry click, a
+    // double-click) both proceeding at once. A conditional UPDATE is
+    // serialized by Postgres row locking, so at most one caller's UPDATE
+    // matches and gets a row back; the other sees payment_status already
+    // moved off unpaid/failed and backs off. This is what lets each
+    // genuinely new attempt (e.g. a Phase D retry after a real decline) use
+    // a fresh idempotency key below instead of a stable per-order one,
+    // without reopening the double-charge race a stable key was closing.
+    const { data: claimed, error: claimErr } = await supabase
+      .from('orders')
+      .update({ payment_status: 'charging' })
+      .eq('id', orderId)
+      .is('payment_intent_id', null)
+      .in('payment_status', ['unpaid', 'failed'])
+      .select()
+      .single();
+    if (claimErr || !claimed) {
+      return { success: false, error: 'Already being charged or already resolved', skipped: true };
     }
 
     const { data: profile } = await supabase
@@ -908,13 +939,13 @@ async function chargeOrder(orderId) {
       return { success: false, error: reason };
     }
 
-    // Idempotency key keyed on the order id: the payment_intent_id check
-    // above is read-then-write and can race (e.g. the auto-close job and a
-    // manual retry landing at once) - this makes Stripe itself refuse to
-    // create a second PaymentIntent for the same order no matter how the
-    // race falls. Stable per order by design for this phase; a real retry
-    // after a genuine decline (Phase D) will need its own key strategy so
-    // it isn't served the cached failure.
+    // Idempotency key is fresh per claimed attempt (not stable per order):
+    // the claim above is what makes concurrent duplicate calls safe now, so
+    // this only has to guard against our own network-level retry of this
+    // one Stripe request - it no longer needs to survive across a later,
+    // genuinely separate retry. A stable per-order key would have made a
+    // Phase D "Retry" replay the first attempt's cached failure instead of
+    // actually trying again.
     const paymentIntent = await stripe.paymentIntents.create({
       amount: order.total_cents || 0,
       currency: 'usd',
@@ -923,7 +954,7 @@ async function chargeOrder(orderId) {
       confirm: true,
       off_session: true,
       metadata: { order_id: orderId, auction_id: order.auction_id, winner_username: order.buyer_username },
-    }, { idempotencyKey: `order-${orderId}` });
+    }, { idempotencyKey: `order-${orderId}-${require('crypto').randomUUID()}` });
 
     await supabase.from('orders')
       .update({ payment_intent_id: paymentIntent.id, payment_status: 'paid', payment_error: null })
