@@ -904,12 +904,21 @@ async function chargeOrder(orderId) {
     // genuinely new attempt (e.g. a Phase D retry after a real decline) use
     // a fresh idempotency key below instead of a stable per-order one,
     // without reopening the double-charge race a stable key was closing.
+    //
+    // Also reclaimable: a row stuck in 'charging' for over 5 minutes. Every
+    // Railway deploy restarts the container, so a push landing between the
+    // claim and the Stripe result stranded the order there permanently -
+    // reclaim only matched unpaid/failed, and the UI disables its button on
+    // 'charging' with no way to unstick it. charging_since is what lets a
+    // later caller tell "actively being charged right now" apart from
+    // "was claimed once and the process died before it could resolve".
+    const staleCutoff = new Date(Date.now() - 5 * 60 * 1000).toISOString();
     const { data: claimed, error: claimErr } = await supabase
       .from('orders')
-      .update({ payment_status: 'charging' })
+      .update({ payment_status: 'charging', charging_since: new Date().toISOString() })
       .eq('id', orderId)
       .is('payment_intent_id', null)
-      .in('payment_status', ['unpaid', 'failed'])
+      .or(`payment_status.in.(unpaid,failed),and(payment_status.eq.charging,charging_since.lt.${staleCutoff})`)
       .select()
       .single();
     if (claimErr || !claimed) {
