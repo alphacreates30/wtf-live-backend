@@ -800,20 +800,24 @@ async function shippoFetch(method, path, body) {
 }
 
 async function createOrderOnWin(auctionId, winnerUsername, finalBid, itemId) {
-  if (!winnerUsername) return;
+  if (!winnerUsername) return null;
   try {
     // Idempotency: never create a second order for the same lot
     if (itemId) {
-      const { data: existing } = await supabase
+      const { data: existing, error: existingErr } = await supabase
         .from('orders').select('id').eq('item_id', itemId).limit(1);
-      if (existing && existing.length) return;
+      if (existingErr) {
+        console.error('Order idempotency check failed:', existingErr.message);
+        return null;
+      }
+      if (existing && existing.length) return existing[0].id;
     }
 
-    const { data: winner } = await supabase.from('users').select('id').eq('username', winnerUsername).single();
-    if (!winner) return;
+    const { data: winner, error: winnerErr } = await supabase.from('users').select('id').eq('username', winnerUsername).single();
+    if (winnerErr || !winner) return null;
     const { data: profile } = await supabase.from('profiles').select('*').eq('user_id', String(winner.id)).single();
-    const { data: auction } = await supabase.from('auctions').select('title, description, buyers_premium_pct').eq('id', auctionId).single();
-    if (!auction) return;
+    const { data: auction, error: auctionErr } = await supabase.from('auctions').select('title, description, buyers_premium_pct').eq('id', auctionId).single();
+    if (auctionErr || !auction) return null;
 
     // Money math in integer cents only - store the computed amounts, not the
     // rate, so a later premium-rate change can't rewrite past orders.
@@ -835,7 +839,7 @@ async function createOrderOnWin(auctionId, winnerUsername, finalBid, itemId) {
       }
     }
 
-    await supabase.from('orders').insert({
+    const { data: inserted, error: insertErr } = await supabase.from('orders').insert({
       auction_id: auctionId,
       item_id: itemId || null,
       buyer_username: winnerUsername,
@@ -854,10 +858,17 @@ async function createOrderOnWin(auctionId, winnerUsername, finalBid, itemId) {
       hammer_cents: hammerCents,
       premium_cents: premiumCents,
       total_cents: totalCents,
-    });
+    }).select('id').single();
+
+    if (insertErr) {
+      console.error('Order creation error:', insertErr.message);
+      return null;
+    }
     console.log('Order created for ' + winnerUsername + ' - auction ' + auctionId + (itemId ? ' item ' + itemId : ''));
+    return inserted.id;
   } catch (e) {
     console.error('Order creation error:', e.message);
+    return null;
   }
 }
 
@@ -1405,13 +1416,18 @@ async function autoCloseStandardItems() {
     // Step 1: Close any items whose ends_at has passed and aren't already closed.
     // This is the ONLY place standard lots get closed - see note on
     // sweepExpiredStandardItems above.
-    const { data: expiredItems } = await supabase
+    const { data: expiredItems, error: expiredErr } = await supabase
       .from('auction_items')
       .select('id, auction_id, bid_count, leading_bidder, current_bid, reserve_price')
       .lt('ends_at', now)
       .not('status', 'in', '("sold","unsold")')
 
-    if (expiredItems?.length) {
+    if (expiredErr) {
+      // Without this the whole sweep silently no-ops on a DB error - next
+      // tick retries, but a persistent error would close nothing forever
+      // with zero signal. Log it so that's visible instead.
+      console.error('autoCloseStandardItems: failed to load expired items:', expiredErr.message)
+    } else if (expiredItems?.length) {
       for (const item of expiredItems) {
         const hasWinner = !!item.leading_bidder && item.bid_count > 0
 
@@ -1426,18 +1442,22 @@ async function autoCloseStandardItems() {
           .from('auction_items').update({ status: newStatus }).eq('id', item.id)
         if (updErr) { console.error('Close item failed:', item.id, updErr.message); continue }
 
-        // Create the order for the winner. createOrderOnWin is idempotent.
+        // Create the order for the winner. createOrderOnWin is idempotent
+        // and returns the order id (existing or newly created) directly -
+        // no follow-up lookup, so there's no query here whose error could
+        // get silently dropped.
         if (sold) {
-          await createOrderOnWin(item.auction_id, item.leading_bidder, item.current_bid, item.id)
+          const orderId = await createOrderOnWin(item.auction_id, item.leading_bidder, item.current_bid, item.id)
 
           // Auto-charge, in its own try/catch: a Stripe outage must never
           // stop a lot from closing. chargeOrder itself never throws, but
-          // this stays defensive in case the order lookup below fails.
-          try {
-            const { data: newOrders } = await supabase.from('orders').select('id').eq('item_id', item.id).limit(1)
-            if (newOrders?.[0]) await chargeOrder(newOrders[0].id)
-          } catch (chargeErr) {
-            console.error('Auto-charge failed for item', item.id, chargeErr.message)
+          // this stays defensive regardless.
+          if (orderId) {
+            try {
+              await chargeOrder(orderId)
+            } catch (chargeErr) {
+              console.error('Auto-charge failed for item', item.id, chargeErr.message)
+            }
           }
         }
         console.log(`Standard item ${item.id} closed: ${newStatus}`)
