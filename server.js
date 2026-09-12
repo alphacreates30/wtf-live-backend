@@ -54,14 +54,25 @@ const mailer = nodemailer.createTransport({
 });
 
 async function sendAdminEmail(subject, text) {
-  if (!process.env.SMTP_USER) return; // skip if not configured
+  if (!process.env.RESEND_API_KEY) return; // skip if not configured
   try {
-    await mailer.sendMail({
-      from: process.env.SMTP_USER,
-      to: process.env.ADMIN_EMAIL || process.env.SMTP_USER,
-      subject,
-      text,
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: 'onboarding@resend.dev',
+        to: process.env.ADMIN_EMAIL,
+        subject,
+        text,
+      }),
+      signal: AbortSignal.timeout(8000),
     });
+    if (!res.ok) {
+      console.error('Email send error:', res.status, await res.text());
+    }
   } catch (e) {
     console.error('Email send error:', e.message);
   }
