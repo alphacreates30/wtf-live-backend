@@ -97,6 +97,17 @@ function requireAdmin(req, res, next) {
   });
 }
 
+// Decodes a bearer token if present but never rejects the request - lets a
+// route serve different data to a logged-in admin vs. everyone else (e.g.
+// draft auctions) while staying public for anonymous callers.
+function optionalAuth(req, res, next) {
+  const auth = req.headers.authorization;
+  if (auth && auth.startsWith('Bearer ')) {
+    try { req.user = jwt.verify(auth.slice(7), JWT_SECRET); } catch { /* not logged in - proceed anonymously */ }
+  }
+  next();
+}
+
 function verifySocketToken(token) {
   try { return jwt.verify(token, JWT_SECRET); } catch { return null; }
 }
@@ -228,12 +239,21 @@ app.post('/create-setup-intent', requireAuth, async (req, res) => {
 
 // Called with the confirmed payment method ID after SetupIntent confirms
 app.post('/save-payment-method', requireAuth, async (req, res) => {
-  const { payment_method_id, customer_id } = req.body;
+  const { payment_method_id } = req.body;
   if (!payment_method_id) return res.status(400).json({ error: 'payment_method_id required' });
+
+  // The Stripe customer to attach to comes from the caller's own profile,
+  // never from the request body - a client-supplied customer_id would let
+  // any logged-in user attach a card to (or change the default payment
+  // method on) an arbitrary Stripe customer.
+  const { data: profile } = await supabase.from('profiles').select('stripe_customer_id').eq('user_id', String(req.user.id)).single();
+  const customerId = profile?.stripe_customer_id;
+  if (!customerId) return res.status(400).json({ error: 'No Stripe customer on file - create a setup intent first' });
+
   try {
     // Attach to customer if needed
-    await stripe.paymentMethods.attach(payment_method_id, { customer: customer_id });
-    await stripe.customers.update(customer_id, { invoice_settings: { default_payment_method: payment_method_id } });
+    await stripe.paymentMethods.attach(payment_method_id, { customer: customerId });
+    await stripe.customers.update(customerId, { invoice_settings: { default_payment_method: payment_method_id } });
 
     await supabase.from('profiles').update({ stripe_payment_method_id: payment_method_id, payment_status: 'ok' })
       .eq('user_id', String(req.user.id));
@@ -245,7 +265,7 @@ app.post('/save-payment-method', requireAuth, async (req, res) => {
       const pi = await stripe.paymentIntents.create({
         amount: 100,
         currency: 'usd',
-        customer: customer_id,
+        customer: customerId,
         payment_method: payment_method_id,
         confirm: true,
         off_session: true,
@@ -441,20 +461,32 @@ app.get('/my-bids', requireAuth, async (req, res) => {
   res.json(result)
 })
 
-app.get('/auctions', async (req, res) => {
+app.get('/auctions', optionalAuth, async (req, res) => {
   const { status } = req.query;
+  const isAdmin = req.user?.username === ADMIN_USERNAME;
   let query = supabase.from('auctions')
         .select('id,title,description,image_url,category,starting_bid,current_bid,leading_bidder,status,starts_at,ends_at,mode,host_username,created_at')
     .order('created_at', { ascending: false });
-  if (status) query = query.eq('status', status);
+  if (status) {
+    // Drafts are private - only the admin can list them, even explicitly.
+    if (status === 'draft' && !isAdmin) return res.json([]);
+    query = query.eq('status', status);
+  } else if (!isAdmin) {
+    query = query.neq('status', 'draft');
+  }
   const { data, error } = await query;
   if (error) return res.status(500).json({ error });
   res.json(data);
 });
 
-app.get('/auction/:id', async (req, res) => {
+app.get('/auction/:id', optionalAuth, async (req, res) => {
   const { data, error } = await supabase.from('auctions').select('*').eq('id', req.params.id).single();
   if (error) return res.status(404).json({ error: 'Auction not found' });
+  // A draft is a part-built auction that must stay invisible until published -
+  // 404 instead of 403 so its existence isn't confirmed to a non-admin.
+  if (data.status === 'draft' && req.user?.username !== ADMIN_USERNAME) {
+    return res.status(404).json({ error: 'Auction not found' });
+  }
   res.json(data);
 });
 
@@ -479,16 +511,20 @@ app.patch('/auction/:id', requireAdmin, async (req, res) => {
   res.json(data);
 });
 
-app.post('/auction', requireAuth, async (req, res) => {
+app.post('/auction', requireAdmin, async (req, res) => {
   const { title, description, image_url, category, starting_bid, starts_at, ends_at, mode } = req.body;
     const auctionMode = mode === 'standard' ? 'standard' : 'live';
     if (!title) return res.status(400).json({ error: 'title is required' });
     // Standard auction lots start at $0.00 by design - only reject missing/negative.
     if (starting_bid == null || Number(starting_bid) < 0) return res.status(400).json({ error: 'starting_bid must be 0 or more' });
       if (ends_at && new Date(ends_at) <= new Date()) return res.status(400).json({ error: 'ends_at must be in the future' });
+  // Always created as a draft - never publicly visible until the host
+  // explicitly publishes via POST /auction/:id/publish. starts_at is
+  // resolved now (not at publish time) so a scheduled start set while
+  // drafting is preserved.
   const { data, error } = await supabase.from('auctions').insert({
     title, description, image_url, category, starting_bid, current_bid: starting_bid,
-        status: starts_at && new Date(starts_at) > new Date() ? 'upcoming' : 'live',
+        status: 'draft',
         starts_at: starts_at || new Date().toISOString(), ends_at: ends_at || null,
         mode: auctionMode,
         host_username: req.user.username
@@ -496,6 +532,36 @@ app.post('/auction', requireAuth, async (req, res) => {
 
   if (error) return res.status(500).json({ error: 'Failed to create auction' });
   res.status(201).json(data);
+});
+
+// Moves a draft auction live (or upcoming, for a scheduled starts_at) once
+// the host is ready. Requires at least one lot - publishing an empty
+// auction is almost certainly a mistake, not an intentional "coming soon".
+app.post('/auction/:id/publish', requireAdmin, async (req, res) => {
+  const { data: auction, error } = await supabase.from('auctions').select('status, starts_at').eq('id', req.params.id).single();
+  if (error || !auction) return res.status(404).json({ error: 'Auction not found' });
+  if (auction.status !== 'draft') return res.status(400).json({ error: 'Auction is not a draft' });
+
+  const { count, error: countErr } = await supabase
+    .from('auction_items')
+    .select('id', { count: 'exact', head: true })
+    .eq('auction_id', req.params.id);
+  if (countErr) return res.status(500).json({ error: 'Failed to check lots' });
+  if (!count) return res.status(400).json({ error: 'Add at least one lot before publishing' });
+
+  const newStatus = auction.starts_at && new Date(auction.starts_at) > new Date() ? 'upcoming' : 'live';
+  // Guard the transition on status still being 'draft' so a concurrent
+  // double-click can't publish twice.
+  const { data: updated, error: updateErr } = await supabase
+    .from('auctions')
+    .update({ status: newStatus })
+    .eq('id', req.params.id)
+    .eq('status', 'draft')
+    .select()
+    .single();
+  if (updateErr || !updated) return res.status(409).json({ error: 'Auction is no longer a draft' });
+
+  res.json(updated);
 });
 
 app.get('/auction/:id/token', requireAuth, async (req, res) => {
@@ -593,6 +659,15 @@ io.on('connection', (socket) => {
 
     const user = token ? verifySocketToken(token) : null;
 
+    // Drafts are private - resolve this BEFORE joining the room or emitting
+    // any state (auction_state/bid_history/chat_history). Checking after
+    // would already have leaked the auction to anyone who has its id.
+    const { data: auction } = await supabase.from('auctions').select('*').eq('id', auctionId).single();
+    if (auction && auction.status === 'draft' && (!user || user.username !== ADMIN_USERNAME)) {
+      socket.emit('auction_error', { code: 'not_found', message: 'Auction not found.' });
+      return;
+    }
+
     // Check approval status for authenticated users
     if (user) {
       socket.userId = String(user.id);
@@ -627,7 +702,6 @@ io.on('connection', (socket) => {
     viewers[auctionId].add(socket.id);
     io.to(auctionId).emit('viewer_count', viewers[auctionId].size);
 
-    const { data: auction } = await supabase.from('auctions').select('*').eq('id', auctionId).single();
     if (auction) {
       socket.emit('auction_state', auction);
       if (auction.status === 'live' && auction.ends_at) startAuctionTimer(auctionId, auction.ends_at);
@@ -1125,7 +1199,11 @@ app.post('/webhook/shippo', async (req, res) => {
 
 // AUCTION ITEMS AND PRE-BIDS
 
-app.get('/auction/:id/items', async (req, res) => {
+app.get('/auction/:id/items', optionalAuth, async (req, res) => {
+  const { data: auction } = await supabase.from('auctions').select('status').eq('id', req.params.id).single();
+  if (auction?.status === 'draft' && req.user?.username !== ADMIN_USERNAME) {
+    return res.status(404).json({ error: 'Auction not found' });
+  }
   const { data, error } = await supabase
     .from('auction_items').select('*').eq('auction_id', req.params.id).order('position', { ascending: true });
   if (error) return res.status(500).json({ error });
@@ -1166,6 +1244,9 @@ app.delete('/auction/:id/items/:itemId', requireAdmin, async (req, res) => {
 app.post('/auction/:id/items/:itemId/prebid', requireAuth, async (req, res) => {
   const { max_amount } = req.body;
   if (!max_amount || max_amount < 1) return res.status(400).json({ error: 'max_amount required' });
+  const { data: auctionRow } = await supabase.from('auctions').select('status').eq('id', req.params.id).single();
+  if (!auctionRow) return res.status(404).json({ error: 'Auction not found' });
+  if (auctionRow.status === 'draft') return res.status(400).json({ error: 'Auction is not published yet' });
   const { data: item } = await supabase.from('auction_items').select('status').eq('id', req.params.itemId).single();
   if (!item) return res.status(404).json({ error: 'Item not found' });
   if (item.status !== 'pending') return res.status(400).json({ error: 'Pre-bidding closed' });
@@ -1204,6 +1285,10 @@ const OPENING_BID_MIN = 1;
 app.post('/auction/:id/items/:itemId/bid', requireAuth, async (req, res) => {
   const { max_amount } = req.body;
   if (!max_amount || max_amount < 1) return res.status(400).json({ error: 'max_amount required' });
+
+  const { data: auctionRow } = await supabase.from('auctions').select('status').eq('id', req.params.id).single();
+  if (!auctionRow) return res.status(404).json({ error: 'Auction not found' });
+  if (auctionRow.status === 'draft') return res.status(400).json({ error: 'Auction is not published yet' });
 
   // Server-side bid increment validation
   const { data: bidItem } = await supabase
@@ -1247,7 +1332,11 @@ app.post('/auction/:id/items/:itemId/bid', requireAuth, async (req, res) => {
   res.json({ ...data, extended });
 });
 
-app.get('/auction/:id/items/standard-status', async (req, res) => {
+app.get('/auction/:id/items/standard-status', optionalAuth, async (req, res) => {
+  const { data: auction } = await supabase.from('auctions').select('status').eq('id', req.params.id).single();
+  if (auction?.status === 'draft' && req.user?.username !== ADMIN_USERNAME) {
+    return res.status(404).json({ error: 'Auction not found' });
+  }
   const { data, error } = await supabase.from('auction_items').select('*').eq('auction_id', req.params.id).order('position', { ascending: true });
   if (error) return res.status(500).json({ error: 'Failed to load items' });
   res.json(data);
@@ -1438,7 +1527,7 @@ async function initStorage() {
   } catch (e) { console.error('Storage init error:', e.message); }
 }
 
-app.post('/upload-image', requireAuth, express.raw({ type: 'image/*', limit: '5mb' }), async (req, res) => {
+app.post('/upload-image', requireAdmin, express.raw({ type: 'image/*', limit: '5mb' }), async (req, res) => {
   try {
     const mimeType = (req.headers['content-type'] || 'image/jpeg').split(';')[0];
     const buffer = req.body;
@@ -1464,6 +1553,13 @@ async function autoCloseStandardItems() {
   try {
     const now = new Date().toISOString()
 
+    // A draft's lots must never close or create orders, even if their
+    // ends_at (set while still drafting) has already passed by publish time.
+    const { data: draftAuctions, error: draftErr } = await supabase
+      .from('auctions').select('id').eq('status', 'draft')
+    if (draftErr) console.error('autoCloseStandardItems: failed to load draft auctions:', draftErr.message)
+    const draftAuctionIds = new Set((draftAuctions || []).map(a => a.id))
+
     // Step 1: Close any items whose ends_at has passed and aren't already closed.
     // This is the ONLY place standard lots get closed - see note on
     // sweepExpiredStandardItems above.
@@ -1480,6 +1576,7 @@ async function autoCloseStandardItems() {
       console.error('autoCloseStandardItems: failed to load expired items:', expiredErr.message)
     } else if (expiredItems?.length) {
       for (const item of expiredItems) {
+        if (draftAuctionIds.has(item.auction_id)) continue
         const hasWinner = !!item.leading_bidder && item.bid_count > 0
 
         // Respect a reserve price if one is set
