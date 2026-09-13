@@ -513,7 +513,14 @@ app.patch('/auction/:id', requireAdmin, async (req, res) => {
 
 app.post('/auction', requireAdmin, async (req, res) => {
   const { title, description, image_url, category, starting_bid, starts_at, ends_at, mode } = req.body;
-    const auctionMode = mode === 'standard' ? 'standard' : 'live';
+    // Live auctions are gated off (v2): createOrderOnWin is called from the
+    // live socket path (start_auction timer / end_auction) with no charging
+    // ever wired in, and live bidding still runs through the old place_bid
+    // RPC (no proxy bidding, tiered increments, or atomic row lock that
+    // place_standard_bid has). Reject explicitly instead of silently
+    // coercing to standard so a live request surfaces, not disappears.
+    if (mode === 'live') return res.status(400).json({ error: 'Live auctions are not available yet' });
+    const auctionMode = 'standard';
     if (!title) return res.status(400).json({ error: 'title is required' });
     // Standard auction lots start at $0.00 by design - only reject missing/negative.
     if (starting_bid == null || Number(starting_bid) < 0) return res.status(400).json({ error: 'starting_bid must be 0 or more' });
@@ -716,6 +723,12 @@ io.on('connection', (socket) => {
     console.log(`- ${socket.id} joined auction ${auctionId} - ${viewers[auctionId].size} watching`);
   });
 
+  // Live-auction bidding is gated off (v2), same as POST /auction rejecting
+  // mode 'live': this path still calls the old place_bid RPC, not
+  // place_standard_bid, so it has no proxy bidding, no tiered increments,
+  // and no atomic row lock; and live auctions never charge (createOrderOnWin
+  // is only wired into autoCloseStandardItems, not the live socket path).
+  // Don't re-enable without fixing both.
   socket.on('place_bid', async ({ auctionId, amount, token }) => {
     const user = verifySocketToken(token);
     if (!user) { socket.emit('bid_error', { message: 'You must be logged in to bid' }); return; }
