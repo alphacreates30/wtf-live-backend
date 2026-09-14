@@ -1262,6 +1262,16 @@ async function shippoFetch(method, path, body) {
   return res.json();
 }
 
+// TEMPORARY - read-only, admin-gated diagnostic to confirm whether a Shippo
+// webhook is actually registered against this backend before assuming the
+// tracking-update pipeline works. Remove once the shipping path has been
+// verified end to end (see 2026-09-14 session).
+app.get('/admin/shippo-webhooks', requireAdmin, async (req, res) => {
+  if (!SHIPPO_API_KEY) return res.status(500).json({ error: 'SHIPPO_API_KEY not configured' });
+  const data = await shippoFetch('GET', '/webhooks/');
+  res.json(data);
+});
+
 async function createOrderOnWin(auctionId, winnerUsername, finalBid, itemId) {
   if (!winnerUsername) return null;
   try {
@@ -1473,6 +1483,11 @@ app.post('/admin/orders/label', requireAdmin, async (req, res) => {
         state: process.env.SHIP_FROM_STATE || '',
         zip: process.env.SHIP_FROM_ZIP || '',
         country: process.env.SHIP_FROM_COUNTRY || 'US',
+        // USPS rejects the shipment ("address_from.email must not be empty")
+        // without this - found 2026-09-14 exercising the path for the first
+        // time. No SHIP_FROM_EMAIL is configured, so fall back to the admin
+        // inbox that's already set up.
+        email: process.env.SHIP_FROM_EMAIL || process.env.ADMIN_EMAIL || '',
       },
       address_to: {
         name: o.ship_name,
