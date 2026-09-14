@@ -60,12 +60,49 @@ const ADMIN_FROM = 'WhatTheFind Live <alerts@whatthefind.live>';
 const BUYER_FROM = 'WhatTheFind Live <auctions@whatthefind.live>';
 const REPLY_TO = 'whatthefind.co@gmail.com';
 
+// Resend's free tier is 3,000/month but capped at 100/day, and a day that
+// hits the cap gets EVERYTHING rejected - including won/charged, which must
+// never be dropped. email_send_log has one row per email actually accepted
+// by Resend today (any kind); once that count is near the cap, only the
+// lowest-value kind (outbid) gets suppressed - won/failed/shipped/admin
+// always go through regardless of volume.
+const DAILY_EMAIL_CAP = 100;
+const OUTBID_SUPPRESS_AT = 90;
+
+function startOfTodayUTC() {
+  const d = new Date();
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())).toISOString();
+}
+
+// Fails CLOSED: if the count itself can't be read, we can't prove we're
+// clear of the cap, so treat outbid as suppressed rather than risk being the
+// send that trips Resend into rejecting a won/failed/shipped email today.
+async function shouldSuppressOutbid() {
+  const { count, error } = await supabase
+    .from('email_send_log')
+    .select('id', { count: 'exact', head: true })
+    .gte('sent_at', startOfTodayUTC());
+  if (error) {
+    console.error('shouldSuppressOutbid: count query failed, suppressing outbid to be safe:', error.message);
+    return true;
+  }
+  return (count || 0) >= OUTBID_SUPPRESS_AT;
+}
+
 // Shared send path for every outgoing email (admin alerts and buyer-facing
 // mail alike) - never throws and never hangs past the 8s timeout, so a
 // Resend outage can't block a charge, an auto-close tick, or a bid response.
-async function sendEmail({ from, to, subject, html, text }) {
+// kind categorizes the send for the daily volume count and the outbid
+// suppression check above; pass 'outbid' only for the outbid email itself.
+async function sendEmail({ from, to, subject, html, text, kind = 'other' }) {
   if (!process.env.RESEND_API_KEY) return; // skip if not configured
   if (!to) return;
+
+  if (kind === 'outbid' && await shouldSuppressOutbid()) {
+    console.error(`OUTBID EMAIL SUPPRESSED (near ${DAILY_EMAIL_CAP}/day Resend cap): to=${to} subject="${subject}"`);
+    return;
+  }
+
   try {
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
@@ -78,6 +115,12 @@ async function sendEmail({ from, to, subject, html, text }) {
     });
     if (!res.ok) {
       console.error('Email send error:', res.status, await res.text());
+      return;
+    }
+    try {
+      await supabase.from('email_send_log').insert({ kind });
+    } catch (logErr) {
+      console.error('email_send_log insert failed:', logErr.message);
     }
   } catch (e) {
     console.error('Email send error:', e.message);
@@ -85,7 +128,7 @@ async function sendEmail({ from, to, subject, html, text }) {
 }
 
 async function sendAdminEmail(subject, text) {
-  await sendEmail({ from: ADMIN_FROM, to: process.env.ADMIN_EMAIL, subject, text });
+  await sendEmail({ from: ADMIN_FROM, to: process.env.ADMIN_EMAIL, subject, text, kind: 'admin' });
 }
 
 // ------------------------------------------------------------
@@ -210,6 +253,7 @@ async function notifyWonAndCharged(orderId, paymentIntentId) {
       to: email,
       subject: `You won "${order.item_title}" - payment charged`,
       html: wonChargedEmailHtml(order, last4),
+      kind: 'won',
     });
   } catch (e) {
     console.error('notifyWonAndCharged error:', orderId, e.message);
@@ -238,6 +282,7 @@ async function notifyPaymentFailed(orderId, reason) {
       to: email,
       subject: `Payment issue - you won "${order.item_title}"`,
       html: paymentFailedEmailHtml(order, reason),
+      kind: 'failed',
     });
   } catch (e) {
     console.error('notifyPaymentFailed error:', orderId, e.message);
@@ -273,6 +318,28 @@ async function claimOutbidEmailSlot(itemId, username) {
   return !!inserted;
 }
 
+// outbid_email_log otherwise grows forever - one row per (lot, bidder) ever
+// throttled, never removed on its own. The 10-minute window makes anything
+// past a day pointless to keep, so sweep it out periodically rather than
+// on every claim (which would turn every bid into a delete query too).
+const OUTBID_LOG_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+async function cleanupOutbidEmailLog() {
+  try {
+    const cutoff = new Date(Date.now() - OUTBID_LOG_RETENTION_MS).toISOString();
+    const { error, count } = await supabase
+      .from('outbid_email_log')
+      .delete({ count: 'exact' })
+      .lt('last_sent_at', cutoff);
+    if (error) console.error('cleanupOutbidEmailLog error:', error.message);
+    else if (count) console.log(`cleanupOutbidEmailLog: removed ${count} stale row(s)`);
+  } catch (e) {
+    console.error('cleanupOutbidEmailLog error:', e.message);
+  }
+}
+setInterval(cleanupOutbidEmailLog, 60 * 60 * 1000); // hourly
+cleanupOutbidEmailLog();
+
 // previousLeader is the lot's leading_bidder BEFORE the bid that triggered
 // this call. Re-reads the item fresh rather than trusting the RPC response
 // shape, so this stays correct regardless of exactly what place_standard_bid
@@ -297,6 +364,7 @@ async function notifyOutbidIfNeeded(itemId, previousLeader) {
       to: email,
       subject: `You've been outbid on "${item.title}"`,
       html: outbidEmailHtml(item),
+      kind: 'outbid',
     });
   } catch (e) {
     console.error('notifyOutbidIfNeeded error:', itemId, e.message);
@@ -324,6 +392,7 @@ async function notifyShipped(orderId) {
       to: email,
       subject: `Your item has shipped: "${order.item_title}"`,
       html: shippedEmailHtml(order),
+      kind: 'shipped',
     });
   } catch (e) {
     console.error('notifyShipped error:', orderId, e.message);
