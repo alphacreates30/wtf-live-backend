@@ -1488,6 +1488,10 @@ app.post('/admin/orders/label', requireAdmin, async (req, res) => {
         // time. No SHIP_FROM_EMAIL is configured, so fall back to the admin
         // inbox that's already set up.
         email: process.env.SHIP_FROM_EMAIL || process.env.ADMIN_EMAIL || '',
+        // USPS also requires this - found immediately after fixing the email
+        // one above, same exercise. No existing value to fall back to (unlike
+        // email/ADMIN_EMAIL), so this is blank until SHIP_FROM_PHONE is set.
+        phone: process.env.SHIP_FROM_PHONE || '',
       },
       address_to: {
         name: o.ship_name,
