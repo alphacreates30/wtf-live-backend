@@ -767,7 +767,7 @@ app.get('/my-bids', requireAuth, async (req, res) => {
 
   const auctionIds = [...new Set((items || []).map(i => i.auction_id))]
   const { data: auctions } = await supabase
-    .from('auctions').select('id, title, status, mode').in('id', auctionIds)
+    .from('auctions').select('id, title, status, mode, buyers_premium_pct').in('id', auctionIds)
   const auctionMap = Object.fromEntries((auctions || []).map(a => [a.id, a]))
 
   const result = (items || []).map(item => {
