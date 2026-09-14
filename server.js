@@ -1305,6 +1305,16 @@ app.patch('/admin/orders/:id/tracking-number', requireAdmin, async (req, res) =>
   res.json(data);
 });
 
+// TEMPORARY - shipped_email_sent_at is claimed atomically BEFORE the actual
+// send attempt (see notifyShipped), so it alone doesn't prove Resend
+// accepted the email - a row here does, since sendEmail only inserts after
+// res.ok.
+app.get('/admin/email-send-log', requireAdmin, async (req, res) => {
+  const { data, error } = await supabase.from('email_send_log').select('*').order('sent_at', { ascending: false }).limit(10);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
 async function createOrderOnWin(auctionId, winnerUsername, finalBid, itemId) {
   if (!winnerUsername) return null;
   try {
