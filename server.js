@@ -53,8 +53,19 @@ const mailer = nodemailer.createTransport({
   socketTimeout: 8000,
 });
 
-async function sendAdminEmail(subject, text) {
+// whatthefind.live is Resend-verified for sending; it has no MX on the apex,
+// so mail sent TO @whatthefind.live bounces. Reply-To always points at a real
+// inbox so a buyer replying to a "you won" email actually reaches someone.
+const ADMIN_FROM = 'WhatTheFind Live <alerts@whatthefind.live>';
+const BUYER_FROM = 'WhatTheFind Live <auctions@whatthefind.live>';
+const REPLY_TO = 'whatthefind.co@gmail.com';
+
+// Shared send path for every outgoing email (admin alerts and buyer-facing
+// mail alike) - never throws and never hangs past the 8s timeout, so a
+// Resend outage can't block a charge, an auto-close tick, or a bid response.
+async function sendEmail({ from, to, subject, html, text }) {
   if (!process.env.RESEND_API_KEY) return; // skip if not configured
+  if (!to) return;
   try {
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
@@ -62,12 +73,7 @@ async function sendAdminEmail(subject, text) {
         Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        from: 'onboarding@resend.dev',
-        to: process.env.ADMIN_EMAIL,
-        subject,
-        text,
-      }),
+      body: JSON.stringify({ from, to, reply_to: REPLY_TO, subject, html, text }),
       signal: AbortSignal.timeout(8000),
     });
     if (!res.ok) {
@@ -75,6 +81,252 @@ async function sendAdminEmail(subject, text) {
     }
   } catch (e) {
     console.error('Email send error:', e.message);
+  }
+}
+
+async function sendAdminEmail(subject, text) {
+  await sendEmail({ from: ADMIN_FROM, to: process.env.ADMIN_EMAIL, subject, text });
+}
+
+// ------------------------------------------------------------
+// BUYER EMAIL NOTIFICATIONS (won/charged, payment failed, outbid, shipped)
+// ------------------------------------------------------------
+// Plain transactional HTML - no images, no tracking pixels. Every email that
+// mentions a charge shows the hammer price and buyer's premium as separate
+// line items, never a bare total.
+
+const OUTBID_THROTTLE_MS = 10 * 60 * 1000;
+
+function escapeHtml(str) {
+  return String(str ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// order.hammer_cents/premium_cents/total_cents are integer cents; formatMoney
+// is for those. auction_items.current_bid is a plain dollar figure - use
+// formatDollars for that instead.
+function formatMoney(cents) { return '$' + (Number(cents || 0) / 100).toFixed(2); }
+function formatDollars(n) { return '$' + Number(n || 0).toFixed(2); }
+
+function emailHtml(heading, bodyHtml) {
+  return `<!DOCTYPE html>
+<html>
+  <body style="margin:0;padding:0;background:#f5f5f5;font-family:Arial,Helvetica,sans-serif;color:#222;">
+    <div style="max-width:520px;margin:0 auto;padding:24px 20px;">
+      <h2 style="margin:0 0 16px;font-size:18px;">${heading}</h2>
+      ${bodyHtml}
+      <p style="margin-top:32px;font-size:12px;color:#777;">WhatTheFind Live &middot; reply to this email if you have questions.</p>
+    </div>
+  </body>
+</html>`;
+}
+
+function wonChargedEmailHtml(order, last4) {
+  const premiumPct = order.hammer_cents > 0 ? Math.round((order.premium_cents / order.hammer_cents) * 100) : 0;
+  const cardLine = last4 ? `<p style="margin:16px 0 0;color:#555;">Card ending in ${escapeHtml(last4)} was charged.</p>` : '';
+  return emailHtml('You won it - and your card has been charged', `
+    <p>Congratulations! You won <strong>${escapeHtml(order.item_title)}</strong>.</p>
+    <table style="width:100%;border-collapse:collapse;margin:16px 0;">
+      <tr><td style="padding:4px 0;color:#555;">Hammer price</td><td style="padding:4px 0;text-align:right;">${formatMoney(order.hammer_cents)}</td></tr>
+      <tr><td style="padding:4px 0;color:#555;">Buyer's premium (${premiumPct}%)</td><td style="padding:4px 0;text-align:right;">${formatMoney(order.premium_cents)}</td></tr>
+      <tr><td style="padding:8px 0 0;font-weight:bold;border-top:1px solid #ddd;">Total charged</td><td style="padding:8px 0 0;text-align:right;font-weight:bold;border-top:1px solid #ddd;">${formatMoney(order.total_cents)}</td></tr>
+    </table>
+    ${cardLine}
+    <p style="margin:16px 0 0;">What happens next: the host will pack and ship your item, and you'll get another email with tracking once it's on its way.</p>
+  `);
+}
+
+function paymentFailedEmailHtml(order, reason) {
+  const premiumPct = order.hammer_cents > 0 ? Math.round((order.premium_cents / order.hammer_cents) * 100) : 0;
+  return emailHtml('You won - but your card did not go through', `
+    <p>You won <strong>${escapeHtml(order.item_title)}</strong>, but we were unable to charge the card on file.</p>
+    <table style="width:100%;border-collapse:collapse;margin:16px 0;">
+      <tr><td style="padding:4px 0;color:#555;">Hammer price</td><td style="padding:4px 0;text-align:right;">${formatMoney(order.hammer_cents)}</td></tr>
+      <tr><td style="padding:4px 0;color:#555;">Buyer's premium (${premiumPct}%)</td><td style="padding:4px 0;text-align:right;">${formatMoney(order.premium_cents)}</td></tr>
+      <tr><td style="padding:8px 0 0;font-weight:bold;border-top:1px solid #ddd;">Total due</td><td style="padding:8px 0 0;text-align:right;font-weight:bold;border-top:1px solid #ddd;">${formatMoney(order.total_cents)}</td></tr>
+    </table>
+    <p style="margin:16px 0 0;color:#555;">Reason: ${escapeHtml(reason)}</p>
+    <p style="margin:16px 0 0;">Your win is still reserved for you. To fix this, log in to WhatTheFind Live and update your payment method on your profile, then reply to this email so the charge can be retried.</p>
+  `);
+}
+
+function outbidEmailHtml(item) {
+  return emailHtml('You have been outbid', `
+    <p>Someone placed a higher bid on <strong>${escapeHtml(item.title)}</strong>.</p>
+    <p style="margin:16px 0;">Current bid: <strong>${formatDollars(item.current_bid)}</strong></p>
+    <p>Log in to WhatTheFind Live if you'd like to bid again before the lot closes.</p>
+  `);
+}
+
+function shippedEmailHtml(order) {
+  return emailHtml('Your item has shipped', `
+    <p><strong>${escapeHtml(order.item_title)}</strong> is on its way.</p>
+    <table style="width:100%;border-collapse:collapse;margin:16px 0;">
+      <tr><td style="padding:4px 0;color:#555;">Carrier</td><td style="padding:4px 0;text-align:right;">${escapeHtml(order.tracking_carrier || 'N/A')}</td></tr>
+      <tr><td style="padding:4px 0;color:#555;">Tracking number</td><td style="padding:4px 0;text-align:right;">${escapeHtml(order.tracking_number || 'N/A')}</td></tr>
+    </table>
+  `);
+}
+
+async function getBuyerEmail(userId) {
+  const { data: profile } = await supabase.from('profiles').select('email').eq('user_id', String(userId)).single();
+  return profile?.email || null;
+}
+
+async function getEmailForUsername(username) {
+  const { data: user } = await supabase.from('users').select('id').eq('username', username).single();
+  if (!user) return null;
+  return getBuyerEmail(user.id);
+}
+
+// Called on every chargeOrder resolution that means "the buyer won and was
+// successfully charged" - including the already-charged replay path, so a
+// process crash between a first successful charge and its email still gets
+// healed by the next call. Idempotent via the won_email_sent_at claim: only
+// the caller that flips it from null actually sends.
+async function notifyWonAndCharged(orderId, paymentIntentId) {
+  try {
+    const { data: order, error } = await supabase
+      .from('orders')
+      .update({ won_email_sent_at: new Date().toISOString() })
+      .eq('id', orderId)
+      .is('won_email_sent_at', null)
+      .select('*')
+      .single();
+    if (error || !order) return; // already sent, or order missing
+
+    const email = await getBuyerEmail(order.buyer_user_id);
+    if (!email) return;
+
+    let last4 = null;
+    try {
+      if (stripe && paymentIntentId) {
+        const pi = await stripe.paymentIntents.retrieve(paymentIntentId, { expand: ['payment_method'] });
+        last4 = pi.payment_method?.card?.last4 || null;
+      }
+    } catch { /* best-effort only - last4 is a nice-to-have, never worth failing the email over */ }
+
+    await sendEmail({
+      from: BUYER_FROM,
+      to: email,
+      subject: `You won "${order.item_title}" - payment charged`,
+      html: wonChargedEmailHtml(order, last4),
+    });
+  } catch (e) {
+    console.error('notifyWonAndCharged error:', orderId, e.message);
+  }
+}
+
+// Called on every chargeOrder resolution that means "the buyer won but the
+// charge failed" - never on the concurrency-skip path (order.skipped), since
+// that isn't an actual failure. Idempotent via payment_failed_email_sent_at.
+async function notifyPaymentFailed(orderId, reason) {
+  try {
+    const { data: order, error } = await supabase
+      .from('orders')
+      .update({ payment_failed_email_sent_at: new Date().toISOString() })
+      .eq('id', orderId)
+      .is('payment_failed_email_sent_at', null)
+      .select('*')
+      .single();
+    if (error || !order) return; // already sent, or order missing
+
+    const email = await getBuyerEmail(order.buyer_user_id);
+    if (!email) return;
+
+    await sendEmail({
+      from: BUYER_FROM,
+      to: email,
+      subject: `Payment issue - you won "${order.item_title}"`,
+      html: paymentFailedEmailHtml(order, reason),
+    });
+  } catch (e) {
+    console.error('notifyPaymentFailed error:', orderId, e.message);
+  }
+}
+
+// Throttle for outbid mail: at most one per (item, outbid user) per
+// OUTBID_THROTTLE_MS. Two-step and race-safe without a raw SQL function:
+// step 1 reclaims a STALE row (last_sent_at past the window) atomically via
+// a conditional UPDATE; step 2, only reached when no stale row was reclaimed,
+// tries to INSERT a fresh row and relies on the (item_id, username) primary
+// key to turn a concurrent duplicate insert into a no-op. Either way, at
+// most one caller ever sees its write "win".
+async function claimOutbidEmailSlot(itemId, username) {
+  const cutoff = new Date(Date.now() - OUTBID_THROTTLE_MS).toISOString();
+  const nowIso = new Date().toISOString();
+
+  const { data: reclaimed } = await supabase
+    .from('outbid_email_log')
+    .update({ last_sent_at: nowIso })
+    .eq('item_id', itemId)
+    .eq('username', username)
+    .lt('last_sent_at', cutoff)
+    .select()
+    .single();
+  if (reclaimed) return true;
+
+  const { data: inserted } = await supabase
+    .from('outbid_email_log')
+    .upsert({ item_id: itemId, username, last_sent_at: nowIso }, { onConflict: 'item_id,username', ignoreDuplicates: true })
+    .select()
+    .single();
+  return !!inserted;
+}
+
+// previousLeader is the lot's leading_bidder BEFORE the bid that triggered
+// this call. Re-reads the item fresh rather than trusting the RPC response
+// shape, so this stays correct regardless of exactly what place_standard_bid
+// returns. No-ops on the very first bid on a lot (no one to outbid yet) and
+// whenever the lead didn't actually change hands (e.g. the leader's own
+// proxy absorbed a lower bid and stayed on top).
+async function notifyOutbidIfNeeded(itemId, previousLeader) {
+  if (!previousLeader) return;
+  try {
+    const { data: item } = await supabase
+      .from('auction_items').select('title, current_bid, leading_bidder').eq('id', itemId).single();
+    if (!item || !item.leading_bidder || item.leading_bidder === previousLeader) return;
+
+    const canSend = await claimOutbidEmailSlot(itemId, previousLeader);
+    if (!canSend) return;
+
+    const email = await getEmailForUsername(previousLeader);
+    if (!email) return;
+
+    await sendEmail({
+      from: BUYER_FROM,
+      to: email,
+      subject: `You've been outbid on "${item.title}"`,
+      html: outbidEmailHtml(item),
+    });
+  } catch (e) {
+    console.error('notifyOutbidIfNeeded error:', itemId, e.message);
+  }
+}
+
+// Idempotent via shipped_email_sent_at - safe to call once per order row
+// matched by the Shippo webhook even if Shippo redelivers the same event.
+async function notifyShipped(orderId) {
+  try {
+    const { data: order, error } = await supabase
+      .from('orders')
+      .update({ shipped_email_sent_at: new Date().toISOString() })
+      .eq('id', orderId)
+      .is('shipped_email_sent_at', null)
+      .select('*')
+      .single();
+    if (error || !order) return;
+
+    const email = await getBuyerEmail(order.buyer_user_id);
+    if (!email) return;
+
+    await sendEmail({
+      from: BUYER_FROM,
+      to: email,
+      subject: `Your item has shipped: "${order.item_title}"`,
+      html: shippedEmailHtml(order),
+    });
+  } catch (e) {
+    console.error('notifyShipped error:', orderId, e.message);
   }
 }
 
@@ -990,6 +1242,7 @@ async function chargeOrder(orderId) {
     const { data: order } = await supabase.from('orders').select('*').eq('id', orderId).single();
     if (!order) return { success: false, error: 'Order not found' };
     if (order.payment_intent_id) {
+      await notifyWonAndCharged(orderId, order.payment_intent_id);
       return { success: true, payment_intent_id: order.payment_intent_id, alreadyCharged: true };
     }
 
@@ -1036,6 +1289,7 @@ async function chargeOrder(orderId) {
         `Payment failed - ${order.buyer_username}`,
         `Order: ${orderId}\nAuction: ${order.auction_id}\nBuyer: ${order.buyer_username}\nAmount: $${((order.total_cents || 0) / 100).toFixed(2)}\nReason: ${reason}`
       );
+      await notifyPaymentFailed(orderId, reason);
       return { success: false, error: reason };
     }
 
@@ -1043,6 +1297,7 @@ async function chargeOrder(orderId) {
       const reason = 'Stripe not configured';
       await supabase.from('orders').update({ payment_status: 'failed', payment_error: reason }).eq('id', orderId);
       await sendAdminEmail(`Payment failed - ${order.buyer_username}`, `Order: ${orderId}\nReason: ${reason}`);
+      await notifyPaymentFailed(orderId, reason);
       return { success: false, error: reason };
     }
 
@@ -1066,6 +1321,7 @@ async function chargeOrder(orderId) {
     await supabase.from('orders')
       .update({ payment_intent_id: paymentIntent.id, payment_status: 'paid', payment_error: null })
       .eq('id', orderId);
+    await notifyWonAndCharged(orderId, paymentIntent.id);
     return { success: true, payment_intent_id: paymentIntent.id };
   } catch (e) {
     console.error('chargeOrder error:', orderId, e.message);
@@ -1078,6 +1334,7 @@ async function chargeOrder(orderId) {
       `Payment failed - order ${orderId}`,
       `chargeOrder failed.\nOrder: ${orderId}\nError: ${e.message}`
     );
+    await notifyPaymentFailed(orderId, e.message);
     return { success: false, error: e.message };
   }
 }
@@ -1199,8 +1456,15 @@ app.post('/webhook/shippo', async (req, res) => {
       if (shippoStatus === 'TRANSIT' || shippoStatus === 'PRE_TRANSIT') status = 'shipped';
       if (shippoStatus === 'DELIVERED') status = 'delivered';
       if (status && tracking_number) {
-        await supabase.from('orders').update({ status }).eq('tracking_number', tracking_number);
+        const { data: updatedOrders } = await supabase
+          .from('orders').update({ status }).eq('tracking_number', tracking_number)
+          .select('id');
         console.log('- Tracking update: ' + tracking_number + ' -> ' + status);
+        if (status === 'shipped' && updatedOrders?.length) {
+          for (const o of updatedOrders) {
+            notifyShipped(o.id).catch(e => console.error('notifyShipped error:', e.message));
+          }
+        }
       }
     }
   } catch (e) {
@@ -1343,6 +1607,11 @@ app.post('/auction/:id/items/:itemId/bid', requireAuth, async (req, res) => {
     console.log(`Soft close: lot ${req.params.itemId} extended to ${data.ends_at}`);
   }
   res.json({ ...data, extended });
+
+  // Fire-and-forget: this notifies whoever *lost* the lead, a different user
+  // than the one who just bid, so it must never delay this response.
+  notifyOutbidIfNeeded(req.params.itemId, bidItem.leading_bidder)
+    .catch(e => console.error('notifyOutbidIfNeeded error:', e.message));
 });
 
 app.get('/auction/:id/items/standard-status', optionalAuth, async (req, res) => {
