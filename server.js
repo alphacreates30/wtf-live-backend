@@ -1281,6 +1281,30 @@ app.get('/admin/shippo-track/:carrier/:trackingNumber', requireAdmin, async (req
   res.json(data);
 });
 
+// TEMPORARY - registers a Shippo test tracking object (carrier "shippo",
+// e.g. tracking_number "SHIPPO_TRANSIT") so Shippo simulates a status change
+// and fires a track_updated webhook - real carriers don't support this even
+// in test mode (confirmed via the GET diagnostic above).
+app.post('/admin/shippo-track', requireAdmin, async (req, res) => {
+  if (!SHIPPO_API_KEY) return res.status(500).json({ error: 'SHIPPO_API_KEY not configured' });
+  const { carrier, tracking_number } = req.body;
+  if (!carrier || !tracking_number) return res.status(400).json({ error: 'carrier and tracking_number required' });
+  const data = await shippoFetch('POST', '/tracks/', { carrier, tracking_number });
+  res.json(data);
+});
+
+// TEMPORARY - lets a real order's tracking_number be swapped to a Shippo
+// test value and back, so a simulated track_updated event can be tied to a
+// real order row for this verification. Nothing else in the app writes
+// tracking_number this way.
+app.patch('/admin/orders/:id/tracking-number', requireAdmin, async (req, res) => {
+  const { tracking_number } = req.body;
+  if (!tracking_number) return res.status(400).json({ error: 'tracking_number required' });
+  const { data, error } = await supabase.from('orders').update({ tracking_number }).eq('id', req.params.id).select().single();
+  if (error || !data) return res.status(404).json({ error: 'Order not found' });
+  res.json(data);
+});
+
 async function createOrderOnWin(auctionId, winnerUsername, finalBid, itemId) {
   if (!winnerUsername) return null;
   try {
