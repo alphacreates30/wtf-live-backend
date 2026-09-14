@@ -201,11 +201,14 @@ function outbidEmailHtml(item) {
 }
 
 function shippedEmailHtml(order) {
+  const trackingCell = order.tracking_url
+    ? `<a href="${escapeHtml(order.tracking_url)}" style="color:#0645ad;">${escapeHtml(order.tracking_number || 'Track shipment')}</a>`
+    : escapeHtml(order.tracking_number || 'N/A');
   return emailHtml('Your item has shipped', `
     <p><strong>${escapeHtml(order.item_title)}</strong> is on its way.</p>
     <table style="width:100%;border-collapse:collapse;margin:16px 0;">
       <tr><td style="padding:4px 0;color:#555;">Carrier</td><td style="padding:4px 0;text-align:right;">${escapeHtml(order.tracking_carrier || 'N/A')}</td></tr>
-      <tr><td style="padding:4px 0;color:#555;">Tracking number</td><td style="padding:4px 0;text-align:right;">${escapeHtml(order.tracking_number || 'N/A')}</td></tr>
+      <tr><td style="padding:4px 0;color:#555;">Tracking number</td><td style="padding:4px 0;text-align:right;">${trackingCell}</td></tr>
     </table>
   `);
 }
@@ -788,7 +791,7 @@ app.get('/my-bids', requireAuth, async (req, res) => {
 app.get('/my-orders', requireAuth, async (req, res) => {
   const { data: orders, error } = await supabase
     .from('orders')
-    .select('id, auction_id, item_title, hammer_cents, premium_cents, total_cents, payment_status, status, tracking_number, tracking_carrier, created_at')
+    .select('id, auction_id, item_title, hammer_cents, premium_cents, total_cents, payment_status, status, tracking_number, tracking_carrier, tracking_url, created_at')
     .eq('buyer_user_id', String(req.user.id))
     .order('created_at', { ascending: false });
   if (error) return res.status(500).json({ error: 'Failed to load orders' });
@@ -809,6 +812,7 @@ app.get('/my-orders', requireAuth, async (req, res) => {
     status: o.status,
     tracking_number: o.tracking_number || null,
     tracking_carrier: o.tracking_carrier || null,
+    tracking_url: o.tracking_url || null,
     created_at: o.created_at,
   })));
 });
@@ -1504,6 +1508,18 @@ app.post('/admin/orders/label', requireAdmin, async (req, res) => {
       return res.status(400).json({ error: 'Label generation failed', detail: transaction.messages });
     }
 
+    // rate.provider (e.g. "USPS") is the carrier name - a Transaction has no
+    // such field itself. tracking_url_provider is Shippo's own hosted
+    // tracking page for this shipment, and is what buyers should be linked
+    // to directly rather than a carrier slug we guess a URL from.
+    const trackingCarrier = rate.provider;
+    const trackingUrl = transaction.tracking_url_provider;
+    if (!trackingCarrier || !trackingUrl) {
+      console.error(
+        `Shippo label for order(s) ${order_ids.join(',')}: missing ${!trackingCarrier ? 'rate.provider' : ''}${!trackingCarrier && !trackingUrl ? ' and ' : ''}${!trackingUrl ? 'transaction.tracking_url_provider' : ''} after a successful label purchase - Shippo's response shape may have changed.`
+      );
+    }
+
     const groupId = orders[0].group_id || orders[0].id;
     await supabase.from('orders').update({
       status: 'label_created',
@@ -1511,7 +1527,8 @@ app.post('/admin/orders/label', requireAdmin, async (req, res) => {
       shippo_transaction_id: transaction.object_id,
       label_url: transaction.label_url,
       tracking_number: transaction.tracking_number,
-      tracking_carrier: transaction.tracking_carrier_account,
+      tracking_carrier: trackingCarrier,
+      tracking_url: trackingUrl,
     }).in('id', order_ids);
 
     res.json({
