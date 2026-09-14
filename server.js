@@ -782,6 +782,37 @@ app.get('/my-bids', requireAuth, async (req, res) => {
   res.json(result)
 })
 
+// -- My Orders (what I won and was billed for) --
+// Scoped to the caller's own JWT-derived id - never accepts a user id from
+// the client, so there's no way to request someone else's orders.
+app.get('/my-orders', requireAuth, async (req, res) => {
+  const { data: orders, error } = await supabase
+    .from('orders')
+    .select('id, auction_id, item_title, hammer_cents, premium_cents, total_cents, payment_status, status, tracking_number, tracking_carrier, created_at')
+    .eq('buyer_user_id', String(req.user.id))
+    .order('created_at', { ascending: false });
+  if (error) return res.status(500).json({ error: 'Failed to load orders' });
+  if (!orders?.length) return res.json([]);
+
+  const auctionIds = [...new Set(orders.map(o => o.auction_id))];
+  const { data: auctions } = await supabase.from('auctions').select('id, title').in('id', auctionIds);
+  const auctionTitleMap = Object.fromEntries((auctions || []).map(a => [a.id, a.title]));
+
+  res.json(orders.map(o => ({
+    id: o.id,
+    item_title: o.item_title,
+    auction_title: auctionTitleMap[o.auction_id] || null,
+    hammer_cents: o.hammer_cents,
+    premium_cents: o.premium_cents,
+    total_cents: o.total_cents,
+    payment_status: o.payment_status,
+    status: o.status,
+    tracking_number: o.tracking_number || null,
+    tracking_carrier: o.tracking_carrier || null,
+    created_at: o.created_at,
+  })));
+});
+
 app.get('/auctions', optionalAuth, async (req, res) => {
   const { status } = req.query;
   const isAdmin = req.user?.username === ADMIN_USERNAME;
