@@ -1298,9 +1298,15 @@ app.post('/admin/shippo-track', requireAdmin, async (req, res) => {
 // real order row for this verification. Nothing else in the app writes
 // tracking_number this way.
 app.patch('/admin/orders/:id/tracking-number', requireAdmin, async (req, res) => {
-  const { tracking_number } = req.body;
-  if (!tracking_number) return res.status(400).json({ error: 'tracking_number required' });
-  const { data, error } = await supabase.from('orders').update({ tracking_number }).eq('id', req.params.id).select().single();
+  const { tracking_number, reset_shipped_email_marker } = req.body;
+  const u = {};
+  if (tracking_number) u.tracking_number = tracking_number;
+  // One-off: undoes the shipped_email_sent_at claim left by the SHIPPO_TRANSIT
+  // test above, so this order isn't left flagged as emailed when its real
+  // USPS parcel never moved, and so the shipping path stays re-testable.
+  if (reset_shipped_email_marker) u.shipped_email_sent_at = null;
+  if (!Object.keys(u).length) return res.status(400).json({ error: 'tracking_number or reset_shipped_email_marker required' });
+  const { data, error } = await supabase.from('orders').update(u).eq('id', req.params.id).select().single();
   if (error || !data) return res.status(404).json({ error: 'Order not found' });
   res.json(data);
 });
