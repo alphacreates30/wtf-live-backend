@@ -1262,65 +1262,6 @@ async function shippoFetch(method, path, body) {
   return res.json();
 }
 
-// TEMPORARY - read-only, admin-gated diagnostic to confirm whether a Shippo
-// webhook is actually registered against this backend before assuming the
-// tracking-update pipeline works. Remove once the shipping path has been
-// verified end to end (see 2026-09-14 session).
-app.get('/admin/shippo-webhooks', requireAdmin, async (req, res) => {
-  if (!SHIPPO_API_KEY) return res.status(500).json({ error: 'SHIPPO_API_KEY not configured' });
-  const data = await shippoFetch('GET', '/webhooks/');
-  res.json(data);
-});
-
-// TEMPORARY - same as above, but reads Shippo's own tracking status for a
-// given carrier/number directly, independent of whether our webhook has
-// fired - lets us observe test-mode status simulation instead of guessing.
-app.get('/admin/shippo-track/:carrier/:trackingNumber', requireAdmin, async (req, res) => {
-  if (!SHIPPO_API_KEY) return res.status(500).json({ error: 'SHIPPO_API_KEY not configured' });
-  const data = await shippoFetch('GET', `/tracks/${req.params.carrier}/${req.params.trackingNumber}/`);
-  res.json(data);
-});
-
-// TEMPORARY - registers a Shippo test tracking object (carrier "shippo",
-// e.g. tracking_number "SHIPPO_TRANSIT") so Shippo simulates a status change
-// and fires a track_updated webhook - real carriers don't support this even
-// in test mode (confirmed via the GET diagnostic above).
-app.post('/admin/shippo-track', requireAdmin, async (req, res) => {
-  if (!SHIPPO_API_KEY) return res.status(500).json({ error: 'SHIPPO_API_KEY not configured' });
-  const { carrier, tracking_number } = req.body;
-  if (!carrier || !tracking_number) return res.status(400).json({ error: 'carrier and tracking_number required' });
-  const data = await shippoFetch('POST', '/tracks/', { carrier, tracking_number });
-  res.json(data);
-});
-
-// TEMPORARY - lets a real order's tracking_number be swapped to a Shippo
-// test value and back, so a simulated track_updated event can be tied to a
-// real order row for this verification. Nothing else in the app writes
-// tracking_number this way.
-app.patch('/admin/orders/:id/tracking-number', requireAdmin, async (req, res) => {
-  const { tracking_number, reset_shipped_email_marker } = req.body;
-  const u = {};
-  if (tracking_number) u.tracking_number = tracking_number;
-  // One-off: undoes the shipped_email_sent_at claim left by the SHIPPO_TRANSIT
-  // test above, so this order isn't left flagged as emailed when its real
-  // USPS parcel never moved, and so the shipping path stays re-testable.
-  if (reset_shipped_email_marker) u.shipped_email_sent_at = null;
-  if (!Object.keys(u).length) return res.status(400).json({ error: 'tracking_number or reset_shipped_email_marker required' });
-  const { data, error } = await supabase.from('orders').update(u).eq('id', req.params.id).select().single();
-  if (error || !data) return res.status(404).json({ error: 'Order not found' });
-  res.json(data);
-});
-
-// TEMPORARY - shipped_email_sent_at is claimed atomically BEFORE the actual
-// send attempt (see notifyShipped), so it alone doesn't prove Resend
-// accepted the email - a row here does, since sendEmail only inserts after
-// res.ok.
-app.get('/admin/email-send-log', requireAdmin, async (req, res) => {
-  const { data, error } = await supabase.from('email_send_log').select('*').order('sent_at', { ascending: false }).limit(10);
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
-
 async function createOrderOnWin(auctionId, winnerUsername, finalBid, itemId) {
   if (!winnerUsername) return null;
   try {
