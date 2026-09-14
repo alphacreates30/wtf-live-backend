@@ -1272,6 +1272,15 @@ app.get('/admin/shippo-webhooks', requireAdmin, async (req, res) => {
   res.json(data);
 });
 
+// TEMPORARY - same as above, but reads Shippo's own tracking status for a
+// given carrier/number directly, independent of whether our webhook has
+// fired - lets us observe test-mode status simulation instead of guessing.
+app.get('/admin/shippo-track/:carrier/:trackingNumber', requireAdmin, async (req, res) => {
+  if (!SHIPPO_API_KEY) return res.status(500).json({ error: 'SHIPPO_API_KEY not configured' });
+  const data = await shippoFetch('GET', `/tracks/${req.params.carrier}/${req.params.trackingNumber}/`);
+  res.json(data);
+});
+
 async function createOrderOnWin(auctionId, winnerUsername, finalBid, itemId) {
   if (!winnerUsername) return null;
   try {
