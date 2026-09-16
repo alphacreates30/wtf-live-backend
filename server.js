@@ -846,8 +846,10 @@ app.get('/auction/:id', optionalAuth, async (req, res) => {
   res.json(data);
 });
 
+const FULFILLMENT_MODES = ['shipping', 'pickup', 'both'];
+
 app.patch('/auction/:id', requireAdmin, async (req, res) => {
-  const { title, description, category, buyers_premium_pct } = req.body;
+  const { title, description, category, buyers_premium_pct, fulfillment_mode, pickup_address, pickup_starts_at, pickup_ends_at } = req.body;
   const u = {};
   if (title !== undefined) {
     if (!title) return res.status(400).json({ error: 'title cannot be empty' });
@@ -862,13 +864,32 @@ app.patch('/auction/:id', requireAdmin, async (req, res) => {
     }
     u.buyers_premium_pct = pct;
   }
+  if (fulfillment_mode !== undefined) {
+    if (!FULFILLMENT_MODES.includes(fulfillment_mode)) {
+      return res.status(400).json({ error: `fulfillment_mode must be one of: ${FULFILLMENT_MODES.join(', ')}` });
+    }
+    u.fulfillment_mode = fulfillment_mode;
+  }
+  if (pickup_address !== undefined) u.pickup_address = pickup_address;
+  if (pickup_starts_at !== undefined) {
+    if (pickup_starts_at && isNaN(new Date(pickup_starts_at).getTime())) {
+      return res.status(400).json({ error: 'pickup_starts_at is not a valid date' });
+    }
+    u.pickup_starts_at = pickup_starts_at || null;
+  }
+  if (pickup_ends_at !== undefined) {
+    if (pickup_ends_at && isNaN(new Date(pickup_ends_at).getTime())) {
+      return res.status(400).json({ error: 'pickup_ends_at is not a valid date' });
+    }
+    u.pickup_ends_at = pickup_ends_at || null;
+  }
   const { data, error } = await supabase.from('auctions').update(u).eq('id', req.params.id).select().single();
   if (error || !data) return res.status(404).json({ error: 'Auction not found' });
   res.json(data);
 });
 
 app.post('/auction', requireAdmin, async (req, res) => {
-  const { title, description, image_url, category, starting_bid, starts_at, ends_at, mode } = req.body;
+  const { title, description, image_url, category, starting_bid, starts_at, ends_at, mode, fulfillment_mode } = req.body;
     // Live auctions are gated off (v2): createOrderOnWin is called from the
     // live socket path (start_auction timer / end_auction) with no charging
     // ever wired in, and live bidding still runs through the old place_bid
@@ -881,6 +902,12 @@ app.post('/auction', requireAdmin, async (req, res) => {
     // Standard auction lots start at $0.00 by design - only reject missing/negative.
     if (starting_bid == null || Number(starting_bid) < 0) return res.status(400).json({ error: 'starting_bid must be 0 or more' });
       if (ends_at && new Date(ends_at) <= new Date()) return res.status(400).json({ error: 'ends_at must be in the future' });
+    // No default - fulfillment_mode decides whether forfeiture applies to a
+    // buyer's money, so it must be a deliberate choice, not something that
+    // silently defaults on a missing field.
+    if (!FULFILLMENT_MODES.includes(fulfillment_mode)) {
+      return res.status(400).json({ error: `fulfillment_mode is required and must be one of: ${FULFILLMENT_MODES.join(', ')}` });
+    }
   // Always created as a draft - never publicly visible until the host
   // explicitly publishes via POST /auction/:id/publish. starts_at is
   // resolved now (not at publish time) so a scheduled start set while
@@ -890,6 +917,7 @@ app.post('/auction', requireAdmin, async (req, res) => {
         status: 'draft',
         starts_at: starts_at || new Date().toISOString(), ends_at: ends_at || null,
         mode: auctionMode,
+        fulfillment_mode,
         host_username: req.user.username
   }).select().single();
 
@@ -901,7 +929,7 @@ app.post('/auction', requireAdmin, async (req, res) => {
 // the host is ready. Requires at least one lot - publishing an empty
 // auction is almost certainly a mistake, not an intentional "coming soon".
 app.post('/auction/:id/publish', requireAdmin, async (req, res) => {
-  const { data: auction, error } = await supabase.from('auctions').select('status, starts_at').eq('id', req.params.id).single();
+  const { data: auction, error } = await supabase.from('auctions').select('status, starts_at, ends_at, fulfillment_mode, pickup_address, pickup_starts_at, pickup_ends_at').eq('id', req.params.id).single();
   if (error || !auction) return res.status(404).json({ error: 'Auction not found' });
   if (auction.status !== 'draft') return res.status(400).json({ error: 'Auction is not a draft' });
 
@@ -911,6 +939,15 @@ app.post('/auction/:id/publish', requireAdmin, async (req, res) => {
     .eq('auction_id', req.params.id);
   if (countErr) return res.status(500).json({ error: 'Failed to check lots' });
   if (!count) return res.status(400).json({ error: 'Add at least one lot before publishing' });
+
+  if (auction.fulfillment_mode === 'pickup' || auction.fulfillment_mode === 'both') {
+    if (!auction.pickup_address || !auction.pickup_starts_at || !auction.pickup_ends_at) {
+      return res.status(400).json({ error: 'Add a pickup address and pickup window before publishing' });
+    }
+    if (auction.ends_at && new Date(auction.pickup_ends_at) <= new Date(auction.ends_at)) {
+      return res.status(400).json({ error: 'Pickup window must end after the auction closes' });
+    }
+  }
 
   const newStatus = auction.starts_at && new Date(auction.starts_at) > new Date() ? 'upcoming' : 'live';
   // Guard the transition on status still being 'draft' so a concurrent
@@ -1279,8 +1316,13 @@ async function createOrderOnWin(auctionId, winnerUsername, finalBid, itemId) {
     const { data: winner, error: winnerErr } = await supabase.from('users').select('id').eq('username', winnerUsername).single();
     if (winnerErr || !winner) return null;
     const { data: profile } = await supabase.from('profiles').select('*').eq('user_id', String(winner.id)).single();
-    const { data: auction, error: auctionErr } = await supabase.from('auctions').select('title, description, buyers_premium_pct').eq('id', auctionId).single();
+    const { data: auction, error: auctionErr } = await supabase.from('auctions').select('title, description, buyers_premium_pct, fulfillment_mode').eq('id', auctionId).single();
     if (auctionErr || !auction) return null;
+
+    // 'both' is left null - the buyer chooses later (acknowledgement modal, v2).
+    const fulfillmentChoice = auction.fulfillment_mode === 'shipping' ? 'shipping'
+      : auction.fulfillment_mode === 'pickup' ? 'pickup'
+      : null;
 
     // Money math in integer cents only - store the computed amounts, not the
     // rate, so a later premium-rate change can't rewrite past orders.
@@ -1318,6 +1360,7 @@ async function createOrderOnWin(auctionId, winnerUsername, finalBid, itemId) {
       ship_zip: profile?.zip || '',
       ship_country: profile?.country || 'US',
       status: 'pending',
+      fulfillment_choice: fulfillmentChoice,
       hammer_cents: hammerCents,
       premium_cents: premiumCents,
       total_cents: totalCents,
@@ -1458,6 +1501,15 @@ app.post('/admin/orders/label', requireAdmin, async (req, res) => {
 
   const { data: orders } = await supabase.from('orders').select('*').in('id', order_ids);
   if (!orders?.length) return res.status(404).json({ error: 'Orders not found' });
+
+  // null (not-yet-chosen, for 'both' auctions) is a legitimate state and
+  // must not be treated as pickup - only block orders explicitly chosen as
+  // pickup, since there's no sense buying a shipping label for a lot the
+  // buyer is collecting in person.
+  const pickupOrders = orders.filter(x => x.fulfillment_choice === 'pickup');
+  if (pickupOrders.length) {
+    return res.status(400).json({ error: `Cannot generate a shipping label - order(s) ${pickupOrders.map(x => x.id).join(', ')} are set to local pickup` });
+  }
 
   const o = orders[0];
   const itemsSummary = orders.map(x => x.item_title).join(', ');
