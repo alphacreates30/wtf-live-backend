@@ -204,11 +204,15 @@ function shippedEmailHtml(order) {
   const trackingCell = order.tracking_url
     ? `<a href="${escapeHtml(order.tracking_url)}" style="color:#0645ad;">${escapeHtml(order.tracking_number || 'Track shipment')}</a>`
     : escapeHtml(order.tracking_number || 'N/A');
+  const postageRow = order.shipping_cost_cents != null
+    ? `<tr><td style="padding:4px 0;color:#555;">Postage charged</td><td style="padding:4px 0;text-align:right;">${formatMoney(order.shipping_cost_cents)}</td></tr>`
+    : '';
   return emailHtml('Your item has shipped', `
     <p><strong>${escapeHtml(order.item_title)}</strong> is on its way.</p>
     <table style="width:100%;border-collapse:collapse;margin:16px 0;">
       <tr><td style="padding:4px 0;color:#555;">Carrier</td><td style="padding:4px 0;text-align:right;">${escapeHtml(order.tracking_carrier || 'N/A')}</td></tr>
       <tr><td style="padding:4px 0;color:#555;">Tracking number</td><td style="padding:4px 0;text-align:right;">${trackingCell}</td></tr>
+      ${postageRow}
     </table>
   `);
 }
@@ -791,7 +795,7 @@ app.get('/my-bids', requireAuth, async (req, res) => {
 app.get('/my-orders', requireAuth, async (req, res) => {
   const { data: orders, error } = await supabase
     .from('orders')
-    .select('id, auction_id, item_title, hammer_cents, premium_cents, total_cents, payment_status, status, tracking_number, tracking_carrier, tracking_url, created_at')
+    .select('id, auction_id, item_title, hammer_cents, premium_cents, total_cents, payment_status, status, tracking_number, tracking_carrier, tracking_url, fulfillment_choice, shipping_cost_cents, shipping_payment_status, shipping_payment_error, created_at')
     .eq('buyer_user_id', String(req.user.id))
     .order('created_at', { ascending: false });
   if (error) return res.status(500).json({ error: 'Failed to load orders' });
@@ -813,6 +817,10 @@ app.get('/my-orders', requireAuth, async (req, res) => {
     tracking_number: o.tracking_number || null,
     tracking_carrier: o.tracking_carrier || null,
     tracking_url: o.tracking_url || null,
+    fulfillment_choice: o.fulfillment_choice || null,
+    shipping_cost_cents: o.shipping_cost_cents ?? null,
+    shipping_payment_status: o.shipping_payment_status || null,
+    shipping_payment_error: o.shipping_payment_error || null,
     created_at: o.created_at,
   })));
 });
@@ -1537,6 +1545,116 @@ async function chargeOrder(orderId) {
   }
 }
 
+// Charges one shipment's postage, off-session, for amountCents. orderIds is
+// every order in the shipment (a single order, or a bundle grouped for one
+// parcel) - there's no separate shipments table, so the charge result is
+// mirrored onto every order row in the group, the same way a future invoice
+// would mirror onto its child orders. Copies chargeOrder's proven pattern
+// (atomic conditional claim, per-attempt idempotency key, never throws)
+// rather than reusing chargeOrder itself, since that claims exactly one row
+// and chargeOrder must stay untouched. The claim locks on orderIds[0] only:
+// callers always pass the same fixed order_ids array for a given shipment
+// (driven from one admin action), so a double-click re-sends that exact set
+// and the second call's claim matches zero rows once the first has already
+// flipped the primary order off 'unpaid'/'failed' - no separate locking
+// table needed for that to be race-safe.
+async function chargeShipping(orderIds, amountCents) {
+  const primaryId = orderIds[0];
+  const restIds = orderIds.slice(1);
+  try {
+    const { data: orders, error: loadErr } = await supabase.from('orders').select('*').in('id', orderIds);
+    if (loadErr || !orders || orders.length !== orderIds.length) {
+      return { success: false, error: 'Order(s) not found' };
+    }
+    if (orders.some(o => o.shipping_payment_status === 'paid')) {
+      return { success: false, error: 'Shipping already paid for one or more orders in this group' };
+    }
+    const buyerUserId = orders[0].buyer_user_id;
+    if (orders.some(o => o.buyer_user_id !== buyerUserId)) {
+      return { success: false, error: 'Orders in this group belong to different buyers' };
+    }
+
+    const staleCutoff = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const { data: claimed, error: claimErr } = await supabase
+      .from('orders')
+      .update({ shipping_payment_status: 'charging', shipping_charging_since: new Date().toISOString() })
+      .eq('id', primaryId)
+      .is('shipping_payment_intent_id', null)
+      .or(`shipping_payment_status.in.(unpaid,failed),shipping_payment_status.is.null,and(shipping_payment_status.eq.charging,shipping_charging_since.lt.${staleCutoff})`)
+      .select()
+      .single();
+    if (claimErr || !claimed) {
+      return { success: false, error: 'Already being charged or already resolved', skipped: true };
+    }
+    // Best-effort mirror of the claim onto the rest of the group. The claim
+    // above is what makes this shipment safe against a concurrent duplicate
+    // call; if this mirror update fails partway, the primary order's claim
+    // still prevents a second chargeShipping call on the same orderIds from
+    // proceeding, and the final success/failure update below re-writes every
+    // orderIds row anyway.
+    if (restIds.length) {
+      await supabase.from('orders')
+        .update({ shipping_payment_status: 'charging', shipping_charging_since: new Date().toISOString() })
+        .in('id', restIds);
+    }
+
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('stripe_customer_id, stripe_payment_method_id')
+      .eq('user_id', buyerUserId)
+      .single();
+
+    if (!profile?.stripe_customer_id || !profile?.stripe_payment_method_id) {
+      const reason = 'No payment method on file';
+      await supabase.from('orders').update({ shipping_payment_status: 'failed', shipping_payment_error: reason }).in('id', orderIds);
+      await sendAdminEmail(
+        `Shipping charge failed - ${orders[0].buyer_username}`,
+        `Order(s): ${orderIds.join(', ')}\nAmount: ${formatMoney(amountCents)}\nReason: ${reason}`
+      );
+      return { success: false, error: reason };
+    }
+
+    if (!stripe) {
+      const reason = 'Stripe not configured';
+      await supabase.from('orders').update({ shipping_payment_status: 'failed', shipping_payment_error: reason }).in('id', orderIds);
+      await sendAdminEmail(`Shipping charge failed - ${orders[0].buyer_username}`, `Order(s): ${orderIds.join(', ')}\nReason: ${reason}`);
+      return { success: false, error: reason };
+    }
+
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: amountCents,
+      currency: 'usd',
+      customer: profile.stripe_customer_id,
+      payment_method: profile.stripe_payment_method_id,
+      confirm: true,
+      off_session: true,
+      metadata: { order_ids: orderIds.join(','), kind: 'shipping', buyer_username: orders[0].buyer_username },
+    }, { idempotencyKey: `shipping-${primaryId}-${require('crypto').randomUUID()}` });
+
+    await supabase.from('orders')
+      .update({
+        shipping_payment_intent_id: paymentIntent.id,
+        shipping_payment_status: 'paid',
+        shipping_payment_error: null,
+        shipping_cost_cents: amountCents,
+      })
+      .in('id', orderIds);
+    return { success: true, payment_intent_id: paymentIntent.id };
+  } catch (e) {
+    console.error('chargeShipping error:', orderIds.join(','), e.message);
+    try {
+      await supabase.from('orders').update({ shipping_payment_status: 'failed', shipping_payment_error: e.message }).in('id', orderIds);
+    } catch (updateErr) {
+      console.error('chargeShipping: failed to record failure on orders', orderIds.join(','), updateErr.message);
+    }
+    await sendAdminEmail(
+      `Shipping charge failed - order(s) ${orderIds.join(', ')}`,
+      `chargeShipping failed.\nOrder(s): ${orderIds.join(', ')}\nAmount: ${formatMoney(amountCents)}\nError: ${e.message}`
+    );
+    return { success: false, error: e.message };
+  }
+}
+
 app.get('/admin/orders', requireAdmin, async (req, res) => {
   const { data, error } = await supabase
     .from('orders')
@@ -1546,12 +1664,14 @@ app.get('/admin/orders', requireAdmin, async (req, res) => {
   res.json(data);
 });
 
-app.post('/admin/orders/label', requireAdmin, async (req, res) => {
-  const { order_ids } = req.body;
-  if (!order_ids?.length) return res.status(400).json({ error: 'order_ids required' });
-
+// Loads order_ids and rejects the request if any is missing, not found, or
+// set to local pickup - shared by the quote and charge+buy steps so neither
+// can silently drift from the other's notion of "valid orders for this
+// shipment".
+async function loadShippableOrders(order_ids) {
+  if (!order_ids?.length) return { error: 'order_ids required', status: 400 };
   const { data: orders } = await supabase.from('orders').select('*').in('id', order_ids);
-  if (!orders?.length) return res.status(404).json({ error: 'Orders not found' });
+  if (!orders?.length || orders.length !== order_ids.length) return { error: 'Orders not found', status: 404 };
 
   // null (not-yet-chosen, for 'both' auctions) is a legitimate state and
   // must not be treated as pickup - only block orders explicitly chosen as
@@ -1559,8 +1679,27 @@ app.post('/admin/orders/label', requireAdmin, async (req, res) => {
   // buyer is collecting in person.
   const pickupOrders = orders.filter(x => x.fulfillment_choice === 'pickup');
   if (pickupOrders.length) {
-    return res.status(400).json({ error: `Cannot generate a shipping label - order(s) ${pickupOrders.map(x => x.id).join(', ')} are set to local pickup` });
+    return { error: `Cannot ship - order(s) ${pickupOrders.map(x => x.id).join(', ')} are set to local pickup`, status: 400 };
   }
+  return { orders };
+}
+
+// Step 1 of the shipping flow: quote the real parcel with Shippo and return
+// the cheapest rate WITHOUT buying anything. Weight and dimensions come from
+// the host, entered at packing time - there is no hardcoded parcel and no
+// fallback if any is missing, because a silent fallback here (a fixed 2lb
+// box, regardless of the real contents) is the exact bug this replaces.
+app.post('/admin/orders/shipping-quote', requireAdmin, async (req, res) => {
+  const { order_ids, weight_oz, length_in, width_in, height_in } = req.body;
+  if (weight_oz == null || length_in == null || width_in == null || height_in == null) {
+    return res.status(400).json({ error: 'weight_oz, length_in, width_in and height_in are all required' });
+  }
+  if (!(weight_oz > 0) || !(length_in > 0) || !(width_in > 0) || !(height_in > 0)) {
+    return res.status(400).json({ error: 'weight_oz, length_in, width_in and height_in must all be greater than 0' });
+  }
+
+  const { orders, error, status } = await loadShippableOrders(order_ids);
+  if (error) return res.status(status).json({ error });
 
   const o = orders[0];
   const itemsSummary = orders.map(x => x.item_title).join(', ');
@@ -1596,10 +1735,10 @@ app.post('/admin/orders/label', requireAdmin, async (req, res) => {
         country: o.ship_country || 'US',
       },
       parcels: [{
-        length: '12', width: '10', height: '6',
+        length: String(length_in), width: String(width_in), height: String(height_in),
         distance_unit: 'in',
-        weight: '2',
-        mass_unit: 'lb',
+        weight: String(weight_oz),
+        mass_unit: 'oz',
       }],
       async: false,
       metadata: itemsSummary,
@@ -1610,21 +1749,73 @@ app.post('/admin/orders/label', requireAdmin, async (req, res) => {
     }
 
     const rate = shipment.rates.sort((a, b) => parseFloat(a.amount) - parseFloat(b.amount))[0];
+    res.json({
+      rate_id: rate.object_id,
+      amount_cents: Math.round(parseFloat(rate.amount) * 100),
+      provider: rate.provider,
+      servicelevel: rate.servicelevel?.name || rate.servicelevel?.token || null,
+      estimated_days: rate.estimated_days ?? null,
+    });
+  } catch (e) {
+    console.error('Shippo quote error:', e.message);
+    res.status(500).json({ error: 'Shippo request failed', detail: e.message });
+  }
+});
+
+// Step 2: charge the buyer exactly the quoted rate, and only on a successful
+// charge, buy that label. rate_id/amount_cents must be the quote from
+// /admin/orders/shipping-quote above - charging happens before buying so we
+// never ship goods we haven't been paid postage for, and never buy a label
+// we can't recover the cost of.
+app.post('/admin/orders/label', requireAdmin, async (req, res) => {
+  const { order_ids, rate_id, amount_cents } = req.body;
+  if (!rate_id || !(amount_cents > 0)) {
+    return res.status(400).json({ error: 'rate_id and amount_cents (from a shipping quote) are required' });
+  }
+
+  const { orders, error, status } = await loadShippableOrders(order_ids);
+  if (error) return res.status(status).json({ error });
+
+  if (!SHIPPO_API_KEY) return res.status(500).json({ error: 'SHIPPO_API_KEY not configured' });
+
+  const chargeResult = await chargeShipping(order_ids, amount_cents);
+  if (!chargeResult.success) {
+    return res.status(402).json({ error: 'Shipping charge failed', detail: chargeResult.error });
+  }
+
+  try {
+    // Fetched independently rather than trusting a client-supplied provider
+    // name or a field on the Transaction response - a Transaction has no
+    // reliable carrier-name field of its own (that's exactly the bug fixed
+    // 2026-09-14, see the tracking_carrier note below), so the rate itself
+    // is re-read from Shippo the same way the original single-request flow
+    // read it off the /shipments/ response.
+    const rateDetails = await shippoFetch('GET', `/rates/${rate_id}/`);
     const transaction = await shippoFetch('POST', '/transactions/', {
-      rate: rate.object_id,
+      rate: rate_id,
       label_file_type: 'PDF',
       async: false,
     });
 
     if (transaction.status !== 'SUCCESS') {
-      return res.status(400).json({ error: 'Label generation failed', detail: transaction.messages });
+      // The buyer has already been charged at this point (chargeResult
+      // succeeded above) - this is money collected with no label bought, so
+      // it needs a human, not a silent retry with a possibly-stale rate.
+      await sendAdminEmail(
+        `Shipping charged but label purchase FAILED - order(s) ${order_ids.join(', ')}`,
+        `Charged ${formatMoney(amount_cents)} (payment_intent ${chargeResult.payment_intent_id}) but Shippo label purchase failed.\nOrder(s): ${order_ids.join(', ')}\nDetail: ${JSON.stringify(transaction.messages)}`
+      );
+      return res.status(500).json({
+        error: 'Buyer was charged but label purchase failed - needs manual follow-up',
+        detail: transaction.messages,
+      });
     }
 
     // rate.provider (e.g. "USPS") is the carrier name - a Transaction has no
     // such field itself. tracking_url_provider is Shippo's own hosted
     // tracking page for this shipment, and is what buyers should be linked
     // to directly rather than a carrier slug we guess a URL from.
-    const trackingCarrier = rate.provider;
+    const trackingCarrier = rateDetails?.provider || null;
     const trackingUrl = transaction.tracking_url_provider;
     if (!trackingCarrier || !trackingUrl) {
       console.error(
@@ -1646,10 +1837,15 @@ app.post('/admin/orders/label', requireAdmin, async (req, res) => {
     res.json({
       label_url: transaction.label_url,
       tracking_number: transaction.tracking_number,
+      shipping_cost_cents: amount_cents,
     });
   } catch (e) {
     console.error('Shippo error:', e.message);
-    res.status(500).json({ error: 'Shippo request failed', detail: e.message });
+    await sendAdminEmail(
+      `Shipping charged but label purchase FAILED - order(s) ${order_ids.join(', ')}`,
+      `Charged ${formatMoney(amount_cents)} (payment_intent ${chargeResult.payment_intent_id}) but Shippo label purchase threw.\nOrder(s): ${order_ids.join(', ')}\nError: ${e.message}`
+    );
+    res.status(500).json({ error: 'Buyer was charged but label purchase failed - needs manual follow-up', detail: e.message });
   }
 });
 
