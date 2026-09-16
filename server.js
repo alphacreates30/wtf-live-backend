@@ -847,6 +847,9 @@ app.get('/auction/:id', optionalAuth, async (req, res) => {
 });
 
 const FULFILLMENT_MODES = ['shipping', 'pickup', 'both'];
+// Bump when TERMS_OF_SALE.md changes materially - existing acceptance rows
+// keep the version they actually agreed to, so this never rewrites history.
+const TERMS_VERSION = '1';
 
 app.patch('/auction/:id', requireAdmin, async (req, res) => {
   const { title, description, category, buyers_premium_pct, fulfillment_mode, pickup_address, pickup_starts_at, pickup_ends_at } = req.body;
@@ -962,6 +965,54 @@ app.post('/auction/:id/publish', requireAdmin, async (req, res) => {
   if (updateErr || !updated) return res.status(409).json({ error: 'Auction is no longer a draft' });
 
   res.json(updated);
+});
+
+// Self-scoped: the caller's own id comes from the JWT, never from a param -
+// no route lets you ask about anyone else's acceptance.
+app.get('/auction/:id/terms-acceptance', requireAuth, async (req, res) => {
+  const { data, error } = await supabase
+    .from('auction_terms_acceptances')
+    .select('accepted_at, buyers_premium_pct, pickup_ends_at, fulfillment_mode, terms_version')
+    .eq('auction_id', req.params.id)
+    .eq('user_id', String(req.user.id))
+    .maybeSingle();
+  if (error) return res.status(500).json({ error: 'Failed to check terms acceptance' });
+  res.json({ accepted: !!data, ...(data || {}) });
+});
+
+app.post('/auction/:id/terms-acceptance', requireAuth, async (req, res) => {
+  const { data: auction, error: auctionErr } = await supabase
+    .from('auctions')
+    .select('status, fulfillment_mode, buyers_premium_pct, pickup_ends_at')
+    .eq('id', req.params.id)
+    .single();
+  if (auctionErr || !auction) return res.status(404).json({ error: 'Auction not found' });
+  if (auction.status === 'draft' && req.user.username !== ADMIN_USERNAME) {
+    return res.status(404).json({ error: 'Auction not found' });
+  }
+
+  // Snapshotted server-side from the auction row right now - the client
+  // never gets to supply these values. ignoreDuplicates makes a re-accept a
+  // silent no-op: accepted_at and this snapshot must never be overwritten by
+  // a later call, even if the auction has since been edited.
+  const { error: upsertErr } = await supabase.from('auction_terms_acceptances').upsert({
+    auction_id: req.params.id,
+    user_id: String(req.user.id),
+    buyers_premium_pct: auction.buyers_premium_pct,
+    pickup_ends_at: auction.pickup_ends_at,
+    fulfillment_mode: auction.fulfillment_mode,
+    terms_version: TERMS_VERSION,
+  }, { onConflict: 'auction_id,user_id', ignoreDuplicates: true });
+  if (upsertErr) return res.status(500).json({ error: 'Failed to record acceptance' });
+
+  const { data, error } = await supabase
+    .from('auction_terms_acceptances')
+    .select('accepted_at, buyers_premium_pct, pickup_ends_at, fulfillment_mode, terms_version')
+    .eq('auction_id', req.params.id)
+    .eq('user_id', String(req.user.id))
+    .single();
+  if (error || !data) return res.status(500).json({ error: 'Failed to load acceptance' });
+  res.json({ accepted: true, ...data });
 });
 
 app.get('/auction/:id/token', requireAuth, async (req, res) => {
@@ -1702,6 +1753,17 @@ app.post('/auction/:id/items/:itemId/prebid', requireAuth, async (req, res) => {
   const { data: auctionRow } = await supabase.from('auctions').select('status').eq('id', req.params.id).single();
   if (!auctionRow) return res.status(404).json({ error: 'Auction not found' });
   if (auctionRow.status === 'draft') return res.status(400).json({ error: 'Auction is not published yet' });
+
+  // A pre-bid is equally binding as a live bid - it commits the buyer to
+  // purchase at that price - so it gets the same terms-acceptance guarantee.
+  const { data: acceptance } = await supabase
+    .from('auction_terms_acceptances')
+    .select('auction_id')
+    .eq('auction_id', req.params.id)
+    .eq('user_id', String(req.user.id))
+    .maybeSingle();
+  if (!acceptance) return res.status(403).json({ error: 'You must accept the auction terms before bidding' });
+
   const { data: item } = await supabase.from('auction_items').select('status').eq('id', req.params.itemId).single();
   if (!item) return res.status(404).json({ error: 'Item not found' });
   if (item.status !== 'pending') return res.status(400).json({ error: 'Pre-bidding closed' });
@@ -1744,6 +1806,17 @@ app.post('/auction/:id/items/:itemId/bid', requireAuth, async (req, res) => {
   const { data: auctionRow } = await supabase.from('auctions').select('status').eq('id', req.params.id).single();
   if (!auctionRow) return res.status(404).json({ error: 'Auction not found' });
   if (auctionRow.status === 'draft') return res.status(400).json({ error: 'Auction is not published yet' });
+
+  // Belt and braces: the acknowledgement modal is the UX, this is the
+  // guarantee. The forfeiture clause is only defensible if every bidder
+  // demonstrably accepted terms before bidding, not just whoever hit the modal.
+  const { data: acceptance } = await supabase
+    .from('auction_terms_acceptances')
+    .select('auction_id')
+    .eq('auction_id', req.params.id)
+    .eq('user_id', String(req.user.id))
+    .maybeSingle();
+  if (!acceptance) return res.status(403).json({ error: 'You must accept the auction terms before bidding' });
 
   // Server-side bid increment validation
   const { data: bidItem } = await supabase
