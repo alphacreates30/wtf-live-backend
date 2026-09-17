@@ -802,27 +802,36 @@ app.get('/my-orders', requireAuth, async (req, res) => {
   if (!orders?.length) return res.json([]);
 
   const auctionIds = [...new Set(orders.map(o => o.auction_id))];
-  const { data: auctions } = await supabase.from('auctions').select('id, title').in('id', auctionIds);
-  const auctionTitleMap = Object.fromEntries((auctions || []).map(a => [a.id, a.title]));
+  const { data: auctions } = await supabase.from('auctions').select('id, title, status, fulfillment_mode').in('id', auctionIds);
+  const auctionMap = Object.fromEntries((auctions || []).map(a => [a.id, a]));
 
-  res.json(orders.map(o => ({
-    id: o.id,
-    item_title: o.item_title,
-    auction_title: auctionTitleMap[o.auction_id] || null,
-    hammer_cents: o.hammer_cents,
-    premium_cents: o.premium_cents,
-    total_cents: o.total_cents,
-    payment_status: o.payment_status,
-    status: o.status,
-    tracking_number: o.tracking_number || null,
-    tracking_carrier: o.tracking_carrier || null,
-    tracking_url: o.tracking_url || null,
-    fulfillment_choice: o.fulfillment_choice || null,
-    shipping_cost_cents: o.shipping_cost_cents ?? null,
-    shipping_payment_status: o.shipping_payment_status || null,
-    shipping_payment_error: o.shipping_payment_error || null,
-    created_at: o.created_at,
-  })));
+  res.json(orders.map(o => {
+    const auction = auctionMap[o.auction_id];
+    return {
+      id: o.id,
+      auction_id: o.auction_id,
+      item_title: o.item_title,
+      auction_title: auction?.title || null,
+      hammer_cents: o.hammer_cents,
+      premium_cents: o.premium_cents,
+      total_cents: o.total_cents,
+      payment_status: o.payment_status,
+      status: o.status,
+      tracking_number: o.tracking_number || null,
+      tracking_carrier: o.tracking_carrier || null,
+      tracking_url: o.tracking_url || null,
+      fulfillment_choice: o.fulfillment_choice || null,
+      // Only a 'both' auction that hasn't closed yet has a choice worth
+      // changing - matches PATCH /auction/:id/fulfillment-choice's own
+      // gate exactly, so this button never appears somewhere that call
+      // would 400.
+      can_change_fulfillment: !!auction && auction.fulfillment_mode === 'both' && auction.status !== 'ended',
+      shipping_cost_cents: o.shipping_cost_cents ?? null,
+      shipping_payment_status: o.shipping_payment_status || null,
+      shipping_payment_error: o.shipping_payment_error || null,
+      created_at: o.created_at,
+    };
+  }));
 });
 
 app.get('/auctions', optionalAuth, async (req, res) => {
@@ -980,7 +989,7 @@ app.post('/auction/:id/publish', requireAdmin, async (req, res) => {
 app.get('/auction/:id/terms-acceptance', requireAuth, async (req, res) => {
   const { data, error } = await supabase
     .from('auction_terms_acceptances')
-    .select('accepted_at, buyers_premium_pct, pickup_ends_at, fulfillment_mode, terms_version')
+    .select('accepted_at, buyers_premium_pct, pickup_ends_at, fulfillment_mode, fulfillment_choice, terms_version')
     .eq('auction_id', req.params.id)
     .eq('user_id', String(req.user.id))
     .maybeSingle();
@@ -989,6 +998,7 @@ app.get('/auction/:id/terms-acceptance', requireAuth, async (req, res) => {
 });
 
 app.post('/auction/:id/terms-acceptance', requireAuth, async (req, res) => {
+  const { fulfillment_choice } = req.body;
   const { data: auction, error: auctionErr } = await supabase
     .from('auctions')
     .select('status, fulfillment_mode, buyers_premium_pct, pickup_ends_at')
@@ -999,27 +1009,88 @@ app.post('/auction/:id/terms-acceptance', requireAuth, async (req, res) => {
     return res.status(404).json({ error: 'Auction not found' });
   }
 
+  // The buyer only picks between pickup and shipping when the auction
+  // genuinely offers both - otherwise the choice is implied by the auction
+  // and resolved server-side, so a client can never submit 'pickup' on a
+  // shipping-only auction (or vice versa) no matter what it sends.
+  let resolvedChoice;
+  if (auction.fulfillment_mode === 'both') {
+    if (fulfillment_choice !== 'shipping' && fulfillment_choice !== 'pickup') {
+      return res.status(400).json({ error: "fulfillment_choice is required and must be 'shipping' or 'pickup'" });
+    }
+    resolvedChoice = fulfillment_choice;
+  } else {
+    resolvedChoice = auction.fulfillment_mode;
+  }
+
   // Snapshotted server-side from the auction row right now - the client
   // never gets to supply these values. ignoreDuplicates makes a re-accept a
-  // silent no-op: accepted_at and this snapshot must never be overwritten by
-  // a later call, even if the auction has since been edited.
+  // silent no-op: accepted_at and this snapshot (fulfillment_choice
+  // included) must never be overwritten by a later call here - changing the
+  // choice after the fact goes through PATCH /auction/:id/fulfillment-choice
+  // instead, which updates nothing else.
   const { error: upsertErr } = await supabase.from('auction_terms_acceptances').upsert({
     auction_id: req.params.id,
     user_id: String(req.user.id),
     buyers_premium_pct: auction.buyers_premium_pct,
     pickup_ends_at: auction.pickup_ends_at,
     fulfillment_mode: auction.fulfillment_mode,
+    fulfillment_choice: resolvedChoice,
     terms_version: TERMS_VERSION,
   }, { onConflict: 'auction_id,user_id', ignoreDuplicates: true });
   if (upsertErr) return res.status(500).json({ error: 'Failed to record acceptance' });
 
   const { data, error } = await supabase
     .from('auction_terms_acceptances')
-    .select('accepted_at, buyers_premium_pct, pickup_ends_at, fulfillment_mode, terms_version')
+    .select('accepted_at, buyers_premium_pct, pickup_ends_at, fulfillment_mode, fulfillment_choice, terms_version')
     .eq('auction_id', req.params.id)
     .eq('user_id', String(req.user.id))
     .single();
   if (error || !data) return res.status(500).json({ error: 'Failed to load acceptance' });
+  res.json({ accepted: true, ...data });
+});
+
+// Lets a buyer change pickup vs shipping any time before the auction closes
+// - only on a 'both' auction, since a shipping-only or pickup-only auction
+// has no choice to change. Updates only fulfillment_choice: accepted_at and
+// the buyers_premium_pct/pickup_ends_at/fulfillment_mode/terms_version
+// snapshot stay exactly as they were at acceptance time.
+app.patch('/auction/:id/fulfillment-choice', requireAuth, async (req, res) => {
+  const { fulfillment_choice } = req.body;
+  if (fulfillment_choice !== 'shipping' && fulfillment_choice !== 'pickup') {
+    return res.status(400).json({ error: "fulfillment_choice must be 'shipping' or 'pickup'" });
+  }
+
+  const { data: auction, error: auctionErr } = await supabase
+    .from('auctions').select('status, fulfillment_mode').eq('id', req.params.id).single();
+  if (auctionErr || !auction) return res.status(404).json({ error: 'Auction not found' });
+  if (auction.fulfillment_mode !== 'both') {
+    return res.status(400).json({ error: 'This auction does not offer a choice of fulfilment' });
+  }
+  if (auction.status === 'ended') {
+    return res.status(400).json({ error: 'Auction has closed - fulfilment choice can no longer be changed' });
+  }
+
+  const { data, error } = await supabase
+    .from('auction_terms_acceptances')
+    .update({ fulfillment_choice })
+    .eq('auction_id', req.params.id)
+    .eq('user_id', String(req.user.id))
+    .select('accepted_at, buyers_premium_pct, pickup_ends_at, fulfillment_mode, fulfillment_choice, terms_version')
+    .single();
+  if (error || !data) return res.status(404).json({ error: 'Accept the auction terms before changing your fulfilment choice' });
+
+  // Mirror onto this buyer's orders from this auction that haven't entered
+  // the shipping-charge flow yet (still pending, never even claimed for a
+  // charge) - an order already charged for postage or further along keeps
+  // whatever choice it was charged under; this never touches that flow.
+  await supabase.from('orders')
+    .update({ fulfillment_choice })
+    .eq('auction_id', req.params.id)
+    .eq('buyer_user_id', String(req.user.id))
+    .eq('status', 'pending')
+    .is('shipping_payment_status', null);
+
   res.json({ accepted: true, ...data });
 });
 
@@ -1375,13 +1446,23 @@ async function createOrderOnWin(auctionId, winnerUsername, finalBid, itemId) {
     const { data: winner, error: winnerErr } = await supabase.from('users').select('id').eq('username', winnerUsername).single();
     if (winnerErr || !winner) return null;
     const { data: profile } = await supabase.from('profiles').select('*').eq('user_id', String(winner.id)).single();
-    const { data: auction, error: auctionErr } = await supabase.from('auctions').select('title, description, buyers_premium_pct, fulfillment_mode').eq('id', auctionId).single();
+    const { data: auction, error: auctionErr } = await supabase.from('auctions').select('title, description, buyers_premium_pct').eq('id', auctionId).single();
     if (auctionErr || !auction) return null;
 
-    // 'both' is left null - the buyer chooses later (acknowledgement modal, v2).
-    const fulfillmentChoice = auction.fulfillment_mode === 'shipping' ? 'shipping'
-      : auction.fulfillment_mode === 'pickup' ? 'pickup'
-      : null;
+    // The buyer's own choice, made before their first bid at the terms
+    // acknowledgement gate - never re-derived from the auction's current
+    // fulfillment_mode, which could have been edited since. Every standard
+    // bid/pre-bid path requires an acceptance row to exist before it lets a
+    // bid through, so this should always find one; null only for a legacy
+    // win with no acceptance row at all (a live auction from before this
+    // gate existed).
+    const { data: acceptance } = await supabase
+      .from('auction_terms_acceptances')
+      .select('fulfillment_choice')
+      .eq('auction_id', auctionId)
+      .eq('user_id', String(winner.id))
+      .maybeSingle();
+    const fulfillmentChoice = acceptance?.fulfillment_choice || null;
 
     // Money math in integer cents only - store the computed amounts, not the
     // rate, so a later premium-rate change can't rewrite past orders.
