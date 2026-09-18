@@ -192,6 +192,44 @@ function paymentFailedEmailHtml(order, reason) {
   `);
 }
 
+// Invoice versions list every lot (hammer + premium each) before the total -
+// same "never a bare total" rule as the per-order emails, just one email
+// covering every lot the buyer won in the auction instead of one per lot.
+function invoiceLotRows(orders) {
+  return orders.map(o => {
+    const premiumPct = o.hammer_cents > 0 ? Math.round((o.premium_cents / o.hammer_cents) * 100) : 0;
+    return `<tr>
+      <td style="padding:4px 0;color:#555;">${escapeHtml(o.item_title)}</td>
+      <td style="padding:4px 0;text-align:right;">${formatMoney(o.hammer_cents)} + ${formatMoney(o.premium_cents)} premium (${premiumPct}%)</td>
+    </tr>`;
+  }).join('');
+}
+
+function invoiceWonChargedEmailHtml(invoice, orders, last4) {
+  const cardLine = last4 ? `<p style="margin:16px 0 0;color:#555;">Card ending in ${escapeHtml(last4)} was charged.</p>` : '';
+  return emailHtml('You won it - and your card has been charged', `
+    <p>Congratulations! You won <strong>${orders.length}</strong> lot${orders.length === 1 ? '' : 's'}:</p>
+    <table style="width:100%;border-collapse:collapse;margin:16px 0;">
+      ${invoiceLotRows(orders)}
+      <tr><td style="padding:8px 0 0;font-weight:bold;border-top:1px solid #ddd;">Total charged</td><td style="padding:8px 0 0;text-align:right;font-weight:bold;border-top:1px solid #ddd;">${formatMoney(invoice.total_cents)}</td></tr>
+    </table>
+    ${cardLine}
+    <p style="margin:16px 0 0;">What happens next: the host will pack and ship your items, and you'll get another email with tracking once each is on its way.</p>
+  `);
+}
+
+function invoicePaymentFailedEmailHtml(invoice, orders, reason) {
+  return emailHtml('You won - but your card did not go through', `
+    <p>You won <strong>${orders.length}</strong> lot${orders.length === 1 ? '' : 's'}, but we were unable to charge the card on file.</p>
+    <table style="width:100%;border-collapse:collapse;margin:16px 0;">
+      ${invoiceLotRows(orders)}
+      <tr><td style="padding:8px 0 0;font-weight:bold;border-top:1px solid #ddd;">Total due</td><td style="padding:8px 0 0;text-align:right;font-weight:bold;border-top:1px solid #ddd;">${formatMoney(invoice.total_cents)}</td></tr>
+    </table>
+    <p style="margin:16px 0 0;color:#555;">Reason: ${escapeHtml(reason)}</p>
+    <p style="margin:16px 0 0;">Your wins are still reserved for you. To fix this, log in to WhatTheFind Live and update your payment method on your profile, then reply to this email so the charge can be retried.</p>
+  `);
+}
+
 function outbidEmailHtml(item) {
   return emailHtml('You have been outbid', `
     <p>Someone placed a higher bid on <strong>${escapeHtml(item.title)}</strong>.</p>
@@ -293,6 +331,81 @@ async function notifyPaymentFailed(orderId, reason) {
     });
   } catch (e) {
     console.error('notifyPaymentFailed error:', orderId, e.message);
+  }
+}
+
+// Invoice equivalents of notifyWonAndCharged/notifyPaymentFailed above -
+// same idempotency-via-sent-marker pattern, just reading/writing invoices
+// and pulling every child order (via orders.invoice_id) to list each lot.
+async function notifyInvoiceWonAndCharged(invoiceId, paymentIntentId) {
+  try {
+    const { data: invoice, error } = await supabase
+      .from('invoices')
+      .update({ won_email_sent_at: new Date().toISOString() })
+      .eq('id', invoiceId)
+      .is('won_email_sent_at', null)
+      .select('*')
+      .single();
+    if (error || !invoice) return; // already sent, or invoice missing
+
+    const { data: orders } = await supabase
+      .from('orders')
+      .select('item_title, hammer_cents, premium_cents')
+      .eq('invoice_id', invoiceId);
+    if (!orders?.length) return;
+
+    const email = await getBuyerEmail(invoice.buyer_user_id);
+    if (!email) return;
+
+    let last4 = null;
+    try {
+      if (stripe && paymentIntentId) {
+        const pi = await stripe.paymentIntents.retrieve(paymentIntentId, { expand: ['payment_method'] });
+        last4 = pi.payment_method?.card?.last4 || null;
+      }
+    } catch { /* best-effort only - last4 is a nice-to-have, never worth failing the email over */ }
+
+    await sendEmail({
+      from: BUYER_FROM,
+      to: email,
+      subject: `You won ${orders.length} lot${orders.length === 1 ? '' : 's'} - payment charged`,
+      html: invoiceWonChargedEmailHtml(invoice, orders, last4),
+      kind: 'won',
+    });
+  } catch (e) {
+    console.error('notifyInvoiceWonAndCharged error:', invoiceId, e.message);
+  }
+}
+
+async function notifyInvoicePaymentFailed(invoiceId, reason) {
+  try {
+    const { data: invoice, error } = await supabase
+      .from('invoices')
+      .update({ payment_failed_email_sent_at: new Date().toISOString() })
+      .eq('id', invoiceId)
+      .is('payment_failed_email_sent_at', null)
+      .select('*')
+      .single();
+    if (error || !invoice) return; // already sent, or invoice missing
+
+    const { data: orders } = await supabase
+      .from('orders')
+      .select('item_title, hammer_cents, premium_cents')
+      .eq('invoice_id', invoiceId);
+    if (!orders?.length) return;
+
+    const email = await getBuyerEmail(invoice.buyer_user_id);
+    if (!email) return;
+
+    await sendEmail({
+      from: BUYER_FROM,
+      to: email,
+      subject: `Payment issue - you won ${orders.length} lot${orders.length === 1 ? '' : 's'}`,
+      html: invoicePaymentFailedEmailHtml(invoice, orders, reason),
+      kind: 'failed',
+    });
+  } catch (e) {
+    console.error('notifyInvoicePaymentFailed error:', invoiceId, e.message);
   }
 }
 
@@ -617,22 +730,38 @@ app.post('/save-payment-method', requireAuth, async (req, res) => {
 });
 
 // -- Stripe: charge winner --
+// Phase D's manual Charge/Retry. Standard-auction orders are billed on a
+// batched invoice, so this routes to chargeInvoice for them (by explicit
+// invoice_id, or by following order_id -> orders.invoice_id when set) and
+// falls through to chargeOrder, untouched, only for orders with no invoice -
+// i.e. live auctions, which never batch.
 app.post('/charge-winner', requireAuth, async (req, res) => {
-  const { auction_id, winner_username, order_id } = req.body;
-  if (!order_id && (!auction_id || !winner_username)) {
-    return res.status(400).json({ error: 'order_id, or auction_id and winner_username, required' });
+  const { auction_id, winner_username, order_id, invoice_id } = req.body;
+  if (!invoice_id && !order_id && (!auction_id || !winner_username)) {
+    return res.status(400).json({ error: 'invoice_id, order_id, or auction_id and winner_username, required' });
   }
 
   // Must be admin or host
   let auctionIdForAuth = auction_id;
   if (!auctionIdForAuth) {
-    const { data: orderForAuth } = await supabase.from('orders').select('auction_id').eq('id', order_id).single();
-    auctionIdForAuth = orderForAuth?.auction_id;
+    if (invoice_id) {
+      const { data: invoiceForAuth } = await supabase.from('invoices').select('auction_id').eq('id', invoice_id).single();
+      auctionIdForAuth = invoiceForAuth?.auction_id;
+    } else {
+      const { data: orderForAuth } = await supabase.from('orders').select('auction_id').eq('id', order_id).single();
+      auctionIdForAuth = orderForAuth?.auction_id;
+    }
   }
   const { data: auction } = await supabase.from('auctions').select('host_username').eq('id', auctionIdForAuth).single();
   if (!auction) return res.status(404).json({ error: 'Auction not found' });
   if (req.user.username !== ADMIN_USERNAME && req.user.username !== auction.host_username) {
     return res.status(403).json({ error: 'Not authorized to charge' });
+  }
+
+  if (invoice_id) {
+    const result = await chargeInvoice(invoice_id);
+    if (result.success) return res.json({ success: true, payment_intent_id: result.payment_intent_id });
+    return res.status(402).json({ error: 'Payment failed', detail: result.error });
   }
 
   let targetOrderId = order_id;
@@ -653,7 +782,12 @@ app.post('/charge-winner', requireAuth, async (req, res) => {
     targetOrderId = orders[0].id;
   }
 
-  const result = await chargeOrder(targetOrderId);
+  // A standard-auction order carries the invoice it was billed on - charge
+  // that instead of the order alone, same as the invoice_id branch above.
+  const { data: targetOrder } = await supabase.from('orders').select('invoice_id').eq('id', targetOrderId).single();
+  const result = targetOrder?.invoice_id
+    ? await chargeInvoice(targetOrder.invoice_id)
+    : await chargeOrder(targetOrderId);
   if (result.success) {
     res.json({ success: true, payment_intent_id: result.payment_intent_id });
   } else {
@@ -673,9 +807,15 @@ app.post('/webhook/stripe', async (req, res) => {
 
   if (event.type === 'payment_intent.payment_failed') {
     const pi = event.data.object;
-    const { order_id, winner_username, auction_id } = pi.metadata || {};
+    const { order_id, invoice_id, winner_username, auction_id } = pi.metadata || {};
     const reason = pi.last_payment_error?.message || 'unknown';
-    if (order_id) {
+    if (invoice_id) {
+      // Source of truth for whether an invoice is paid - not profiles, which
+      // Phase D's UI doesn't read for this. Mirror onto every child order so
+      // orders.payment_status stays in sync with its invoice.
+      await supabase.from('invoices').update({ payment_status: 'failed', payment_error: reason }).eq('id', invoice_id);
+      await supabase.from('orders').update({ payment_status: 'failed', payment_error: reason }).eq('invoice_id', invoice_id);
+    } else if (order_id) {
       // Source of truth for whether an order is paid - not profiles, which
       // Phase D's UI doesn't read for this.
       await supabase.from('orders').update({ payment_status: 'failed', payment_error: reason }).eq('id', order_id);
@@ -683,7 +823,7 @@ app.post('/webhook/stripe', async (req, res) => {
     if (winner_username) {
       await sendAdminEmail(
         `Stripe payment failed - ${winner_username}`,
-        `Stripe payment_intent.payment_failed\nOrder: ${order_id || 'unknown'}\nWinner: ${winner_username}\nAuction: ${auction_id}\nError: ${reason}`
+        `Stripe payment_intent.payment_failed\n${invoice_id ? `Invoice: ${invoice_id}` : `Order: ${order_id || 'unknown'}`}\nWinner: ${winner_username}\nAuction: ${auction_id}\nError: ${reason}`
       );
     }
   }
@@ -795,7 +935,7 @@ app.get('/my-bids', requireAuth, async (req, res) => {
 app.get('/my-orders', requireAuth, async (req, res) => {
   const { data: orders, error } = await supabase
     .from('orders')
-    .select('id, auction_id, item_title, hammer_cents, premium_cents, total_cents, payment_status, status, tracking_number, tracking_carrier, tracking_url, fulfillment_choice, shipping_cost_cents, shipping_payment_status, shipping_payment_error, created_at')
+    .select('id, auction_id, invoice_id, item_title, hammer_cents, premium_cents, total_cents, payment_status, status, tracking_number, tracking_carrier, tracking_url, fulfillment_choice, shipping_cost_cents, shipping_payment_status, shipping_payment_error, created_at')
     .eq('buyer_user_id', String(req.user.id))
     .order('created_at', { ascending: false });
   if (error) return res.status(500).json({ error: 'Failed to load orders' });
@@ -810,6 +950,7 @@ app.get('/my-orders', requireAuth, async (req, res) => {
     return {
       id: o.id,
       auction_id: o.auction_id,
+      invoice_id: o.invoice_id || null,
       item_title: o.item_title,
       auction_title: auction?.title || null,
       hammer_cents: o.hammer_cents,
@@ -1626,6 +1767,177 @@ async function chargeOrder(orderId) {
   }
 }
 
+// Charges an invoice's buyer off-session for total_cents - the standard-
+// auction equivalent of chargeOrder above, one charge per buyer per auction
+// instead of one per lot. Copies chargeOrder's proven pattern (atomic
+// conditional claim including stale-charging reclaim, per-attempt
+// idempotency key, mirrors the result onto every child order via
+// orders.invoice_id, never throws) rather than modifying chargeOrder itself,
+// which stays exactly as-is for live auctions.
+async function chargeInvoice(invoiceId) {
+  try {
+    const { data: invoice } = await supabase.from('invoices').select('*').eq('id', invoiceId).single();
+    if (!invoice) return { success: false, error: 'Invoice not found' };
+    if (invoice.payment_intent_id) {
+      await notifyInvoiceWonAndCharged(invoiceId, invoice.payment_intent_id);
+      return { success: true, payment_intent_id: invoice.payment_intent_id, alreadyCharged: true };
+    }
+
+    const staleCutoff = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const { data: claimed, error: claimErr } = await supabase
+      .from('invoices')
+      .update({ payment_status: 'charging', charging_since: new Date().toISOString() })
+      .eq('id', invoiceId)
+      .is('payment_intent_id', null)
+      .or(`payment_status.in.(unpaid,failed),and(payment_status.eq.charging,charging_since.lt.${staleCutoff})`)
+      .select()
+      .single();
+    if (claimErr || !claimed) {
+      return { success: false, error: 'Already being charged or already resolved', skipped: true };
+    }
+    // Mirror the claim onto every child order so orders.payment_status keeps
+    // reflecting the invoice's state for UI that reads it directly.
+    await supabase.from('orders').update({ payment_status: 'charging' }).eq('invoice_id', invoiceId);
+
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('stripe_customer_id, stripe_payment_method_id')
+      .eq('user_id', invoice.buyer_user_id)
+      .single();
+
+    if (!profile?.stripe_customer_id || !profile?.stripe_payment_method_id) {
+      const reason = 'No payment method on file';
+      await supabase.from('invoices').update({ payment_status: 'failed', payment_error: reason }).eq('id', invoiceId);
+      await supabase.from('orders').update({ payment_status: 'failed', payment_error: reason }).eq('invoice_id', invoiceId);
+      await sendAdminEmail(
+        `Payment failed - ${invoice.buyer_username}`,
+        `Invoice: ${invoiceId}\nAuction: ${invoice.auction_id}\nBuyer: ${invoice.buyer_username}\nAmount: $${((invoice.total_cents || 0) / 100).toFixed(2)}\nReason: ${reason}`
+      );
+      await notifyInvoicePaymentFailed(invoiceId, reason);
+      return { success: false, error: reason };
+    }
+
+    if (!stripe) {
+      const reason = 'Stripe not configured';
+      await supabase.from('invoices').update({ payment_status: 'failed', payment_error: reason }).eq('id', invoiceId);
+      await supabase.from('orders').update({ payment_status: 'failed', payment_error: reason }).eq('invoice_id', invoiceId);
+      await sendAdminEmail(`Payment failed - ${invoice.buyer_username}`, `Invoice: ${invoiceId}\nReason: ${reason}`);
+      await notifyInvoicePaymentFailed(invoiceId, reason);
+      return { success: false, error: reason };
+    }
+
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: invoice.total_cents || 0,
+      currency: 'usd',
+      customer: profile.stripe_customer_id,
+      payment_method: profile.stripe_payment_method_id,
+      confirm: true,
+      off_session: true,
+      metadata: { invoice_id: invoiceId, auction_id: invoice.auction_id, winner_username: invoice.buyer_username },
+    }, { idempotencyKey: `invoice-${invoiceId}-${require('crypto').randomUUID()}` });
+
+    await supabase.from('invoices')
+      .update({ payment_intent_id: paymentIntent.id, payment_status: 'paid', payment_error: null })
+      .eq('id', invoiceId);
+    await supabase.from('orders')
+      .update({ payment_intent_id: paymentIntent.id, payment_status: 'paid', payment_error: null })
+      .eq('invoice_id', invoiceId);
+    await notifyInvoiceWonAndCharged(invoiceId, paymentIntent.id);
+    return { success: true, payment_intent_id: paymentIntent.id };
+  } catch (e) {
+    console.error('chargeInvoice error:', invoiceId, e.message);
+    try {
+      await supabase.from('invoices').update({ payment_status: 'failed', payment_error: e.message }).eq('id', invoiceId);
+      await supabase.from('orders').update({ payment_status: 'failed', payment_error: e.message }).eq('invoice_id', invoiceId);
+    } catch (updateErr) {
+      console.error('chargeInvoice: failed to record failure on invoice', invoiceId, updateErr.message);
+    }
+    await sendAdminEmail(
+      `Payment failed - invoice ${invoiceId}`,
+      `chargeInvoice failed.\nInvoice: ${invoiceId}\nError: ${e.message}`
+    );
+    await notifyInvoicePaymentFailed(invoiceId, e.message);
+    return { success: false, error: e.message };
+  }
+}
+
+// Builds one invoice per distinct buyer for a just-closed standard auction
+// and charges each. Called once, from autoCloseStandardItems, when the
+// auction has no lots left open (all sold/unsold) - see the trigger there
+// for why that check is safe without an artificial delay. Sums each order's
+// already-captured total_cents rather than recomputing from the auction's
+// current premium rate, same reasoning as createOrderOnWin.
+//
+// Idempotent: the (auction_id, buyer_user_id) unique constraint means a
+// re-run (the close job retrying a not-yet-fully-processed auction) either
+// finds the existing invoice row or loses a race to insert one and then
+// fetches the winner - either way it converges on the same invoice id, links
+// any not-yet-linked orders to it, and chargeInvoice's own claim makes a
+// repeat charge attempt a no-op once paid (or safely retryable if failed).
+async function buildAndChargeInvoicesForAuction(auctionId) {
+  try {
+    const { data: orders, error: ordersErr } = await supabase
+      .from('orders')
+      .select('id, buyer_user_id, buyer_username, total_cents, invoice_id')
+      .eq('auction_id', auctionId);
+    if (ordersErr) {
+      console.error('buildAndChargeInvoicesForAuction: failed to load orders:', auctionId, ordersErr.message);
+      return;
+    }
+    if (!orders?.length) return;
+
+    const byBuyer = new Map();
+    for (const o of orders) {
+      if (!o.buyer_user_id) continue;
+      if (!byBuyer.has(o.buyer_user_id)) byBuyer.set(o.buyer_user_id, { buyer_username: o.buyer_username, orders: [] });
+      byBuyer.get(o.buyer_user_id).orders.push(o);
+    }
+
+    for (const [buyerUserId, group] of byBuyer) {
+      const totalCents = group.orders.reduce((sum, o) => sum + (o.total_cents || 0), 0);
+
+      let invoiceId = null;
+      const { data: existingInvoice } = await supabase
+        .from('invoices').select('id').eq('auction_id', auctionId).eq('buyer_user_id', buyerUserId).maybeSingle();
+      if (existingInvoice) {
+        invoiceId = existingInvoice.id;
+      } else {
+        const { data: inserted, error: insertErr } = await supabase
+          .from('invoices')
+          .insert({ auction_id: auctionId, buyer_user_id: buyerUserId, buyer_username: group.buyer_username, total_cents: totalCents })
+          .select('id')
+          .single();
+        if (insertErr) {
+          // Unique-constraint hit means a concurrent tick already created
+          // it - fetch rather than treat this as a real failure.
+          const { data: raceInvoice } = await supabase
+            .from('invoices').select('id').eq('auction_id', auctionId).eq('buyer_user_id', buyerUserId).maybeSingle();
+          if (!raceInvoice) {
+            console.error('buildAndChargeInvoicesForAuction: invoice creation failed:', auctionId, buyerUserId, insertErr.message);
+            continue;
+          }
+          invoiceId = raceInvoice.id;
+        } else {
+          invoiceId = inserted.id;
+        }
+      }
+
+      const unlinkedIds = group.orders.filter(o => o.invoice_id !== invoiceId).map(o => o.id);
+      if (unlinkedIds.length) {
+        await supabase.from('orders').update({ invoice_id: invoiceId }).in('id', unlinkedIds);
+      }
+
+      try {
+        await chargeInvoice(invoiceId);
+      } catch (chargeErr) {
+        console.error('buildAndChargeInvoicesForAuction: chargeInvoice failed:', invoiceId, chargeErr.message);
+      }
+    }
+  } catch (e) {
+    console.error('buildAndChargeInvoicesForAuction error:', auctionId, e.message);
+  }
+}
+
 // Charges one shipment's postage, off-session, for amountCents. orderIds is
 // every order in the shipment (a single order, or a bundle grouped for one
 // parcel) - there's no separate shipments table, so the charge result is
@@ -2403,26 +2715,39 @@ async function autoCloseStandardItems() {
         // Create the order for the winner. createOrderOnWin is idempotent
         // and returns the order id (existing or newly created) directly -
         // no follow-up lookup, so there's no query here whose error could
-        // get silently dropped.
+        // get silently dropped. No per-lot charge here anymore - standard
+        // auctions batch every buyer's lots into one invoice and charge once
+        // when the whole auction closes (Step 2 below), not as each lot
+        // closes. Live auctions don't go through this sweep at all (their
+        // items never get an ends_at - see the comment on Step 1 above), so
+        // this doesn't touch per-lot live charging.
         if (sold) {
-          const orderId = await createOrderOnWin(item.auction_id, item.leading_bidder, item.current_bid, item.id)
-
-          // Auto-charge, in its own try/catch: a Stripe outage must never
-          // stop a lot from closing. chargeOrder itself never throws, but
-          // this stays defensive regardless.
-          if (orderId) {
-            try {
-              await chargeOrder(orderId)
-            } catch (chargeErr) {
-              console.error('Auto-charge failed for item', item.id, chargeErr.message)
-            }
-          }
+          await createOrderOnWin(item.auction_id, item.leading_bidder, item.current_bid, item.id)
         }
         console.log(`Standard item ${item.id} closed: ${newStatus}`)
       }
     }
 
-    // Step 2: End any standard live auctions where ALL items are now closed
+    // Step 2: End any standard live auctions where ALL items are now closed.
+    // This is also the batched-charging trigger: when the last open lot in
+    // an auction closes, build one invoice per buyer (summing their orders'
+    // already-captured total_cents) and attempt to charge each. No
+    // artificial delay - soft close already extends individual lots, so "no
+    // open items left" is genuinely the end.
+    //
+    // Ending the auction is NOT gated on charging succeeding. A decline is
+    // an expected outcome, not a crash to retry - if it blocked 'ended',
+    // one buyer's bad card would hold the whole auction open on every tick
+    // forever, retrying a charge that will keep failing. That's the same
+    // shape of bug as a stuck 'charging' order with no way out (the reason
+    // chargeOrder's stale-claim reclaim exists at all). A failed invoice is
+    // recorded via invoices.payment_status = 'failed' and left for Phase
+    // D's manual Charge/Retry, exactly like a failed order always has been -
+    // the auction still ends here regardless.
+    //
+    // buildAndChargeInvoicesForAuction never throws (see its own comment),
+    // so the try/catch below is defensive only, not something the 'ended'
+    // update depends on.
     const { data: liveAuctions } = await supabase
       .from('auctions')
       .select('id')
@@ -2440,6 +2765,13 @@ async function autoCloseStandardItems() {
         const { data: allItems } = await supabase
           .from('auction_items').select('id').eq('auction_id', auction.id)
         if (allItems?.length > 0) {
+          try {
+            await buildAndChargeInvoicesForAuction(auction.id)
+          } catch (invErr) {
+            console.error('buildAndChargeInvoicesForAuction failed for auction', auction.id, invErr.message)
+          }
+          // Unconditional: reached regardless of whether any invoice above
+          // charged successfully, declined, or errored.
           await supabase.from('auctions').update({ status: 'ended' }).eq('id', auction.id)
           console.log('Auto-ended standard auction:', auction.id)
         }
