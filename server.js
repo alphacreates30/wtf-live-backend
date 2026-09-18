@@ -2069,6 +2069,22 @@ app.get('/admin/debug/payment-intents', requireAdmin, async (req, res) => {
   res.json(pis.data.map(pi => ({ id: pi.id, status: pi.status, amount: pi.amount, metadata: pi.metadata, created: pi.created })));
 });
 
+// TEMPORARY, same test as above: renders the actual invoice email HTML by
+// calling the real invoiceWonChargedEmailHtml/invoicePaymentFailedEmailHtml
+// functions against this invoice's real orders - proves what sendEmail was
+// actually given, not a re-description of it. Remove after the test.
+app.get('/admin/debug/render-invoice-email', requireAdmin, async (req, res) => {
+  const { invoice_id, kind } = req.query;
+  if (!invoice_id || !['won', 'failed'].includes(kind)) return res.status(400).json({ error: 'invoice_id and kind (won|failed) required' });
+  const { data: invoice } = await supabase.from('invoices').select('*').eq('id', invoice_id).single();
+  if (!invoice) return res.status(404).json({ error: 'Invoice not found' });
+  const { data: orders } = await supabase.from('orders').select('item_title, hammer_cents, premium_cents').eq('invoice_id', invoice_id);
+  const html = kind === 'won'
+    ? invoiceWonChargedEmailHtml(invoice, orders, null)
+    : invoicePaymentFailedEmailHtml(invoice, orders, invoice.payment_error || 'Card declined');
+  res.json({ invoice_total_cents: invoice.total_cents, order_count: orders.length, html });
+});
+
 // Loads order_ids and rejects the request if any is missing, not found, or
 // set to local pickup - shared by the quote and charge+buy steps so neither
 // can silently drift from the other's notion of "valid orders for this
