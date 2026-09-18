@@ -2057,6 +2057,18 @@ app.get('/admin/orders', requireAdmin, async (req, res) => {
   res.json(data);
 });
 
+// TEMPORARY diagnostic for the invoice-batching live test - proves the
+// PaymentIntent count from Stripe's own records, not from our payment_status
+// column. Remove after the test (see wtf-handoff notes on this same pattern
+// used for the 2026-09-14 shipping-path verification).
+app.get('/admin/debug/payment-intents', requireAdmin, async (req, res) => {
+  if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
+  const { customer } = req.query;
+  if (!customer) return res.status(400).json({ error: 'customer required' });
+  const pis = await stripe.paymentIntents.list({ customer, limit: 20 });
+  res.json(pis.data.map(pi => ({ id: pi.id, status: pi.status, amount: pi.amount, metadata: pi.metadata, created: pi.created })));
+});
+
 // Loads order_ids and rejects the request if any is missing, not found, or
 // set to local pickup - shared by the quote and charge+buy steps so neither
 // can silently drift from the other's notion of "valid orders for this
