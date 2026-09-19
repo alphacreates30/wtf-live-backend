@@ -2057,34 +2057,6 @@ app.get('/admin/orders', requireAdmin, async (req, res) => {
   res.json(data);
 });
 
-// TEMPORARY diagnostic for the invoice-batching live test - proves the
-// PaymentIntent count from Stripe's own records, not from our payment_status
-// column. Remove after the test (see wtf-handoff notes on this same pattern
-// used for the 2026-09-14 shipping-path verification).
-app.get('/admin/debug/payment-intents', requireAdmin, async (req, res) => {
-  if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
-  const { customer } = req.query;
-  if (!customer) return res.status(400).json({ error: 'customer required' });
-  const pis = await stripe.paymentIntents.list({ customer, limit: 20 });
-  res.json(pis.data.map(pi => ({ id: pi.id, status: pi.status, amount: pi.amount, metadata: pi.metadata, created: pi.created })));
-});
-
-// TEMPORARY, same test as above: renders the actual invoice email HTML by
-// calling the real invoiceWonChargedEmailHtml/invoicePaymentFailedEmailHtml
-// functions against this invoice's real orders - proves what sendEmail was
-// actually given, not a re-description of it. Remove after the test.
-app.get('/admin/debug/render-invoice-email', requireAdmin, async (req, res) => {
-  const { invoice_id, kind } = req.query;
-  if (!invoice_id || !['won', 'failed'].includes(kind)) return res.status(400).json({ error: 'invoice_id and kind (won|failed) required' });
-  const { data: invoice } = await supabase.from('invoices').select('*').eq('id', invoice_id).single();
-  if (!invoice) return res.status(404).json({ error: 'Invoice not found' });
-  const { data: orders } = await supabase.from('orders').select('item_title, hammer_cents, premium_cents').eq('invoice_id', invoice_id);
-  const html = kind === 'won'
-    ? invoiceWonChargedEmailHtml(invoice, orders, null)
-    : invoicePaymentFailedEmailHtml(invoice, orders, invoice.payment_error || 'Card declined');
-  res.json({ invoice_total_cents: invoice.total_cents, order_count: orders.length, won_email_sent_at: invoice.won_email_sent_at, payment_failed_email_sent_at: invoice.payment_failed_email_sent_at, html });
-});
-
 // Loads order_ids and rejects the request if any is missing, not found, or
 // set to local pickup - shared by the quote and charge+buy steps so neither
 // can silently drift from the other's notion of "valid orders for this
