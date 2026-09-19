@@ -1287,10 +1287,18 @@ app.get('/auction/:id/token', requireAuth, async (req, res) => {
 // view and easy to lose track of while still unpaid. Fails closed: if the
 // check itself errors, nothing is deleted.
 app.delete('/auction/:id', requireAdmin, async (req, res) => {
+  // orders.auction_id is a TEXT column (auctions.id is uuid), so the order
+  // check below is a case-sensitive string match while the auction delete is a
+  // case-insensitive uuid match: an UPPERCASE id would sail past the check and
+  // still delete the auction. Only accept a canonical lowercase uuid.
+  const auctionId = String(req.params.id).toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(auctionId)) {
+    return res.status(400).json({ error: 'Invalid auction id' });
+  }
   const { data: existing, error: ordersErr } = await supabase
     .from('orders')
     .select('id, payment_status, shipping_payment_status')
-    .eq('auction_id', req.params.id);
+    .eq('auction_id', auctionId);
   if (ordersErr) return res.status(500).json({ error: 'Could not check this auction for orders, so it was not deleted' });
   if (existing.length) {
     const notSettled = existing.filter(o => o.payment_status !== 'paid' || (o.shipping_payment_status && o.shipping_payment_status !== 'paid')).length;
@@ -1299,10 +1307,10 @@ app.delete('/auction/:id', requireAdmin, async (req, res) => {
       detail: `${existing.length} order${existing.length === 1 ? '' : 's'} came from it` + (notSettled ? `, ${notSettled} not fully paid` : '') + '. Orders are the record of what buyers owe and were sold.',
     });
   }
-  await supabase.from('auction_items').delete().eq('auction_id', req.params.id);
-  await supabase.from('bids').delete().eq('auction_id', req.params.id);
-  await supabase.from('chat_messages').delete().eq('auction_id', req.params.id);
-  await supabase.from('auctions').delete().eq('id', req.params.id);
+  await supabase.from('auction_items').delete().eq('auction_id', auctionId);
+  await supabase.from('bids').delete().eq('auction_id', auctionId);
+  await supabase.from('chat_messages').delete().eq('auction_id', auctionId);
+  await supabase.from('auctions').delete().eq('id', auctionId);
   res.json({ success: true });
 });
 app.get('/auction/:id/bids', async (req, res) => {
