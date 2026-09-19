@@ -2850,6 +2850,10 @@ app.post('/auction/:auctionId/items/:itemId/images', requireAuth, async (req, re
     if (!url) return res.status(400).json({ error: 'url is required' });
     const { data: auction } = await supabase.from('auctions').select('host_username').eq('id', req.params.auctionId).single();
     if (!auction || auction.host_username !== req.user.username) return res.status(403).json({ error: 'Not authorized' });
+    // Hosting :auctionId says nothing about :itemId - the lot must actually be
+    // in that auction, or any host could attach images to another host's lot.
+    const { data: lot } = await supabase.from('auction_items').select('auction_id').eq('id', req.params.itemId).single();
+    if (!lot || !lotBelongsToAuction(lot, req.params.auctionId)) return res.status(404).json({ error: 'Item not found' });
     const { data, error } = await supabase.from('item_images').insert({ item_id: req.params.itemId, url, position: position ?? 0 }).select().single();
     if (error) return res.status(500).json({ error: 'Failed to add image' });
     res.status(201).json(data);
