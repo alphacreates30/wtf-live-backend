@@ -2048,13 +2048,110 @@ async function chargeShipping(orderIds, amountCents) {
   }
 }
 
+// Orders id/invoice_id are uuids, and Postgres has no ILIKE for uuid, so a
+// typed prefix ("2ef6", "2ef6560d-a1") becomes an inclusive range instead:
+// the prefix padded with 0s up to the prefix padded with fs. Returns null if
+// the text can't be the start of a uuid.
+function uuidPrefixRange(text) {
+  const hex = text.replace(/-/g, '');
+  if (!hex || hex.length > 32 || !/^[0-9a-f]+$/i.test(hex)) return null;
+  const fmt = h => `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+  return [fmt(hex.toLowerCase().padEnd(32, '0')), fmt(hex.toLowerCase().padEnd(32, 'f'))];
+}
+
+const ADMIN_ORDERS_DEFAULT_LIMIT = 200;
+const ADMIN_ORDERS_MAX_LIMIT = 200;
+
+// Filtered, bounded, and counted. Returns { orders, total }: total is the
+// exact number of orders matching the filter/search, so the UI can say
+// "showing 200 of 847" instead of a silently truncated list. PostgREST caps a
+// response at the project's max-rows setting with no error, so an unbounded
+// select('*') here would eventually just stop showing orders.
+//
+// limit/offset page over the MATCHED orders. Each page is then widened to
+// every sibling of its orders - the rest of the same invoice and the rest of
+// the same bundle - so a page boundary or a search hit on one lot never
+// leaves an invoice or bundle showing only some of its lots (the invoice
+// card lists its lots and the amount it charges). `orders` can therefore
+// hold more rows than `limit`; `total` still counts matches only.
 app.get('/admin/orders', requireAdmin, async (req, res) => {
-  const { data, error } = await supabase
+  const auctionId = typeof req.query.auction_id === 'string' ? req.query.auction_id.trim() : '';
+  const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  const limitN = parseInt(req.query.limit, 10);
+  const offsetN = parseInt(req.query.offset, 10);
+  const limit = Math.min(Number.isFinite(limitN) && limitN > 0 ? limitN : ADMIN_ORDERS_DEFAULT_LIMIT, ADMIN_ORDERS_MAX_LIMIT);
+  const offset = Number.isFinite(offsetN) && offsetN > 0 ? offsetN : 0;
+
+  let query = supabase
     .from('orders')
-    .select('*')
-    .order('created_at', { ascending: false });
+    .select('*', { count: 'exact' })
+    .order('created_at', { ascending: false })
+    .order('id', { ascending: true })
+    .range(offset, offset + limit - 1);
+
+  if (auctionId) query = query.eq('auction_id', auctionId);
+
+  if (q) {
+    // Values go inside double quotes in PostgREST's or() syntax, so escape
+    // backslash and " there, and escape LIKE's own wildcards so a typed % or _
+    // is literal. LIKE escaping goes first; the quote-escaping then doubles
+    // the backslashes it added.
+    const BS = '\\';
+    const like = q.replace(/[\\%_]/g, c => BS + c);
+    const quoted = `"%${like.replace(/[\\"]/g, c => BS + c)}%"`;
+    const clauses = [`buyer_username.ilike.${quoted}`, `item_title.ilike.${quoted}`];
+    const range = uuidPrefixRange(q);
+    if (range) {
+      clauses.push(`and(id.gte.${range[0]},id.lte.${range[1]})`);
+      clauses.push(`and(invoice_id.gte.${range[0]},invoice_id.lte.${range[1]})`);
+    }
+    query = query.or(clauses.join(','));
+  }
+
+  const { data: page, error, count } = await query;
   if (error) return res.status(500).json({ error });
-  res.json(data);
+
+  const have = new Set(page.map(o => o.id));
+  const invoiceIds = [...new Set(page.map(o => o.invoice_id).filter(Boolean))];
+  const groupIds = [...new Set(page.map(o => o.group_id).filter(Boolean))];
+  let orders = page;
+  if (invoiceIds.length || groupIds.length) {
+    const sibClauses = [];
+    if (invoiceIds.length) sibClauses.push(`invoice_id.in.(${invoiceIds.join(',')})`);
+    if (groupIds.length) sibClauses.push(`group_id.in.(${groupIds.join(',')})`);
+    const { data: sibs, error: sibErr } = await supabase
+      .from('orders')
+      .select('*')
+      .or(sibClauses.join(','))
+      .order('created_at', { ascending: false })
+      .order('id', { ascending: true });
+    if (sibErr) return res.status(500).json({ error: sibErr });
+    orders = [...page, ...sibs.filter(o => !have.has(o.id))]
+      .sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : a.id < b.id ? -1 : 1));
+  }
+
+  // matched = how many of the total this page covers (orders may exceed it -
+  // see the sibling widening above); the UI compares it to total to say
+  // "showing 200 of 847".
+  res.json({ orders, total: count ?? page.length, matched: page.length });
+});
+
+// Populates the orders screen's auction selector. Counts come from one exact
+// count query per auction, NOT from grouping a select of orders - that select
+// would hit the same silent row cap this whole endpoint exists to get around.
+app.get('/admin/auctions/summary', requireAdmin, async (req, res) => {
+  const { data: auctions, error } = await supabase
+    .from('auctions')
+    .select('id, title, status, starts_at, ends_at, created_at')
+    .order('created_at', { ascending: false })
+    .limit(100);
+  if (error) return res.status(500).json({ error });
+  const counts = await Promise.all((auctions || []).map(a =>
+    supabase.from('orders').select('id', { count: 'exact', head: true }).eq('auction_id', a.id)
+  ));
+  const failed = counts.find(c => c.error);
+  if (failed) return res.status(500).json({ error: failed.error });
+  res.json((auctions || []).map((a, i) => ({ ...a, order_count: counts[i].count ?? 0 })));
 });
 
 // Loads order_ids and rejects the request if any is missing, not found, or
