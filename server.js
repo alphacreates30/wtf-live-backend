@@ -2173,7 +2173,7 @@ app.post('/admin/orders/label', requireAdmin, async (req, res) => {
 
   const chargeResult = await chargeShipping(order_ids, amount_cents);
   if (!chargeResult.success) {
-    return res.status(402).json({ error: `Shipping charge failed: ${chargeResult.error}`, detail: chargeResult.error });
+    return res.status(402).json({ error: 'Shipping charge failed', detail: chargeResult.error });
   }
 
   try {
@@ -2199,7 +2199,7 @@ app.post('/admin/orders/label', requireAdmin, async (req, res) => {
         `Charged ${formatMoney(amount_cents)} (payment_intent ${chargeResult.payment_intent_id}) but Shippo label purchase failed.\nOrder(s): ${order_ids.join(', ')}\nDetail: ${JSON.stringify(transaction.messages)}`
       );
       return res.status(500).json({
-        error: `Buyer was charged but label purchase failed - needs manual follow-up: ${JSON.stringify(transaction.messages)}`,
+        error: 'Buyer was charged but label purchase failed - needs manual follow-up',
         detail: transaction.messages,
       });
     }
@@ -2238,7 +2238,7 @@ app.post('/admin/orders/label', requireAdmin, async (req, res) => {
       `Shipping charged but label purchase FAILED - order(s) ${order_ids.join(', ')}`,
       `Charged ${formatMoney(amount_cents)} (payment_intent ${chargeResult.payment_intent_id}) but Shippo label purchase threw.\nOrder(s): ${order_ids.join(', ')}\nError: ${e.message}`
     );
-    res.status(500).json({ error: `Buyer was charged but label purchase failed - needs manual follow-up: ${e.message}`, detail: e.message });
+    res.status(500).json({ error: 'Buyer was charged but label purchase failed - needs manual follow-up', detail: e.message });
   }
 });
 
