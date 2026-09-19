@@ -2082,7 +2082,7 @@ app.get('/admin/debug/render-invoice-email', requireAdmin, async (req, res) => {
   const html = kind === 'won'
     ? invoiceWonChargedEmailHtml(invoice, orders, null)
     : invoicePaymentFailedEmailHtml(invoice, orders, invoice.payment_error || 'Card declined');
-  res.json({ invoice_total_cents: invoice.total_cents, order_count: orders.length, html });
+  res.json({ invoice_total_cents: invoice.total_cents, order_count: orders.length, won_email_sent_at: invoice.won_email_sent_at, payment_failed_email_sent_at: invoice.payment_failed_email_sent_at, html });
 });
 
 // Loads order_ids and rejects the request if any is missing, not found, or
