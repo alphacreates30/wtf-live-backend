@@ -932,14 +932,49 @@ app.get('/my-bids', requireAuth, async (req, res) => {
 // -- My Orders (what I won and was billed for) --
 // Scoped to the caller's own JWT-derived id - never accepts a user id from
 // the client, so there's no way to request someone else's orders.
+//
+// Pages through ALL of the buyer's orders rather than taking one select: a
+// single select is silently cut at PostgREST's max-rows cap, and this is the
+// screen that shows what a buyer owes. Unlike the admin list this is not
+// truncated-with-a-count, because the page groups lots into invoices and must
+// see every lot of an invoice to show the right total.
+//
+// count and rows are separate queries, so they can disagree while an auction
+// is closing and writing orders. The loop therefore never trusts the count
+// alone: it stops on an empty page, on a short page once it has the count,
+// and at a hard page cap (returning what it has, loudly logged, rather than
+// erroring or spinning). Rows are keyed by id because an insert between pages
+// shifts the offset and can repeat a row - a repeated lot would inflate an
+// invoice total.
+const MY_ORDERS_PAGE = 500;
+const MY_ORDERS_MAX_PAGES = 20;
 app.get('/my-orders', requireAuth, async (req, res) => {
-  const { data: orders, error } = await supabase
-    .from('orders')
-    .select('id, auction_id, invoice_id, item_title, hammer_cents, premium_cents, total_cents, payment_status, status, tracking_number, tracking_carrier, tracking_url, fulfillment_choice, shipping_cost_cents, shipping_payment_status, shipping_payment_error, created_at')
-    .eq('buyer_user_id', String(req.user.id))
-    .order('created_at', { ascending: false });
-  if (error) return res.status(500).json({ error: 'Failed to load orders' });
-  if (!orders?.length) return res.json([]);
+  const byId = new Map();
+  let total = null;
+  let fetched = 0;
+  let pages = 0;
+  while (total === null || fetched < total) {
+    if (pages >= MY_ORDERS_MAX_PAGES) {
+      console.error(`[my-orders] PAGE CAP HIT for user ${req.user.id}: ${MY_ORDERS_MAX_PAGES} pages, ${byId.size} orders returned, count said ${total}. Returning a partial list.`);
+      break;
+    }
+    pages++;
+    const { data, error, count } = await supabase
+      .from('orders')
+      .select('id, auction_id, invoice_id, item_title, hammer_cents, premium_cents, total_cents, payment_status, status, tracking_number, tracking_carrier, tracking_url, fulfillment_choice, shipping_cost_cents, shipping_payment_status, shipping_payment_error, created_at', { count: 'exact' })
+      .eq('buyer_user_id', String(req.user.id))
+      .order('created_at', { ascending: false })
+      .order('id', { ascending: true })
+      .range(fetched, fetched + MY_ORDERS_PAGE - 1);
+    if (error) return res.status(500).json({ error: 'Failed to load orders' });
+    total = count ?? 0;
+    if (!data?.length) break;                 // count and rows disagree - never spin
+    fetched += data.length;
+    for (const o of data) byId.set(o.id, o);
+    if (data.length < MY_ORDERS_PAGE && fetched >= total) break;
+  }
+  const orders = [...byId.values()];
+  if (!orders.length) return res.json([]);
 
   const auctionIds = [...new Set(orders.map(o => o.auction_id))];
   const { data: auctions } = await supabase.from('auctions').select('id, title, status, fulfillment_mode').in('id', auctionIds);
