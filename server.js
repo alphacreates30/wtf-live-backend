@@ -531,6 +531,54 @@ function requireAuth(req, res, next) {
   }
 }
 
+// ---- Id normalisation at the edge ----
+// Several id columns are TEXT rather than uuid (orders/auction_items/pre_bids
+// .auction_id), so a comparison against one is a case-sensitive string match
+// while the same id against a uuid column is case-insensitive. An id that
+// arrives in the wrong case can therefore pass one check and miss another.
+// Every id that comes in from a URL, body, query or socket event is validated
+// as a well-formed uuid and lowercased here, once, before any handler uses it.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+function canonicalUuid(v) {
+  if (typeof v !== 'string') return null;
+  const c = v.trim().toLowerCase();
+  return UUID_RE.test(c) ? c : null;
+}
+
+// URL params. Every :id / :auctionId / :itemId / :imageId / :userId in this
+// file is a uuid, so one param hook covers every route that takes one.
+for (const name of ['id', 'auctionId', 'itemId', 'imageId', 'userId']) {
+  app.param(name, (req, res, next, value) => {
+    const c = canonicalUuid(value);
+    if (!c) return res.status(400).json({ error: `Invalid ${name}` });
+    req.params[name] = c;
+    next();
+  });
+}
+
+// Body ids: { single: ['order_id', ...], list: ['order_ids', ...] }. A field
+// that is absent (or null/'') is left alone - each route already decides
+// whether it is required.
+function normalizeBodyIds({ single = [], list = [] }) {
+  return (req, res, next) => {
+    const body = req.body || {};
+    for (const k of single) {
+      if (body[k] == null || body[k] === '') continue;
+      const c = canonicalUuid(body[k]);
+      if (!c) return res.status(400).json({ error: `Invalid ${k}` });
+      body[k] = c;
+    }
+    for (const k of list) {
+      if (body[k] == null) continue;
+      if (!Array.isArray(body[k])) return res.status(400).json({ error: `Invalid ${k}` });
+      const out = body[k].map(canonicalUuid);
+      if (out.some(x => !x)) return res.status(400).json({ error: `Invalid ${k}` });
+      body[k] = out;
+    }
+    next();
+  };
+}
+
 function requireAdmin(req, res, next) {
   requireAuth(req, res, () => {
     if (req.user.username !== ADMIN_USERNAME) return res.status(403).json({ error: 'Admin only' });
@@ -735,7 +783,7 @@ app.post('/save-payment-method', requireAuth, async (req, res) => {
 // invoice_id, or by following order_id -> orders.invoice_id when set) and
 // falls through to chargeOrder, untouched, only for orders with no invoice -
 // i.e. live auctions, which never batch.
-app.post('/charge-winner', requireAuth, async (req, res) => {
+app.post('/charge-winner', requireAuth, normalizeBodyIds({ single: ['auction_id', 'order_id', 'invoice_id'] }), async (req, res) => {
   const { auction_id, winner_username, order_id, invoice_id } = req.body;
   if (!invoice_id && !order_id && (!auction_id || !winner_username)) {
     return res.status(400).json({ error: 'invoice_id, order_id, or auction_id and winner_username, required' });
@@ -1289,12 +1337,9 @@ app.get('/auction/:id/token', requireAuth, async (req, res) => {
 app.delete('/auction/:id', requireAdmin, async (req, res) => {
   // orders.auction_id is a TEXT column (auctions.id is uuid), so the order
   // check below is a case-sensitive string match while the auction delete is a
-  // case-insensitive uuid match: an UPPERCASE id would sail past the check and
-  // still delete the auction. Only accept a canonical lowercase uuid.
-  const auctionId = String(req.params.id).toLowerCase();
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(auctionId)) {
-    return res.status(400).json({ error: 'Invalid auction id' });
-  }
+  // case-insensitive uuid match. req.params.id is already a canonical lowercase
+  // uuid (app.param above), so the two can't disagree.
+  const auctionId = req.params.id;
   const { data: existing, error: ordersErr } = await supabase
     .from('orders')
     .select('id, payment_status, shipping_payment_status')
@@ -1383,6 +1428,27 @@ async function sweepExpiredStandardItems() { /* intentionally disabled */ }
 // ------------------------------------------------------------
 
 io.on('connection', (socket) => {
+  // Every socket event that carries an auctionId gets it validated and
+  // lowercased before its handler runs (room names are case-sensitive too: an
+  // uppercase id would join a room nothing is ever broadcast to).
+  const SOCKET_ID_ERRORS = {
+    join_auction: ['auction_error', { code: 'not_found', message: 'Auction not found.' }],
+    place_bid: ['bid_error', { message: 'Invalid auction id' }],
+    send_chat: ['chat_error', { message: 'Invalid auction id' }],
+  };
+  socket.use(([event, payload], next) => {
+    if (payload && typeof payload === 'object' && 'auctionId' in payload) {
+      const c = canonicalUuid(payload.auctionId);
+      if (!c) {
+        const [evt, body] = SOCKET_ID_ERRORS[event] || ['host_error', { message: 'Invalid auction id' }];
+        socket.emit(evt, body);
+        return;   // drop the event: the handler never sees a malformed id
+      }
+      payload.auctionId = c;
+    }
+    next();
+  });
+
   console.log(`- User connected: ${socket.id}`);
 
   socket.on('join_auction', async ({ auctionId, token } = {}) => {
@@ -2136,7 +2202,9 @@ const ADMIN_ORDERS_MAX_LIMIT = 200;
 // card lists its lots and the amount it charges). `orders` can therefore
 // hold more rows than `limit`; `total` still counts matches only.
 app.get('/admin/orders', requireAdmin, async (req, res) => {
-  const auctionId = typeof req.query.auction_id === 'string' ? req.query.auction_id.trim() : '';
+  const rawAuctionId = typeof req.query.auction_id === 'string' ? req.query.auction_id.trim() : '';
+  const auctionId = rawAuctionId ? canonicalUuid(rawAuctionId) : '';
+  if (rawAuctionId && !auctionId) return res.status(400).json({ error: 'Invalid auction_id' });
   const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
   const limitN = parseInt(req.query.limit, 10);
   const offsetN = parseInt(req.query.offset, 10);
@@ -2240,7 +2308,7 @@ async function loadShippableOrders(order_ids) {
 // the host, entered at packing time - there is no hardcoded parcel and no
 // fallback if any is missing, because a silent fallback here (a fixed 2lb
 // box, regardless of the real contents) is the exact bug this replaces.
-app.post('/admin/orders/shipping-quote', requireAdmin, async (req, res) => {
+app.post('/admin/orders/shipping-quote', requireAdmin, normalizeBodyIds({ list: ['order_ids'] }), async (req, res) => {
   const { order_ids, weight_oz, length_in, width_in, height_in } = req.body;
   if (weight_oz == null || length_in == null || width_in == null || height_in == null) {
     return res.status(400).json({ error: 'weight_oz, length_in, width_in and height_in are all required' });
@@ -2318,7 +2386,7 @@ app.post('/admin/orders/shipping-quote', requireAdmin, async (req, res) => {
 // /admin/orders/shipping-quote above - charging happens before buying so we
 // never ship goods we haven't been paid postage for, and never buy a label
 // we can't recover the cost of.
-app.post('/admin/orders/label', requireAdmin, async (req, res) => {
+app.post('/admin/orders/label', requireAdmin, normalizeBodyIds({ list: ['order_ids'] }), async (req, res) => {
   const { order_ids, rate_id, amount_cents } = req.body;
   if (!rate_id || !(amount_cents > 0)) {
     return res.status(400).json({ error: 'rate_id and amount_cents (from a shipping quote) are required' });
@@ -2400,7 +2468,7 @@ app.post('/admin/orders/label', requireAdmin, async (req, res) => {
   }
 });
 
-app.post('/admin/orders/group', requireAdmin, async (req, res) => {
+app.post('/admin/orders/group', requireAdmin, normalizeBodyIds({ list: ['order_ids'] }), async (req, res) => {
   const { order_ids } = req.body;
   if (!order_ids?.length) return res.status(400).json({ error: 'order_ids required' });
   const groupId = require('crypto').randomUUID();
