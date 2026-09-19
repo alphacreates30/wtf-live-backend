@@ -1280,7 +1280,25 @@ app.get('/auction/:id/token', requireAuth, async (req, res) => {
 });
 
 
+// An auction that has produced orders can't be deleted: orders (and invoices,
+// which cascade off the auction) are the record of what a buyer owes and what
+// was sold, and there is no FK from orders to auctions, so a delete here used
+// to leave them behind pointing at nothing - unreachable from any per-auction
+// view and easy to lose track of while still unpaid. Fails closed: if the
+// check itself errors, nothing is deleted.
 app.delete('/auction/:id', requireAdmin, async (req, res) => {
+  const { data: existing, error: ordersErr } = await supabase
+    .from('orders')
+    .select('id, payment_status, shipping_payment_status')
+    .eq('auction_id', req.params.id);
+  if (ordersErr) return res.status(500).json({ error: 'Could not check this auction for orders, so it was not deleted' });
+  if (existing.length) {
+    const notSettled = existing.filter(o => o.payment_status !== 'paid' || (o.shipping_payment_status && o.shipping_payment_status !== 'paid')).length;
+    return res.status(409).json({
+      error: 'This auction has orders and cannot be deleted',
+      detail: `${existing.length} order${existing.length === 1 ? '' : 's'} came from it` + (notSettled ? `, ${notSettled} not fully paid` : '') + '. Orders are the record of what buyers owe and were sold.',
+    });
+  }
   await supabase.from('auction_items').delete().eq('auction_id', req.params.id);
   await supabase.from('bids').delete().eq('auction_id', req.params.id);
   await supabase.from('chat_messages').delete().eq('auction_id', req.params.id);
