@@ -2494,6 +2494,12 @@ app.delete('/auction/:id/items/:itemId', requireAdmin, async (req, res) => {
   res.json({ success: true });
 });
 
+// auction_items.auction_id is a text column, so compare case-insensitively
+// (a uuid in the URL may be any case; the stored value is canonical lowercase).
+function lotBelongsToAuction(item, auctionId) {
+  return String(item.auction_id || '').toLowerCase() === String(auctionId).toLowerCase();
+}
+
 app.post('/auction/:id/items/:itemId/prebid', requireAuth, async (req, res) => {
   const { max_amount } = req.body;
   if (!max_amount || max_amount < 1) return res.status(400).json({ error: 'max_amount required' });
@@ -2511,8 +2517,12 @@ app.post('/auction/:id/items/:itemId/prebid', requireAuth, async (req, res) => {
     .maybeSingle();
   if (!acceptance) return res.status(403).json({ error: 'You must accept the auction terms before bidding' });
 
-  const { data: item } = await supabase.from('auction_items').select('status').eq('id', req.params.itemId).single();
+  const { data: item } = await supabase.from('auction_items').select('status, auction_id').eq('id', req.params.itemId).single();
   if (!item) return res.status(404).json({ error: 'Item not found' });
+  // The terms check above is for the auction in the URL. The lot must belong
+  // to that same auction, or terms accepted on auction A would cover a pre-bid
+  // on a lot in auction B (no terms, no fulfilment choice, wrong premium).
+  if (!lotBelongsToAuction(item, req.params.id)) return res.status(404).json({ error: 'Item not found' });
   if (item.status !== 'pending') return res.status(400).json({ error: 'Pre-bidding closed' });
   const { data, error } = await supabase.from('pre_bids').upsert({ item_id: req.params.itemId, auction_id: req.params.id, buyer_username: req.user.username, buyer_user_id: String(req.user.id), max_amount }, { onConflict: 'item_id,buyer_username' }).select().single();
   if (error) return res.status(500).json({ error });
@@ -2568,9 +2578,13 @@ app.post('/auction/:id/items/:itemId/bid', requireAuth, async (req, res) => {
   // Server-side bid increment validation
   const { data: bidItem } = await supabase
     .from('auction_items')
-    .select('current_bid,starting_bid,bid_count,leading_bidder,status,ends_at')
+    .select('current_bid,starting_bid,bid_count,leading_bidder,status,ends_at,auction_id')
     .eq('id', req.params.itemId).single();
   if (!bidItem) return res.status(404).json({ error: 'Item not found' });
+  // Same as pre-bid: the terms check above covers the URL's auction, so the
+  // lot has to be in it. Without this a bid lands on any auction's lot as
+  // long as the bidder accepted terms on ANY auction.
+  if (!lotBelongsToAuction(bidItem, req.params.id)) return res.status(404).json({ error: 'Item not found' });
   if (bidItem.status === 'sold' || bidItem.status === 'unsold') return res.status(400).json({ error: 'Lot is closed' });
   if (bidItem.ends_at && new Date(bidItem.ends_at) <= new Date()) return res.status(400).json({ error: 'Lot has closed' });
 
