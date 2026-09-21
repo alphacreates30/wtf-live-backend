@@ -1910,6 +1910,19 @@ async function chargeOrder(orderId) {
   }
 }
 
+// The won-and-charged email runs AFTER the money has moved and the invoice is
+// marked paid. Nothing it does may be able to reach chargeInvoice's catch, which
+// would record a charged invoice as failed and email the buyer "payment failed".
+// notifyInvoiceWonAndCharged already swallows its own errors; this makes the
+// guarantee structural rather than a property of that function's body.
+async function notifyWonAfterCharge(invoiceId, paymentIntentId) {
+  try {
+    await notifyInvoiceWonAndCharged(invoiceId, paymentIntentId);
+  } catch (e) {
+    console.error('won email failed after a successful charge (invoice stays paid):', invoiceId, e.message);
+  }
+}
+
 // Charges an invoice's buyer off-session for total_cents - the standard-
 // auction equivalent of chargeOrder above, one charge per buyer per auction
 // instead of one per lot. Copies chargeOrder's proven pattern (atomic
@@ -1922,7 +1935,7 @@ async function chargeInvoice(invoiceId) {
     const { data: invoice } = await supabase.from('invoices').select('*').eq('id', invoiceId).single();
     if (!invoice) return { success: false, error: 'Invoice not found' };
     if (invoice.payment_intent_id) {
-      await notifyInvoiceWonAndCharged(invoiceId, invoice.payment_intent_id);
+      await notifyWonAfterCharge(invoiceId, invoice.payment_intent_id);
       return { success: true, payment_intent_id: invoice.payment_intent_id, alreadyCharged: true };
     }
 
@@ -1985,13 +1998,16 @@ async function chargeInvoice(invoiceId) {
     await supabase.from('orders')
       .update({ payment_intent_id: paymentIntent.id, payment_status: 'paid', payment_error: null })
       .eq('invoice_id', invoiceId);
-    await notifyInvoiceWonAndCharged(invoiceId, paymentIntent.id);
+    await notifyWonAfterCharge(invoiceId, paymentIntent.id);
     return { success: true, payment_intent_id: paymentIntent.id };
   } catch (e) {
     console.error('chargeInvoice error:', invoiceId, e.message);
     try {
-      await supabase.from('invoices').update({ payment_status: 'failed', payment_error: e.message }).eq('id', invoiceId);
-      await supabase.from('orders').update({ payment_status: 'failed', payment_error: e.message }).eq('invoice_id', invoiceId);
+      // Never overwrite an invoice that already carries a PaymentIntent: money
+      // has moved, so whatever threw, it is not "payment failed". (Retry and
+      // the UI both treat a PaymentIntent id as "already charged".)
+      await supabase.from('invoices').update({ payment_status: 'failed', payment_error: e.message }).eq('id', invoiceId).is('payment_intent_id', null);
+      await supabase.from('orders').update({ payment_status: 'failed', payment_error: e.message }).eq('invoice_id', invoiceId).is('payment_intent_id', null);
     } catch (updateErr) {
       console.error('chargeInvoice: failed to record failure on invoice', invoiceId, updateErr.message);
     }
