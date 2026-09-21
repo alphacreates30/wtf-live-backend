@@ -789,21 +789,37 @@ app.post('/charge-winner', requireAuth, normalizeBodyIds({ single: ['auction_id'
     return res.status(400).json({ error: 'invoice_id, order_id, or auction_id and winner_username, required' });
   }
 
-  // Must be admin or host
-  let auctionIdForAuth = auction_id;
-  if (!auctionIdForAuth) {
-    if (invoice_id) {
-      const { data: invoiceForAuth } = await supabase.from('invoices').select('auction_id').eq('id', invoice_id).single();
-      auctionIdForAuth = invoiceForAuth?.auction_id;
-    } else {
-      const { data: orderForAuth } = await supabase.from('orders').select('auction_id').eq('id', order_id).single();
-      auctionIdForAuth = orderForAuth?.auction_id;
-    }
+  // Must be admin or host - of the auction the TARGET belongs to. What gets
+  // charged is decided by invoice_id, else order_id, else auction_id +
+  // winner_username, so authorise against that same thing. A caller-supplied
+  // auction_id is only ever a cross-check: trusting it alone let the host of
+  // auction A charge an invoice or order that lives in auction B.
+  let auctionIdForAuth;
+  if (invoice_id) {
+    const { data: invoiceForAuth } = await supabase.from('invoices').select('auction_id').eq('id', invoice_id).maybeSingle();
+    auctionIdForAuth = invoiceForAuth?.auction_id;
+  } else if (order_id) {
+    const { data: orderForAuth } = await supabase.from('orders').select('auction_id').eq('id', order_id).maybeSingle();
+    auctionIdForAuth = orderForAuth?.auction_id;
+  } else {
+    auctionIdForAuth = auction_id;
   }
-  const { data: auction } = await supabase.from('auctions').select('host_username').eq('id', auctionIdForAuth).single();
+  if (!auctionIdForAuth) return res.status(404).json({ error: 'Auction not found' });
+  // Body auction_id disagreeing with the target's own auction: refuse, and say
+  // nothing about the other auction.
+  if (auction_id && (invoice_id || order_id) && auction_id !== auctionIdForAuth) {
+    return res.status(404).json({ error: 'Auction not found' });
+  }
+  const { data: auction } = await supabase.from('auctions').select('host_username').eq('id', auctionIdForAuth).maybeSingle();
   if (!auction) return res.status(404).json({ error: 'Auction not found' });
   if (req.user.username !== ADMIN_USERNAME && req.user.username !== auction.host_username) {
     return res.status(403).json({ error: 'Not authorized to charge' });
+  }
+  // invoice_id wins below, so an order_id sent alongside it must be on that
+  // invoice - otherwise it would be ignored after being authorised as if used.
+  if (invoice_id && order_id) {
+    const { data: o } = await supabase.from('orders').select('invoice_id').eq('id', order_id).maybeSingle();
+    if (!o || o.invoice_id !== invoice_id) return res.status(404).json({ error: 'Order not found on this invoice' });
   }
 
   if (invoice_id) {
