@@ -1,4 +1,4 @@
--- STEP f. NOT YET RUN. Supersedes the function body from step e (e was applied, but its function fails on any
+-- STEP f. APPLIED on production 2026-09-21, verified (security_definer = false, ACL postgres+service_role only), followed by notify pgrst. DO NOT RUN AGAIN. Supersedes step e (whose function failed on any auction with rows: "operator does not exist: text = uuid").
 -- auction that has rows: "operator does not exist: text = uuid"). Run in the Supabase SQL editor.
 --
 -- Cause: auction_items.auction_id and pre_bids.auction_id / item_id are TEXT columns (auctions.id is uuid), and e

@@ -1,4 +1,4 @@
--- STEP e. APPLIED 2026-09-20 but its function body is BROKEN ("operator does not exist: text = uuid" on any auction that has rows) - superseded by step f (2026-09-20f...). Do not run again; run f.
+-- STEP e. APPLIED 2026-09-21 but its function body was BROKEN ("operator does not exist: text = uuid" on any auction that has rows) - superseded by step f, which is also applied. DO NOT RUN AGAIN.
 -- Must be applied BEFORE the matching server.js is deployed: the new DELETE /auction/:id calls this function
 -- and answers 500 ("Nothing was removed") if it does not exist.
 --
