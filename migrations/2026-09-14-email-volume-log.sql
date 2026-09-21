@@ -1,6 +1,6 @@
 -- One row per email actually accepted by Resend (any kind: admin, won,
--- failed, outbid, shipped). Used only to count today's send volume so
--- outbid emails can be suppressed once we're near Resend's 100/day cap -
+-- failed, outbid, shipped). Used only to count the rolling 30-day send volume so
+-- outbid emails can be suppressed once we're near Resend's quota -
 -- see shouldSuppressOutbid() / sendEmail() in server.js. Written only by
 -- the service key, so no anon access.
 create table if not exists email_send_log (

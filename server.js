@@ -60,28 +60,43 @@ const ADMIN_FROM = 'WhatTheFind Live <alerts@whatthefind.live>';
 const BUYER_FROM = 'WhatTheFind Live <auctions@whatthefind.live>';
 const REPLY_TO = 'whatthefind.co@gmail.com';
 
-// Resend's free tier is 3,000/month but capped at 100/day, and a day that
-// hits the cap gets EVERYTHING rejected - including won/charged, which must
-// never be dropped. email_send_log has one row per email actually accepted
-// by Resend today (any kind); once that count is near the cap, only the
-// lowest-value kind (outbid) gets suppressed - won/failed/shipped/admin
-// always go through regardless of volume.
-const DAILY_EMAIL_CAP = 100;
-const OUTBID_SUPPRESS_AT = 90;
+// Resend Pro: 50,000 emails per billing period, no daily cap. The limit that can
+// now bite is that quota, and a quota that runs out rejects EVERYTHING until it
+// resets - including won/charged, which must never be dropped - so running out
+// is worse than it ever was mid-day, not better. email_send_log has one row per
+// email actually accepted by Resend (any kind); once the recent count is near
+// the quota, only the lowest-value kind (outbid) gets suppressed -
+// won/failed/shipped/admin always go through regardless of volume. The 5,000 of
+// headroom is what those kinds run on.
+//
+// The window is a ROLLING 30 days, and it is deliberately APPROXIMATE and
+// deliberately CONSERVATIVE. Resend's period is the billing cycle, which renews
+// on the day the plan started (the 20th, at the time of writing), not the 1st -
+// so a calendar month is wrong in both directions. Anchoring on today's billing
+// day would be exact until the plan changes or is resubscribed, and then
+// silently wrong with nobody to notice. A rolling window needs no such constant
+// and errs in the SAFE direction: just after a real reset it still counts the
+// pre-reset sends, so it reaches 45,000 sooner than Resend's own meter and
+// suppresses outbid EARLY - a few dropped outbid emails, harmless. It can only
+// err LATE on the last day of a 31-day cycle, when it misses about one day of
+// sends - far inside the 5,000 headroom. Erring late is how won emails get
+// rejected; erring early costs nothing that matters. Do not "fix" it to be exact.
+const MONTHLY_EMAIL_CAP = 50000;
+const OUTBID_SUPPRESS_AT = 45000;
+const EMAIL_WINDOW_DAYS = 30;
 
-function startOfTodayUTC() {
-  const d = new Date();
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())).toISOString();
+function emailWindowStart() {
+  return new Date(Date.now() - EMAIL_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString();
 }
 
 // Fails CLOSED: if the count itself can't be read, we can't prove we're
-// clear of the cap, so treat outbid as suppressed rather than risk being the
-// send that trips Resend into rejecting a won/failed/shipped email today.
+// clear of the quota, so treat outbid as suppressed rather than risk being the
+// send that trips Resend into rejecting a won/failed/shipped email this period.
 async function shouldSuppressOutbid() {
   const { count, error } = await supabase
     .from('email_send_log')
     .select('id', { count: 'exact', head: true })
-    .gte('sent_at', startOfTodayUTC());
+    .gte('sent_at', emailWindowStart());
   if (error) {
     console.error('shouldSuppressOutbid: count query failed, suppressing outbid to be safe:', error.message);
     return true;
@@ -92,14 +107,14 @@ async function shouldSuppressOutbid() {
 // Shared send path for every outgoing email (admin alerts and buyer-facing
 // mail alike) - never throws and never hangs past the 8s timeout, so a
 // Resend outage can't block a charge, an auto-close tick, or a bid response.
-// kind categorizes the send for the daily volume count and the outbid
+// kind categorizes the send for the rolling-window volume count and the outbid
 // suppression check above; pass 'outbid' only for the outbid email itself.
 async function sendEmail({ from, to, subject, html, text, kind = 'other' }) {
   if (!process.env.RESEND_API_KEY) return; // skip if not configured
   if (!to) return;
 
   if (kind === 'outbid' && await shouldSuppressOutbid()) {
-    console.error(`OUTBID EMAIL SUPPRESSED (near ${DAILY_EMAIL_CAP}/day Resend cap): to=${to} subject="${subject}"`);
+    console.error(`OUTBID EMAIL SUPPRESSED (at ${OUTBID_SUPPRESS_AT} of the ${MONTHLY_EMAIL_CAP} Resend quota, rolling ${EMAIL_WINDOW_DAYS} days): to=${to} subject="${subject}"`);
     return;
   }
 
