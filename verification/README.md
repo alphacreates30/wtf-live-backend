@@ -1,9 +1,25 @@
 # Verification suites
 
-Behavioural proofs for the nine checks of 2026-09-19/20. Each one
+Behavioural proofs for the eleven checks of 2026-09-19/20. Each one
 **reproduces the bug on an older commit, then shows the fix refuses it**, and
 also checks the legitimate path still works. Run them after touching any of the
 routes below.
+
+> ## ⚠ DEPLOY HAZARD: no Railway deploys during an auction close window
+>
+> **Until migration `2026-09-21g-orders-item-id-unique.sql` is applied on production, do not deploy the backend
+> while any standard auction is closing** (its lots' `ends_at` passing, up to when it flips to `ended`).
+>
+> A deploy briefly runs the old and new instance side by side, and both run the auto-close job. Two instances
+> can both pass `createOrderOnWin`'s "does this lot have an order?" check and both insert one. Measured on
+> 2026-09-21 (`scale-200-close.js`, two instances, 200 lots): **267 orders for 150 sold lots, 117 lots duplicated,
+> buyers' invoices inflated** (one $607.20 against $381.80 owed). The invoice sums orders, so a duplicate order is
+> a duplicate charge *amount*, and the charge itself still succeeds exactly once, at the wrong figure.
+>
+> The in-process overlap guard added alongside (`autoCloseRunningSince`) does NOT help here: it is per process.
+> Only the unique index makes duplicates impossible across instances. **Once `orders_item_id_key` exists this
+> hazard is closed and this box should be deleted.** Check with:
+> `select indexname from pg_indexes where indexname = 'orders_item_id_key';`
 
 > ## ⚠ These run against the REAL database
 >
@@ -24,7 +40,7 @@ routes below.
 > for leftover `ZZTEST_` rows (`select * from auctions where title like 'ZZTEST_%'`).
 
 They start local copies of the server on ports 3231-3234, 3241-3242, 3251-3252,
-3261-3262, 3271-3272, 3281-3285 and 3291-3293 with the background jobs (`setInterval`) stubbed out, so nothing
+3261-3262, 3271-3272, 3281-3285, 3291-3293, 3301-3312 and 3321-3322 with the background jobs (`setInterval`) stubbed out, so nothing
 auto-closes or charges. They write temporary `server.tmp-*.js` / `run.tmp-*.js`
 files next to `server.js` and delete them on exit (both are git-ignored).
 
@@ -34,7 +50,7 @@ are minted in-process with `JWT_SECRET` and expire in minutes. `id-normalisation
 also needs `../wtf-live-frontend` checked out next to this repo (for
 `socket.io-client`).
 
-## The nine suites
+## The eleven suites
 
 Each suite's "before" server is pinned to a commit, not to `HEAD`, so its
 reproduction assertions stay valid however far `main` moves on. A suite that is
@@ -50,7 +66,9 @@ always red teaches people to ignore red.
 | `paid-stays-paid.js` | #37: `chargeInvoice` ran the won-and-charged email inside the same `try` as the charge, after marking the invoice paid, so anything throwing there made the `catch` flip a PAID invoice (and its orders) to `failed` and email the buyer "payment failed". Reproduced on the pinned commit for both the fresh-charge and the already-charged (re-click) paths. Fixed in two layers: the notify call is wrapped, and the failure handler only writes `failed` where `payment_intent_id is null`; each layer is tested alone. Genuine declines still record `failed`, retries still reach the charge. **Stripe is faked in-process and the email step is forced to throw** (in real code it swallows its own errors, so this is a structural hazard, not a live failure); nothing is charged or sent. Borrows the `zztest_paid_ok` profile read-only. | **`1ffce81`** | _this slice (#37)_ |
 | `delete-atomic.js` | `DELETE /auction/:id` deleted lots, bids and chat one statement at a time, then the auction, ignoring the last error. An order created in the gap (an auction closing creates them) made the DB refuse the auction AFTER the children were gone, and the route still answered 200. The race is simulated by source-patching an order insert into the gap. Asserts the **child rows survive** (lots, bids, chat, pre-bids, images, outbid log, terms), not just the status; also an invoice-only auction, a clean delete removing every dependent, and idempotent re-delete. **Requires `migrations/2026-09-20e-delete-auction-cascade.sql`** (the route calls that function; the suite refuses to run without it). Only `bids`, `chat_messages` and `auction_terms_acceptances` cascade from `auctions` - lots and pre-bids do not, hence the explicit transactional function. | **`80fdcd9`** | _this slice_ |
 | `email-volume-guard.js` | Resend Pro (50,000 per billing period, no daily cap): the outbid-suppression guard counted from the start of the UTC DAY and suppressed at 90, so on Pro it dropped outbid emails with ~49,900 of headroom. Now a rolling 30 days, suppress at 45,000; won/failed/shipped/admin always go through; fails closed. The window is deliberately approximate and conservative (Resend renews on the billing day - the 20th today - not the 1st; a rolling window over-counts just after a reset, so it errs early, never late except ~1 day on a 31-day cycle). The REAL functions are extracted from `server.js` into a vm with Resend's HTTP call stubbed - nothing is sent; one check uses throwaway `email_send_log` rows (`zztest_vol`) against the real table. | **`d60b9e7`** | _this slice_ |
-| `scale-200-close.js` (**slow, ~10 min, not part of the quick run**) | The whole close path at 200 lots / 20 buyers (`autoCloseStandardItems` -> `createOrderOnWin` -> `buildAndChargeInvoicesForAuction` -> `chargeInvoice`), real code and real database, Stripe an in-process fake (latency, 2 declines, 1 error). Scenarios: `single` and `double` (two servers running the job at once). Asserts one order per sold lot, invoice totals vs an independently computed figure, exactly one charge attempt per invoice, that failures mid-loop don't stall later buyers; measures tick duration and Supabase requests per lot. **Currently FAILS by design of the findings:** see the 2026-09-21 findings in the handoff (duplicate orders under overlapping ticks; a failed invoice auto-retried by an overlapping tick). The fixture stays `draft` so the production job skips it, and the local job is patched to touch only it. | n/a (current code) | _findings, not yet fixed_ |
+| `scale-200-close.js` (**slow, ~15 min, not part of the quick run**) | The whole close path at 200 lots / 20 buyers (`autoCloseStandardItems` -> `createOrderOnWin` -> `buildAndChargeInvoicesForAuction` -> `chargeInvoice`), real code and real database, Stripe an in-process fake (800ms latency, 2 declines, 1 error). Scenarios: `single` and `double` (two servers running the job at once). Asserts one order per sold lot; invoice totals vs an independently computed figure; **AMOUNT: every invoice total and every amount sent to Stripe equals what each buyer owes, recomputed from the lots the database says sold** (every earlier check proved charge *count*; a 60% overcharge passed all of them); exactly one charge attempt per invoice; failures mid-loop don't stall later buyers. Measures tick duration and requests per lot. The fixture stays `draft` so the production job skips it, and the local job is patched to touch only it. The `double` scenario needs migration g to pass. | n/a (current code) | _this slice_ |
+| `charge-auto-vs-manual.js` | The auto-close job re-attempted FAILED invoices when a tick re-entered an auction it had already charged (23 charge attempts for 20 invoices in the 200-lot run): an automatic retry of a declined card. `chargeInvoice(id, { auto: true })` (used only by `buildAndChargeInvoicesForAuction`) now claims only `unpaid` (plus stale-`charging` crash recovery); a human's `/charge-winner` still claims `failed`. Proves both directions, plus that the job still charges unpaid invoices and leaves a fresh `charging` one alone. Stripe is faked in-process. | **`670cdb5`** | _this slice_ |
+| `orders-item-unique.js` | One order per lot, enforced by the database (`migrations/2026-09-21g`). Provokes the race deterministically (two concurrent `createOrderOnWin` calls for one lot): BEFORE the migration it shows 8 of 8 races duplicate an order on both old and new code, then exits 2; AFTER, asserts the index refuses a raw duplicate, live orders with no `item_id` are unconstrained, and each race yields exactly one order with both callers getting the same id. | **`670cdb5`** | _this slice_ |
 
 ## Not covered
 

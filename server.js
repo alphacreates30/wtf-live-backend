@@ -1822,6 +1822,14 @@ async function createOrderOnWin(auctionId, winnerUsername, finalBid, itemId) {
     }).select('id').single();
 
     if (insertErr) {
+      // 23505 = orders_item_id_key (migration 2026-09-21g): another caller - an
+      // overlapping tick, a second instance during a deploy - created this lot's
+      // order between our existence check above and this insert. That is the
+      // idempotent outcome, not a failure: return the order that won the race.
+      if (itemId && insertErr.code === '23505') {
+        const { data: raced } = await supabase.from('orders').select('id').eq('item_id', itemId).limit(1);
+        if (raced && raced.length) return raced[0].id;
+      }
       console.error('Order creation error:', insertErr.message);
       return null;
     }
@@ -1961,7 +1969,7 @@ async function notifyWonAfterCharge(invoiceId, paymentIntentId) {
 // idempotency key, mirrors the result onto every child order via
 // orders.invoice_id, never throws) rather than modifying chargeOrder itself,
 // which stays exactly as-is for live auctions.
-async function chargeInvoice(invoiceId) {
+async function chargeInvoice(invoiceId, { auto = false } = {}) {
   try {
     const { data: invoice } = await supabase.from('invoices').select('*').eq('id', invoiceId).single();
     if (!invoice) return { success: false, error: 'Invoice not found' };
@@ -1971,15 +1979,24 @@ async function chargeInvoice(invoiceId) {
     }
 
     const staleCutoff = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    // A FAILED invoice is claimable only by a human (manual Charge/Retry via
+    // /charge-winner). The auto-close job passes { auto: true }, which narrows the
+    // claim to 'unpaid' (plus the stale-'charging' crash recovery): a tick that
+    // re-enters an auction it has already charged - an overlapping tick, a second
+    // instance - must never re-attempt a declined card on its own.
+    const claimable = auto ? 'payment_status.eq.unpaid' : 'payment_status.in.(unpaid,failed)';
     const { data: claimed, error: claimErr } = await supabase
       .from('invoices')
       .update({ payment_status: 'charging', charging_since: new Date().toISOString() })
       .eq('id', invoiceId)
       .is('payment_intent_id', null)
-      .or(`payment_status.in.(unpaid,failed),and(payment_status.eq.charging,charging_since.lt.${staleCutoff})`)
+      .or(`${claimable},and(payment_status.eq.charging,charging_since.lt.${staleCutoff})`)
       .select()
       .single();
     if (claimErr || !claimed) {
+      if (auto && invoice.payment_status === 'failed') {
+        return { success: false, error: 'Failed earlier - left for manual retry', skipped: true };
+      }
       return { success: false, error: 'Already being charged or already resolved', skipped: true };
     }
     // Mirror the claim onto every child order so orders.payment_status keeps
@@ -2118,7 +2135,7 @@ async function buildAndChargeInvoicesForAuction(auctionId) {
       }
 
       try {
-        await chargeInvoice(invoiceId);
+        await chargeInvoice(invoiceId, { auto: true });
       } catch (chargeErr) {
         console.error('buildAndChargeInvoicesForAuction: chargeInvoice failed:', invoiceId, chargeErr.message);
       }
@@ -2978,7 +2995,19 @@ server.keepAliveTimeout = 61000; // keep connections open longer than Railway's 
 server.headersTimeout = 65000;
 
 // Auto-close standard auction items when their ends_at passes
+// Overlap guard. The job runs on setInterval(30s) and a tick can outlast its
+// interval (200 lots closing means ~150 order creations and, at the end, one
+// sequential Stripe call per buyer), so without this a second tick starts on
+// top of the first. In-process only: it does not stop a second INSTANCE (a
+// deploy overlap) - orders(item_id) being unique does that, at the database.
+// A tick that has held the flag for over 10 minutes is presumed hung and is
+// stepped over rather than blocking the job forever (same idea as the 5-minute
+// charging_since reclaim).
+let autoCloseRunningSince = 0
+const AUTO_CLOSE_STALE_MS = 10 * 60 * 1000
 async function autoCloseStandardItems() {
+  if (autoCloseRunningSince && Date.now() - autoCloseRunningSince < AUTO_CLOSE_STALE_MS) return
+  autoCloseRunningSince = Date.now()
   try {
     const now = new Date().toISOString()
 
@@ -3086,6 +3115,8 @@ async function autoCloseStandardItems() {
     }
   } catch (e) {
     console.error('autoCloseStandardItems error:', e)
+  } finally {
+    autoCloseRunningSince = 0
   }
 }
 setInterval(autoCloseStandardItems, 30000)

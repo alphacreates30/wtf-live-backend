@@ -13,8 +13,8 @@
 // Every other line of the close path is unmodified. Numbers are from this machine to Supabase: a slower link than
 // Railway's, so read them as an upper bound on the database side.
 //
-// Scenarios: 'single' = one server; 'double' = two servers running the job at once (overlapping ticks - the job has
-// no overlap guard, and a tick that outlasts its 30s interval, or a redeploy overlap, does the same thing).
+// Scenarios: 'single' = one server; 'double' = two servers running the job at once (overlapping ticks - the job has only an in-process
+// cross-instance guard: the in-process flag stops one server overlapping itself, but a redeploy overlap runs two.)
 const fs = require('fs');
 const os = require('os');
 const { spawn } = require('child_process');
@@ -163,6 +163,19 @@ async function scenario(name, instances) {
     const byInv = {}; calls.forEach(c => { byInv[c.invoice] = (byInv[c.invoice] || 0) + 1; });
     const multi = Object.entries(byInv).filter(([, n]) => n > 1);
     ok(calls.length === invoices.length && multi.length === 0, `EXACTLY ONE charge attempt per invoice (fake Stripe saw ${calls.length} create() calls for ${invoices.length} invoices; ${multi.length} invoices charged more than once)${multi.length ? '  <- DOUBLE CHARGE' : ''}`);
+    // AMOUNT charged, recomputed INDEPENDENTLY of the orders table and of the fixture plan: straight from the lots the
+    // database says SOLD (winner + hammer, premium at 15%). Every check above proved charge COUNT; a 60% overcharge from
+    // duplicate orders passed all of them. This is the assertion that catches it: what each buyer OWES vs the invoice
+    // total AND vs every amount actually sent to Stripe for that invoice (the fake logs create() amounts).
+    const owed = {};
+    items.filter(i => i.status === 'sold').forEach(i => { const h = Math.round(Number(i.current_bid) * 100), pr = Math.round(h * 15 / 100); owed[i.leading_bidder] = (owed[i.leading_bidder] || 0) + h + pr; });
+    const amountBad = [];
+    for (const inv of invoices) {
+      const want = owed[inv.buyer_username], sent = calls.filter(c => c.invoice === inv.id).map(c => c.amount);
+      if (inv.total_cents !== want || sent.some(a => a !== want)) amountBad.push(`${inv.buyer_username.slice(-3)}: owes $${(want / 100).toFixed(2)}, invoice $${(inv.total_cents / 100).toFixed(2)}, sent to Stripe ${sent.map(a => '$' + (a / 100).toFixed(2)).join('/') || 'nothing'}`);
+    }
+    const owedTotal = Object.values(owed).reduce((a, b) => a + b, 0), invTotal = invoices.reduce((a, i) => a + i.total_cents, 0);
+    ok(amountBad.length === 0 && invTotal === owedTotal && Object.keys(owed).length === invoices.length, `AMOUNT: every invoice total AND every amount sent to Stripe equals what that buyer owes for the lots that actually sold; all invoices together $${(invTotal / 100).toFixed(2)} vs owed $${(owedTotal / 100).toFixed(2)} (${owedTotal ? ((invTotal / owedTotal - 1) * 100).toFixed(1) : 0}% off)${amountBad.length ? '  <- WRONG AMOUNT: ' + amountBad.slice(0, 3).join('; ') : ''}`);
     const good = invoices.filter(i => !DECLINERS.includes(+i.buyer_username.slice(-2)) && +i.buyer_username.slice(-2) !== THROWER);
     ok(good.every(i => i.payment_status === 'paid' && i.payment_intent_id) && orders.filter(o => good.some(g => g.id === o.invoice_id)).every(o => o.payment_status === 'paid'), `all ${good.length} healthy buyers paid, incl. those AFTER the failures in the loop; their orders mirrored`);
     const failedInv = invoices.filter(i => i.payment_status === 'failed');
@@ -177,7 +190,7 @@ async function scenario(name, instances) {
     const totalReqs = ticks.reduce((a, t) => a + t.reqs, 0);
     console.log(`\nMEASURED (${name}):`);
     console.log(`  ticks with real work: ${work.length}; idle-tick cost: ${Math.round(ticks.filter(t => t.reqs <= 40).reduce((a, t) => a + t.reqs, 0) / Math.max(1, ticks.filter(t => t.reqs <= 40).length))} requests`);
-    console.log(`  longest tick: ${longest ? (longest.dur / 1000).toFixed(1) + 's, ' + longest.reqs + ' Supabase requests (instance ' + longest.inst + ')' : 'n/a'}${longest && longest.dur > 30000 ? '   <-- LONGER THAN THE 30s INTERVAL: the next tick started on top of it' : ''}`);
+    console.log(`  longest tick: ${longest ? (longest.dur / 1000).toFixed(1) + 's, ' + longest.reqs + ' Supabase requests (instance ' + longest.inst + ')' : 'n/a'}${longest && longest.dur > 30000 ? '   <-- LONGER THAN THE 30s INTERVAL: the next tick fired while this one ran (the overlap guard makes it return at once)' : ''}`);
     console.log(`  total Supabase requests: ${totalReqs} for ${soldItems} sold + ${LOTS - soldItems} unsold lots  =>  ${(totalReqs / LOTS).toFixed(1)} per lot`);
     const closeTicks = work.filter(t => t.dur > 0).sort((a, b) => b.dur - a.dur).slice(0, 3).map(t => `${(t.dur / 1000).toFixed(1)}s/${t.reqs}req`).join(', ');
     console.log(`  three heaviest ticks: ${closeTicks}`);
