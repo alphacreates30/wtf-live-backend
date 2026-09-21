@@ -96,6 +96,14 @@ const del = (port, id) => fetch('http://localhost:' + port + '/auction/' + id, {
     await s.from('invoices').delete().eq('id', inv.id);
     A = await mk('new_clean'); r = await del(3293, A.id); sn = await snapshot(A);
     ok(r.s === 200 && r.j.success && same(sn, GONE), `NEW: a deletable auction goes in ONE statement, every dependent removed with it: ${r.s}, ${JSON.stringify(sn)}`);
+    // rows poisoned with an UPPERCASE auction id (text columns; the id-normalisation bug used to store them) must not be orphaned
+    A = await mk('new_upper');
+    await s.from('auction_items').update({ auction_id: A.id.toUpperCase() }).eq('auction_id', A.id);
+    await s.from('pre_bids').update({ auction_id: A.id.toUpperCase() }).eq('auction_id', A.id);
+    const upperLots = (await s.from('auction_items').select('id').eq('auction_id', A.id.toUpperCase())).data.length;
+    r = await del(3293, A.id); sn = await snapshot(A);
+    const upperLeft = (await s.from('auction_items').select('id').eq('auction_id', A.id.toUpperCase())).data.length + (await s.from('pre_bids').select('item_id').eq('auction_id', A.id.toUpperCase())).data.length;
+    ok(upperLots === 2 && r.s === 200 && upperLeft === 0 && sn.auction === 0 && sn.images === 0 && sn.outbid === 0, `NEW: lots and pre-bids stored with an UPPERCASE auction id are removed too, not orphaned (${upperLots} such lots before, ${upperLeft} rows left): ${r.s}`);
     r = await del(3293, A.id);
     ok(r.s === 200, `NEW: deleting an already-deleted auction is still a harmless ${r.s} (unchanged behaviour)`);
   } finally {
