@@ -1,6 +1,6 @@
 # Verification suites
 
-Behavioural proofs for the six fixes of 2026-09-19/20. Each one
+Behavioural proofs for the seven fixes of 2026-09-19/20. Each one
 **reproduces the bug on an older commit, then shows the fix refuses it**, and
 also checks the legitimate path still works. Run them after touching any of the
 routes below.
@@ -24,7 +24,7 @@ routes below.
 > for leftover `ZZTEST_` rows (`select * from auctions where title like 'ZZTEST_%'`).
 
 They start local copies of the server on ports 3231-3234, 3241-3242, 3251-3252,
-3261-3262, 3271-3272 and 3281-3285 with the background jobs (`setInterval`) stubbed out, so nothing
+3261-3262, 3271-3272, 3281-3285 and 3291-3293 with the background jobs (`setInterval`) stubbed out, so nothing
 auto-closes or charges. They write temporary `server.tmp-*.js` / `run.tmp-*.js`
 files next to `server.js` and delete them on exit (both are git-ignored).
 
@@ -34,7 +34,7 @@ are minted in-process with `JWT_SECRET` and expire in minutes. `id-normalisation
 also needs `../wtf-live-frontend` checked out next to this repo (for
 `socket.io-client`).
 
-## The six suites
+## The seven suites
 
 Each suite's "before" server is pinned to a commit, not to `HEAD`, so its
 reproduction assertions stay valid however far `main` moves on. A suite that is
@@ -48,6 +48,7 @@ always red teaches people to ignore red.
 | `images-ownership.js` | `POST /auction/:auctionId/items/:itemId/images` checked that the caller hosts `:auctionId` but not that the lot is in it, so any host could attach an image to a lot in someone else's auction. Now 404, nothing written; own lots (and uppercase ids) still work. Uses two throwaway hosts. | **`a27f899`** | `1b5f994` |
 | `charge-scope.js` | `/charge-winner` authorised against the body's `auction_id` but acted on `invoice_id` / `order_id`, so the host of auction A could charge an invoice or order in auction B (on the pinned commit: 402 and B's invoice flipped to `failed`). Now authorised against the target's own auction; a disagreeing body `auction_id`, or an `order_id` not on the given `invoice_id`, is 404, B untouched. Own invoice/order (incl. what the UI sends, uppercase ids) still reach the charge path. No Stripe key or email is used: the fixture buyer has no card. | **`a1b2dd5`** | _this slice (#39)_ |
 | `paid-stays-paid.js` | #37: `chargeInvoice` ran the won-and-charged email inside the same `try` as the charge, after marking the invoice paid, so anything throwing there made the `catch` flip a PAID invoice (and its orders) to `failed` and email the buyer "payment failed". Reproduced on the pinned commit for both the fresh-charge and the already-charged (re-click) paths. Fixed in two layers: the notify call is wrapped, and the failure handler only writes `failed` where `payment_intent_id is null`; each layer is tested alone. Genuine declines still record `failed`, retries still reach the charge. **Stripe is faked in-process and the email step is forced to throw** (in real code it swallows its own errors, so this is a structural hazard, not a live failure); nothing is charged or sent. Borrows the `zztest_paid_ok` profile read-only. | **`1ffce81`** | _this slice (#37)_ |
+| `delete-atomic.js` | `DELETE /auction/:id` deleted lots, bids and chat one statement at a time, then the auction, ignoring the last error. An order created in the gap (an auction closing creates them) made the DB refuse the auction AFTER the children were gone, and the route still answered 200. The race is simulated by source-patching an order insert into the gap. Asserts the **child rows survive** (lots, bids, chat, pre-bids, images, outbid log, terms), not just the status; also an invoice-only auction, a clean delete removing every dependent, and idempotent re-delete. **Requires `migrations/2026-09-20e-delete-auction-cascade.sql`** (the route calls that function; the suite refuses to run without it). Only `bids`, `chat_messages` and `auction_terms_acceptances` cascade from `auctions` - lots and pre-bids do not, hence the explicit transactional function. | **`80fdcd9`** | _this slice_ |
 
 ## Not covered
 
@@ -63,7 +64,4 @@ always red teaches people to ignore red.
   `id-normalisation`'s uppercase `/admin/orders` filter). The pre-bid and
   add-item poisoning reproductions still hold: `auction_items.auction_id` and
   pre-bid rows are still text columns.
-- Known route weakness, not fixed: `DELETE /auction/:id` deletes a lot, bid and
-  chat rows first and ignores the error from the final `auctions` delete. If the
-  order check were bypassed or raced, the DB refuses the delete but the route
-  answers 200 having already removed the lots (`delete-guard.js` prints this).
+- The `DELETE /auction/:id` atomicity gap is fixed (`delete-atomic.js`).

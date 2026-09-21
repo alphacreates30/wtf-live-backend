@@ -1368,10 +1368,26 @@ app.delete('/auction/:id', requireAdmin, async (req, res) => {
       detail: `${existing.length} order${existing.length === 1 ? '' : 's'} came from it` + (notSettled ? `, ${notSettled} not fully paid` : '') + '. Orders are the record of what buyers owe and were sold.',
     });
   }
-  await supabase.from('auction_items').delete().eq('auction_id', auctionId);
-  await supabase.from('bids').delete().eq('auction_id', auctionId);
-  await supabase.from('chat_messages').delete().eq('auction_id', auctionId);
-  await supabase.from('auctions').delete().eq('id', auctionId);
+  // The whole cascade is ONE function call = ONE transaction (migration
+  // 2026-09-20e): lots, bids, chat, pre-bids, images, terms acceptances, then the
+  // auction. If an order or invoice exists at that instant the final delete is
+  // refused (RESTRICT) and everything before it rolls back - nothing is removed.
+  // The order check above is only for a readable message; it is not what protects
+  // the data. (This used to delete the children one statement at a time, then the
+  // parent, ignoring the parent's error: an order created in the gap - an auction
+  // closing creates them - refused the parent AFTER the lots, bids and chat were
+  // gone, and the route still answered 200.)
+  const { error: delErr } = await supabase.rpc('delete_auction_cascade', { p_auction_id: auctionId });
+  if (delErr) {
+    if (delErr.code === '23503') {
+      return res.status(409).json({
+        error: 'This auction has orders and cannot be deleted',
+        detail: 'An order or invoice was created for it while it was being deleted. Nothing was removed.',
+      });
+    }
+    console.error('DELETE /auction/:id failed:', auctionId, delErr.code, delErr.message);
+    return res.status(500).json({ error: 'Could not delete this auction. Nothing was removed.' });
+  }
   res.json({ success: true });
 });
 app.get('/auction/:id/bids', async (req, res) => {
