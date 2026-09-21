@@ -53,5 +53,6 @@ always red teaches people to ignore red.
   `order_id` / `invoice_id` (latent while there is a single host). Its id
   *format* is validated by `id-normalisation.js`; the scope problem is not.
 - The DB-level guards in `migrations/2026-09-19a…d` (foreign keys, the
-  `orders.auction_id` text → uuid conversion). Re-run all four suites after
-  applying them.
+  `orders.auction_id` text → uuid conversion). **Applied to production on
+  2026-09-20; do not run them again.** The four suites have not yet been re-run
+  against the migrated schema.
