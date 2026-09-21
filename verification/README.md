@@ -50,13 +50,19 @@ always red teaches people to ignore red.
 
 ## Not covered
 
-- The DB-level guards in `migrations/2026-09-19a…d` (foreign keys, the
-  `orders.auction_id` text → uuid conversion). **Applied to production on
-  2026-09-20; do not run them again.** Re-run after them: `terms-gate`,
-  `images-ownership`, `charge-scope` all pass. In `delete-guard` and
-  `id-normalisation` every *fixed-code* assertion passes, but their "reproduce
-  the old bug" assertions now FAIL by design - the database itself refuses
-  what the code bug used to allow (FK RESTRICT; uuid column). `delete-guard`
-  also aborts before its real-auction check as a result. Those reproductions
-  need re-pinning to a pre-migration schema or converting to "DB refuses"
-  assertions.
+- The DB-level guards are now covered: `delete-guard.js` asserts that a raw
+  delete of an auction with orders / invoices is refused by Postgres (23503,
+  `orders_auction_id_fkey` / `invoices_auction_id_fkey`), that an order for a
+  non-existent auction cannot be inserted, and that the pre-migration server can
+  no longer orphan an order (even with an UPPERCASE id). The migrations
+  themselves (`migrations/2026-09-19a…d`) were applied to production on
+  2026-09-20 and must not be run again.
+- Some "reproduce the old bug" assertions became "the database refuses it" once
+  the schema changed (`delete-guard`'s control and uppercase bypass;
+  `id-normalisation`'s uppercase `/admin/orders` filter). The pre-bid and
+  add-item poisoning reproductions still hold: `auction_items.auction_id` and
+  pre-bid rows are still text columns.
+- Known route weakness, not fixed: `DELETE /auction/:id` deletes a lot, bid and
+  chat rows first and ignores the error from the final `auctions` delete. If the
+  order check were bypassed or raced, the DB refuses the delete but the route
+  answers 200 having already removed the lots (`delete-guard.js` prints this).

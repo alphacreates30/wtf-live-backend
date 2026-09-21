@@ -87,7 +87,8 @@ const socketTry = (port, event, payload, waitFor) => new Promise(resolve => {
     console.log('\n== B. ADMIN ORDERS query id ==');
     const oLow = await call(OLD, 'GET', `/admin/orders?auction_id=${X}`, adminTok), oUp = await call(OLD, 'GET', `/admin/orders?auction_id=${X.toUpperCase()}`, adminTok);
     const nLow = await call(NEW, 'GET', `/admin/orders?auction_id=${X}`, adminTok), nUp = await call(NEW, 'GET', `/admin/orders?auction_id=${X.toUpperCase()}`, adminTok), nBad = await call(NEW, 'GET', `/admin/orders?auction_id=zzz`, adminTok);
-    ok(oUp.j.total === 0 && oLow.j.total > 0, `OLD: UPPER auction_id filter silently returned ${oUp.j.total} orders vs ${oLow.j.total} for lowercase  <- fails-closed bug reproduced`);
+    // Was: OLD returned 0 for the UPPER filter (orders.auction_id was TEXT, compared case-sensitively). The column is uuid now (migration c), so even the pre-normalisation server matches case-insensitively - the bug can no longer occur at the DB level.
+    ok(oLow.j.total > 0 && oUp.j.total === oLow.j.total, `DB (migration c, orders.auction_id is uuid): even the pre-normalisation server now returns ${oUp.j.total} orders for an UPPER auction_id filter vs ${oLow.j.total} for lowercase (was silently 0 when the column was text)`);
     ok(nUp.j.total === nLow.j.total && nLow.j.total === oLow.j.total && nBad.s === 400, `NEW: UPPER returns ${nUp.j.total} = lowercase ${nLow.j.total}; garbage -> ${nBad.s}`);
 
     console.log('\n== C. WRITE POISONING (the stored value) ==');
