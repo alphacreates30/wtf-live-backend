@@ -69,8 +69,12 @@ const del = (port, id) => fetch('http://localhost:' + port + '/auction/' + id, {
   const servers = [];
   try {
     // preflight: the fixed route calls a database function (migrations/2026-09-20e); refuse to run without it
-    const pre = await s.rpc('delete_auction_cascade', { p_auction_id: crypto.randomUUID() });
-    if (pre.error) { console.error('\nmigrations/2026-09-20e-delete-auction-cascade.sql has not been applied (' + pre.error.code + ' ' + pre.error.message + ').\n'); process.exit(2); }
+    // (a random id returns early, so also exercise it on a real row: e's first version passed this preflight and then failed on text = uuid)
+    const probe = die(await s.from('auctions').insert({ title: 'ZZTEST_delatomic_preflight', description: 'x', status: 'ended', mode: 'standard', fulfillment_mode: 'shipping', host_username: 'whatthefind', ends_at: new Date().toISOString() }).select().single());
+    made.auctions.push(probe.id);
+    die(await s.from('auction_items').insert({ auction_id: probe.id, title: 'ZZTEST_delatomic preflight lot', starting_bid: 0, position: 0, status: 'pending', ends_at: soon() }).select().single());
+    const pre = await s.rpc('delete_auction_cascade', { p_auction_id: probe.id });
+    if (pre.error) { console.error('\nmigrations/2026-09-20e + 20f (delete-auction-cascade) not applied, or broken (' + pre.error.code + ' ' + pre.error.message + ').\n'); process.exit(2); }
     const oldSrc = execSync('git show ' + OLD_COMMIT + ':server.js', { cwd: BE, maxBuffer: 50e6 }).toString();
     const newSrc = fs.readFileSync(BE + '/server.js', 'utf8');
     servers.push(await boot('oldrace', 3291, withRace(oldSrc, OLD_MARK)), await boot('newrace', 3292, withRace(newSrc, NEW_MARK)), await boot('newclean', 3293, newSrc));
