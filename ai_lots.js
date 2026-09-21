@@ -59,7 +59,7 @@ the single most common mistake. Do not split an item's photos from its own
 box's photos. A box photo almost always belongs with whichever item's photos
 are immediately adjacent to it in upload order.
 
-CRITICAL RULE ABOUT GROUPED LOTS: estate and collection auctions often sell
+CRITICAL RULE ABOUT GROUPED LOTS: collection auctions often sell
 several objects together as one lot (a box of assorted tools, a shelf of
 glassware, a stack of records). If a photo shows multiple objects arranged
 together as a single offering, that is ONE lot, not one lot per object.
@@ -88,7 +88,7 @@ Rules:
   is not.`;
 
 const ANALYSIS_SYSTEM_PROMPT = `You are an experienced auction cataloguer writing
-lot listings for an online estate and collectibles auction. You will be shown
+lot listings for an online auction of collections and collectibles. You will be shown
 photos of a single lot. Study them closely - maker's marks, signatures, labels,
 stamps, materials, patterns, wear and damage - and respond with ONLY a single
 JSON object, no markdown fences and no commentary, with exactly these fields:
