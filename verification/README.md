@@ -30,6 +30,28 @@ routes below.
 > Both fixes are per-instance (in the actual code, not just a migration), so an ordinary Railway deploy -
 > old and new instance briefly side by side - is no longer a hazard either way.
 
+> ## ⚠ Deploy verification is weaker than it should be (#49, open)
+>
+> There is no `GET /version` or `/health` endpoint on this backend. After a push, the only check
+> available is "the root route (`/`) responds 200" - that proves the service is up, not that the pushed
+> commit is the one serving traffic. Found while confirming the #48 push had actually landed: no way to
+> fingerprint the live deploy short of exercising a code path that changed (money-adjacent for the
+> auto-close job, so not done casually) or checking the Railway dashboard directly. Fix: a `GET /version`
+> route returning the deployed commit SHA (Railway sets `RAILWAY_GIT_COMMIT_SHA` in the environment - read
+> it directly, no build step needed).
+>
+> **`.gitattributes` is still outstanding, both repos.** This machine has `core.autocrlf=true`
+> (global git config). Any `git checkout` (a fresh clone, or even `git checkout -- .` to discard noise)
+> silently flips the working tree from the LF the repo stores to CRLF - confirmed directly with `file` and
+> a byte-level read; Git Bash's own `grep`/`cat` mask this by auto-stripping `\r` on read, so it isn't
+> visible from the tools you'd normally check with. `git diff`/`git status` also don't show it (autocrlf
+> normalizes for comparison), so it's invisible at the git level too - the first real symptom is a
+> multi-line `\n`-embedded string marker silently failing to match against `fs.readFileSync()`'d source,
+> which is exactly what broke `undercharge-race.js`'s first run this session (worked around by normalizing
+> `server.js` back to LF by hand; the fix doesn't stick - the next checkout re-flips it). A `.gitattributes`
+> with `* text=auto eol=lf` (or similar) in each repo's root would make the working tree LF regardless of
+> the local `core.autocrlf` setting, closing this for good instead of re-fixing it by hand each time it bites.
+
 > ## ⚠ These run against the REAL database
 >
 > They use the Supabase project in your `.env`, not a test copy. Each creates
