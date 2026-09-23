@@ -3005,6 +3005,57 @@ server.headersTimeout = 65000;
 // charging_since reclaim).
 let autoCloseRunningSince = 0
 const AUTO_CLOSE_STALE_MS = 10 * 60 * 1000
+// Ends one standard auction once every one of its lots is closed (sold or
+// unsold), building and charging that auction's invoices first. Split out
+// of autoCloseStandardItems's sweep so one auction can be driven at a time
+// (by a test, or in principle by a future retry path) without touching
+// every live auction in the database.
+//
+// Every SOLD lot must have its order inserted before invoices are built - a
+// lot can be flipped to 'sold' here (making "no open items" true for a
+// concurrent tick or a second instance) a moment before createOrderOnWin
+// for it actually finishes over there. Building now would sum only the
+// orders that exist yet, permanently undercharging that buyer: once this
+// auction is 'ended', this function never runs for it again, so a
+// late-arriving order is left with no invoice at all. Deferring costs
+// nothing - "no open items" stays true next tick, so this function is
+// simply called again.
+async function maybeEndStandardAuction(auctionId) {
+  const { data: openItems } = await supabase
+    .from('auction_items')
+    .select('id')
+    .eq('auction_id', auctionId)
+    .not('status', 'in', '("sold","unsold")')
+  if (openItems?.length) return { ended: false }
+
+  const { data: allItems } = await supabase
+    .from('auction_items').select('id').eq('auction_id', auctionId)
+  if (!allItems?.length) return { ended: false }
+
+  const { data: soldItems } = await supabase
+    .from('auction_items').select('id').eq('auction_id', auctionId).eq('status', 'sold')
+  if (soldItems?.length) {
+    const { data: coveredOrders } = await supabase
+      .from('orders').select('item_id').eq('auction_id', auctionId).in('item_id', soldItems.map(i => i.id))
+    const covered = new Set((coveredOrders || []).map(o => o.item_id))
+    if (soldItems.some(i => !covered.has(i.id))) {
+      console.log('Auto-close: deferring invoice build for auction', auctionId, '- a sold lot has no order yet')
+      return { ended: false, deferred: true }
+    }
+  }
+
+  try {
+    await buildAndChargeInvoicesForAuction(auctionId)
+  } catch (invErr) {
+    console.error('buildAndChargeInvoicesForAuction failed for auction', auctionId, invErr.message)
+  }
+  // Unconditional: reached regardless of whether any invoice above charged
+  // successfully, declined, or errored.
+  await supabase.from('auctions').update({ status: 'ended' }).eq('id', auctionId)
+  console.log('Auto-ended standard auction:', auctionId)
+  return { ended: true }
+}
+
 async function autoCloseStandardItems() {
   if (autoCloseRunningSince && Date.now() - autoCloseRunningSince < AUTO_CLOSE_STALE_MS) return
   autoCloseRunningSince = Date.now()
@@ -3092,26 +3143,7 @@ async function autoCloseStandardItems() {
     if (!liveAuctions?.length) return
 
     for (const auction of liveAuctions) {
-      const { data: openItems } = await supabase
-        .from('auction_items')
-        .select('id')
-        .eq('auction_id', auction.id)
-        .not('status', 'in', '("sold","unsold")')
-      if (!openItems?.length) {
-        const { data: allItems } = await supabase
-          .from('auction_items').select('id').eq('auction_id', auction.id)
-        if (allItems?.length > 0) {
-          try {
-            await buildAndChargeInvoicesForAuction(auction.id)
-          } catch (invErr) {
-            console.error('buildAndChargeInvoicesForAuction failed for auction', auction.id, invErr.message)
-          }
-          // Unconditional: reached regardless of whether any invoice above
-          // charged successfully, declined, or errored.
-          await supabase.from('auctions').update({ status: 'ended' }).eq('id', auction.id)
-          console.log('Auto-ended standard auction:', auction.id)
-        }
-      }
+      await maybeEndStandardAuction(auction.id)
     }
   } catch (e) {
     console.error('autoCloseStandardItems error:', e)

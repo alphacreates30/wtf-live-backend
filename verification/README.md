@@ -5,7 +5,7 @@ Behavioural proofs for the eleven checks of 2026-09-19/20. Each one
 also checks the legitimate path still works. Run them after touching any of the
 routes below.
 
-> ## ⚠ DEPLOY HAZARD: no Railway deploys during an auction close window (under-billing only)
+> ## ⚠ DEPLOY HAZARD: no Railway deploys during an auction close window (until #48 ships)
 >
 > **Duplicate orders (over-billing) are closed.** Migration `2026-09-21g-orders-item-id-unique.sql`
 > (partial unique index on `orders.item_id`) is applied on production - confirmed present
@@ -17,15 +17,19 @@ routes below.
 > (`autoCloseRunningSince`) never closed this by itself - it's per-process - the unique index is what
 > makes it impossible across instances.
 >
-> **Under-billing is still open.** With two instances running the close job at once, one can reach "no
-> open items left" and start building invoices for the auction at the exact moment the other has just
-> flipped a lot to `sold` but hasn't yet inserted its order. Invoice build only sums orders that already
-> exist, so it silently skips that lot: the buyer is undercharged and the lot is left `sold` with no
-> order at all. Not reproduced in the 3 post-migration 200-lot runs (narrow window), not ruled out
-> either - the unique index does nothing for it. **Until fixed (#48: invoice build must verify every sold
-> lot in the auction has an order before building invoices, and defer to the next tick if any are
-> missing), do not deploy the backend while any standard auction is closing** (its lots' `ends_at`
-> passing, up to when it flips to `ended`).
+> **Under-billing (#48) is fixed in code, NOT YET DEPLOYED.** With two instances running the close job
+> at once, one could reach "no open items left" and start building invoices for the auction at the exact
+> moment the other had just flipped a lot to `sold` but hadn't yet inserted its order. Invoice build only
+> summed orders that already existed, so it silently skipped that lot: the buyer stayed undercharged and
+> the order arrived afterward with no `invoice_id`, never to be charged (the auction was already `ended`
+> and nothing revisits it). No DB migration needed - unlike the duplicate-order fix, this is a pure code
+> check: `maybeEndStandardAuction` now verifies every `sold` lot has an order before building invoices,
+> deferring to the next tick if any are missing. Reproduced and fixed deterministically
+> (`verification/undercharge-race.js`) - the old commit ends the auction with the order still in flight
+> and no invoice ever built; the new code defers, then completes correctly once the order lands. **Once
+> this ships to production, delete this entire hazard box - both halves are closed.** Until then, **do
+> not deploy the backend while any standard auction is closing** (its lots' `ends_at` passing, up to
+> when it flips to `ended`).
 
 > ## ⚠ These run against the REAL database
 >
@@ -46,7 +50,7 @@ routes below.
 > for leftover `ZZTEST_` rows (`select * from auctions where title like 'ZZTEST_%'`).
 
 They start local copies of the server on ports 3231-3234, 3241-3242, 3251-3252,
-3261-3262, 3271-3272, 3281-3285, 3291-3293, 3301-3312 and 3321-3322 with the background jobs (`setInterval`) stubbed out, so nothing
+3261-3262, 3271-3272, 3281-3285, 3291-3293, 3301-3312, 3321-3322 and 3331-3332 with the background jobs (`setInterval`) stubbed out, so nothing
 auto-closes or charges. They write temporary `server.tmp-*.js` / `run.tmp-*.js`
 files next to `server.js` and delete them on exit (both are git-ignored).
 
@@ -56,7 +60,7 @@ are minted in-process with `JWT_SECRET` and expire in minutes. `id-normalisation
 also needs `../wtf-live-frontend` checked out next to this repo (for
 `socket.io-client`).
 
-## The eleven suites
+## The twelve suites
 
 Each suite's "before" server is pinned to a commit, not to `HEAD`, so its
 reproduction assertions stay valid however far `main` moves on. A suite that is
@@ -75,6 +79,7 @@ always red teaches people to ignore red.
 | `scale-200-close.js` (**slow, ~15 min, not part of the quick run**) | The whole close path at 200 lots / 20 buyers (`autoCloseStandardItems` -> `createOrderOnWin` -> `buildAndChargeInvoicesForAuction` -> `chargeInvoice`), real code and real database, Stripe an in-process fake (800ms latency, 2 declines, 1 error). Scenarios: `single` and `double` (two servers running the job at once). Asserts one order per sold lot; invoice totals vs an independently computed figure; **AMOUNT: every invoice total and every amount sent to Stripe equals what each buyer owes, recomputed from the lots the database says sold** (every earlier check proved charge *count*; a 60% overcharge passed all of them); exactly one charge attempt per invoice; failures mid-loop don't stall later buyers. Measures tick duration and requests per lot. The fixture stays `draft` so the production job skips it, and the local job is patched to touch only it. The `double` scenario needs migration g to pass. | n/a (current code) | _this slice_ |
 | `charge-auto-vs-manual.js` | The auto-close job re-attempted FAILED invoices when a tick re-entered an auction it had already charged (23 charge attempts for 20 invoices in the 200-lot run): an automatic retry of a declined card. `chargeInvoice(id, { auto: true })` (used only by `buildAndChargeInvoicesForAuction`) now claims only `unpaid` (plus stale-`charging` crash recovery); a human's `/charge-winner` still claims `failed`. Proves both directions, plus that the job still charges unpaid invoices and leaves a fresh `charging` one alone. Stripe is faked in-process. | **`670cdb5`** | _this slice_ |
 | `orders-item-unique.js` | One order per lot, enforced by the database (`migrations/2026-09-21g`). Provokes the race deterministically (two concurrent `createOrderOnWin` calls for one lot): BEFORE the migration it shows 8 of 8 races duplicate an order on both old and new code, then exits 2; AFTER, asserts the index refuses a raw duplicate, live orders with no `item_id` are unconstrained, and each race yields exactly one order with both callers getting the same id. | **`670cdb5`** | _this slice_ |
+| `undercharge-race.js` | #48: an invoice build must not run while a sold lot's order is still in flight - the residual risk flagged after the 200-lot double-instance runs. A test-only route flips one lot to `sold` and, after an injected delay, calls the real `createOrderOnWin` (Step 1's own sequence, gap widened on purpose); a second test-only route drives the real per-auction "everything closed?" check (`maybeEndStandardAuction` on NEW; a frozen copy of the pinned commit's own inline equivalent on OLD) into that gap. On the pinned commit: the auction ends with the order still missing, no invoice is ever built for it, and the order arrives afterward permanently unlinked (`invoice_id` null) - undercharged for good, since an `ended` auction is never revisited. Fixed: `maybeEndStandardAuction` checks every `sold` lot has an order before building invoices and defers (leaves the auction `live`) if any are missing; the next call finds it covered and completes normally, invoice total matching the order exactly. No DB migration involved - pure code, unlike the duplicate-order fix. | **`9ffdcfb`** | _this slice (#48)_ |
 
 ## Not covered
 
