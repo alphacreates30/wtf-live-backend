@@ -5,31 +5,30 @@ Behavioural proofs for the eleven checks of 2026-09-19/20. Each one
 also checks the legitimate path still works. Run them after touching any of the
 routes below.
 
-> ## ⚠ DEPLOY HAZARD: no Railway deploys during an auction close window (until #48 ships)
+> ## ✅ Close-path races (duplicate orders, under-billing): both closed
 >
-> **Duplicate orders (over-billing) are closed.** Migration `2026-09-21g-orders-item-id-unique.sql`
-> (partial unique index on `orders.item_id`) is applied on production - confirmed present
-> (`orders_item_id_key`) - and `createOrderOnWin` treats the resulting `23505` as "exists" instead of
-> erroring. Two instances can no longer both insert an order for the same lot. Re-verified post-migration
-> at 200 lots / 20 buyers, two instances, 3 runs: one order per sold lot every time, and every invoice
-> total / Stripe charge amount matched what was actually owed exactly (0.0% off; pre-migration this was
-> 80.2% off - $13203.53 charged against $7325.71 owed). The in-process overlap guard
-> (`autoCloseRunningSince`) never closed this by itself - it's per-process - the unique index is what
-> makes it impossible across instances.
+> Two races used to make deploying the backend during an auction close window unsafe. Both are now
+> closed - kept here as a record, not a live warning.
 >
-> **Under-billing (#48) is fixed in code, NOT YET DEPLOYED.** With two instances running the close job
-> at once, one could reach "no open items left" and start building invoices for the auction at the exact
-> moment the other had just flipped a lot to `sold` but hadn't yet inserted its order. Invoice build only
-> summed orders that already existed, so it silently skipped that lot: the buyer stayed undercharged and
-> the order arrived afterward with no `invoice_id`, never to be charged (the auction was already `ended`
-> and nothing revisits it). No DB migration needed - unlike the duplicate-order fix, this is a pure code
-> check: `maybeEndStandardAuction` now verifies every `sold` lot has an order before building invoices,
-> deferring to the next tick if any are missing. Reproduced and fixed deterministically
-> (`verification/undercharge-race.js`) - the old commit ends the auction with the order still in flight
-> and no invoice ever built; the new code defers, then completes correctly once the order lands. **Once
-> this ships to production, delete this entire hazard box - both halves are closed.** Until then, **do
-> not deploy the backend while any standard auction is closing** (its lots' `ends_at` passing, up to
-> when it flips to `ended`).
+> **Duplicate orders (over-billing).** Two instances could both pass `createOrderOnWin`'s "does this lot
+> have an order?" check and both insert one - measured 2026-09-21 at 267 orders for 150 sold lots, one
+> buyer's invoice inflated to $607.20 against $381.80 owed. Closed by migration
+> `2026-09-21g-orders-item-id-unique.sql` (partial unique index on `orders.item_id`, live on production,
+> confirmed present as `orders_item_id_key`) plus `createOrderOnWin` treating the resulting `23505` as
+> "exists" rather than erroring. Re-verified post-migration at 200 lots / 20 buyers, two instances, 3
+> runs: one order per sold lot every time, every invoice total / Stripe charge amount matching what was
+> actually owed exactly (0.0% off; pre-migration this was 80.2% off).
+>
+> **Under-billing (#48).** Two instances could reach "no open items left" and start building invoices at
+> the exact moment another had just flipped a lot to `sold` but hadn't yet inserted its order - invoice
+> build only summed orders that already existed, so it silently skipped that lot, and because the auction
+> was already `ended` afterward, nothing ever revisited it: a permanent undercharge. Closed in code (no
+> migration needed) by `maybeEndStandardAuction`, which now verifies every `sold` lot has an order before
+> building invoices and defers to the next tick if any are missing. Reproduced and fixed deterministically
+> in `verification/undercharge-race.js`. Live on production as of `9322fde`.
+>
+> Both fixes are per-instance (in the actual code, not just a migration), so an ordinary Railway deploy -
+> old and new instance briefly side by side - is no longer a hazard either way.
 
 > ## ⚠ These run against the REAL database
 >
