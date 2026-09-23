@@ -5,21 +5,27 @@ Behavioural proofs for the eleven checks of 2026-09-19/20. Each one
 also checks the legitimate path still works. Run them after touching any of the
 routes below.
 
-> ## ⚠ DEPLOY HAZARD: no Railway deploys during an auction close window
+> ## ⚠ DEPLOY HAZARD: no Railway deploys during an auction close window (under-billing only)
 >
-> **Until migration `2026-09-21g-orders-item-id-unique.sql` is applied on production, do not deploy the backend
-> while any standard auction is closing** (its lots' `ends_at` passing, up to when it flips to `ended`).
+> **Duplicate orders (over-billing) are closed.** Migration `2026-09-21g-orders-item-id-unique.sql`
+> (partial unique index on `orders.item_id`) is applied on production - confirmed present
+> (`orders_item_id_key`) - and `createOrderOnWin` treats the resulting `23505` as "exists" instead of
+> erroring. Two instances can no longer both insert an order for the same lot. Re-verified post-migration
+> at 200 lots / 20 buyers, two instances, 3 runs: one order per sold lot every time, and every invoice
+> total / Stripe charge amount matched what was actually owed exactly (0.0% off; pre-migration this was
+> 80.2% off - $13203.53 charged against $7325.71 owed). The in-process overlap guard
+> (`autoCloseRunningSince`) never closed this by itself - it's per-process - the unique index is what
+> makes it impossible across instances.
 >
-> A deploy briefly runs the old and new instance side by side, and both run the auto-close job. Two instances
-> can both pass `createOrderOnWin`'s "does this lot have an order?" check and both insert one. Measured on
-> 2026-09-21 (`scale-200-close.js`, two instances, 200 lots): **267 orders for 150 sold lots, 117 lots duplicated,
-> buyers' invoices inflated** (one $607.20 against $381.80 owed). The invoice sums orders, so a duplicate order is
-> a duplicate charge *amount*, and the charge itself still succeeds exactly once, at the wrong figure.
->
-> The in-process overlap guard added alongside (`autoCloseRunningSince`) does NOT help here: it is per process.
-> Only the unique index makes duplicates impossible across instances. **Once `orders_item_id_key` exists this
-> hazard is closed and this box should be deleted.** Check with:
-> `select indexname from pg_indexes where indexname = 'orders_item_id_key';`
+> **Under-billing is still open.** With two instances running the close job at once, one can reach "no
+> open items left" and start building invoices for the auction at the exact moment the other has just
+> flipped a lot to `sold` but hasn't yet inserted its order. Invoice build only sums orders that already
+> exist, so it silently skips that lot: the buyer is undercharged and the lot is left `sold` with no
+> order at all. Not reproduced in the 3 post-migration 200-lot runs (narrow window), not ruled out
+> either - the unique index does nothing for it. **Until fixed (#48: invoice build must verify every sold
+> lot in the auction has an order before building invoices, and defer to the next tick if any are
+> missing), do not deploy the backend while any standard auction is closing** (its lots' `ends_at`
+> passing, up to when it flips to `ended`).
 
 > ## ⚠ These run against the REAL database
 >
