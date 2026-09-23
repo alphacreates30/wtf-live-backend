@@ -244,7 +244,7 @@ async function groupPhotosSingleCall(thumbs) {
     max_tokens: 4000,
     system: cacheableSystem(GROUPING_SYSTEM_PROMPT),
     messages: [{ role: 'user', content }],
-  });
+  }, { maxRetries: 5 });
 
   let groups;
   try {
@@ -309,6 +309,11 @@ async function analyzeLot(images, condition = '') {
     max_tokens: 1500,
     system: cacheableSystem(ANALYSIS_SYSTEM_PROMPT),
     messages: [{ role: 'user', content }],
+  }, {
+    // SDK default is 2. A 200-lot batch is a sequential run of 200 of these -
+    // worth a few extra retries against a transient 429/5xx/overload rather
+    // than losing the lot to a blip the caller (analyzeAll) can't see.
+    maxRetries: 5,
   });
 
   const raw = textOf(response);
