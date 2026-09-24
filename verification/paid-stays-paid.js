@@ -67,8 +67,8 @@ const createCalls = () => { try { return fs.readFileSync(CALLS, 'utf8').trim().s
     BUYER_ID = die(await s.from('users').select('id').eq('username', BUYER_USERNAME).single()).id;
     const prof = die(await s.from('profiles').select('stripe_customer_id,stripe_payment_method_id').eq('user_id', String(BUYER_ID)).single());
     if (!prof.stripe_customer_id || !prof.stripe_payment_method_id) throw new Error('fixture buyer has no saved card');
-    const oldSrc = execSync('git show ' + OLD_COMMIT + ':server.js', { cwd: BE, maxBuffer: 50e6 }).toString();
-    const newSrc = fs.readFileSync(BE + '/server.js', 'utf8');
+    const oldSrc = require('./guard').sourceAt(OLD_COMMIT, BE);
+    const newSrc = require('./guard').readSource(BE + '/server.js');
     // ports 3281-3285: old/new with the email step forced to throw; new with a healthy email step; new with a declining card
     servers.push(
       await boot('oldthrow', 3281, withNotifyThrowing(withFakeStripe(oldSrc))),

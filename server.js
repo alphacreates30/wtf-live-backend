@@ -622,6 +622,13 @@ function verifySocketToken(token) {
 
 app.get('/', (req, res) => res.json({ status: 'WhatTheFind Live is running' }));
 
+// Deploy fingerprint (#49): after a push, /version.commit must equal
+// `git rev-parse HEAD`. Railway sets RAILWAY_GIT_COMMIT_SHA; locally it's null,
+// which is correct - never derive it from git at runtime. Returns ONLY these two
+// fields: this route must never become a place where config leaks.
+const STARTED_AT = new Date().toISOString();
+app.get('/version', (req, res) => res.json({ commit: process.env.RAILWAY_GIT_COMMIT_SHA || null, started_at: STARTED_AT }));
+
 // -- Auth --
 app.post('/auth/register', async (req, res) => {
   const { username, password } = req.body;

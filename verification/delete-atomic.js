@@ -75,8 +75,8 @@ const del = (port, id) => fetch('http://localhost:' + port + '/auction/' + id, {
     die(await s.from('auction_items').insert({ auction_id: probe.id, title: 'ZZTEST_delatomic preflight lot', starting_bid: 0, position: 0, status: 'pending', ends_at: soon() }).select().single());
     const pre = await s.rpc('delete_auction_cascade', { p_auction_id: probe.id });
     if (pre.error) { console.error('\nmigrations/2026-09-20e + 20f (delete-auction-cascade) not applied, or broken (' + pre.error.code + ' ' + pre.error.message + ').\n'); process.exit(2); }
-    const oldSrc = execSync('git show ' + OLD_COMMIT + ':server.js', { cwd: BE, maxBuffer: 50e6 }).toString();
-    const newSrc = fs.readFileSync(BE + '/server.js', 'utf8');
+    const oldSrc = require('./guard').sourceAt(OLD_COMMIT, BE);
+    const newSrc = require('./guard').readSource(BE + '/server.js');
     servers.push(await boot('oldrace', 3291, withRace(oldSrc, OLD_MARK)), await boot('newrace', 3292, withRace(newSrc, NEW_MARK)), await boot('newclean', 3293, newSrc));
 
     console.log(`== REPRODUCE on ${OLD_COMMIT} (pre-fix): an order is created after the order check has passed ==`);

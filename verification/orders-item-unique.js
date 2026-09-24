@@ -72,8 +72,8 @@ async function race(port, label) {
     die(await s.from('orders').insert(row).select().single());
     const dup = await s.from('orders').insert(row).select();
     const indexed = !!dup.error && dup.error.code === '23505';
-    const oldSrc = execSync('git show ' + OLD_COMMIT + ':server.js', { cwd: BE, maxBuffer: 50e6 }).toString();
-    const newSrc = fs.readFileSync(BE + '/server.js', 'utf8');
+    const oldSrc = require('./guard').sourceAt(OLD_COMMIT, BE);
+    const newSrc = require('./guard').readSource(BE + '/server.js');
     servers.push(await boot('old', 3321, patch(oldSrc)), await boot('new', 3322, patch(newSrc)));
 
     if (!indexed) {

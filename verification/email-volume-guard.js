@@ -44,8 +44,8 @@ function sandbox(code, { count = 0, countError = null, now = null } = {}) {
 const send = (env, kind) => env.api.sendEmail({ from: 'a', to: 'b@example.invalid', subject: kind + ' test', html: 'x', text: 'x', kind });
 
 (async () => {
-  const newSrc = fs.readFileSync(BE + '/server.js', 'utf8');
-  const oldSrc = execSync('git show ' + OLD_COMMIT + ':server.js', { cwd: BE, maxBuffer: 50e6 }).toString();
+  const newSrc = require('./guard').readSource(BE + '/server.js');
+  const oldSrc = require('./guard').sourceAt(OLD_COMMIT, BE);
   const NEW = extract(newSrc, 'const MONTHLY_EMAIL_CAP'), OLD = extract(oldSrc, 'const DAILY_EMAIL_CAP');
   const created = [];
   try {

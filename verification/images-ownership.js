@@ -36,8 +36,8 @@ const images = async id => (await s.from('item_images').select('id').eq('item_id
 (async () => {
   const servers = [];
   try {
-    const oldSrc = execSync('git show ' + OLD_COMMIT + ':server.js', { cwd: BE, maxBuffer: 50e6 }).toString();
-    const newSrc = fs.readFileSync(BE + '/server.js', 'utf8');
+    const oldSrc = require('./guard').sourceAt(OLD_COMMIT, BE);
+    const newSrc = require('./guard').readSource(BE + '/server.js');
     const A = await mkAuction('A_callers', CALLER), B = await mkAuction('B_others', OTHER);
     const lotA = await mkItem(A, 'ZZTEST img lot A'), lotB = await mkItem(B, 'ZZTEST img lot B');
     servers.push(await boot('old', 3261, oldSrc), await boot('new', 3262, newSrc));

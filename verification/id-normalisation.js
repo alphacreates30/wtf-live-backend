@@ -49,8 +49,8 @@ const socketTry = (port, event, payload, waitFor) => new Promise(resolve => {
 (async () => {
   const servers = [];
   try {
-    const oldSrc = execSync('git show 385ea56:server.js', { cwd: BE, maxBuffer: 50e6 }).toString();
-    const newSrc = fs.readFileSync(BE + '/server.js', 'utf8');
+    const oldSrc = require('./guard').sourceAt('385ea56', BE);
+    const newSrc = require('./guard').readSource(BE + '/server.js');
     const R = await s.from('auctions').select('id,title').like('title', 'ZZTEST_InvoiceBatch%').single();
     const X = R.data.id;   // real auction that has lots + orders (read-only use)
 

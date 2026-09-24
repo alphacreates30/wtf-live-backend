@@ -8,7 +8,7 @@ require(BE + '/node_modules/dotenv').config({ quiet: true });
 const jwt = require(BE + '/node_modules/jsonwebtoken');
 const { createClient } = require(BE + '/node_modules/@supabase/supabase-js');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const src = fs.readFileSync(BE + '/server.js', 'utf8');
+const src = require('./guard').readSource(BE + '/server.js');
 let fails = 0;
 const ok = (c, m) => { console.log((c ? 'PASS ' : 'FAIL ') + m); if (!c) fails++; };
 const s = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
@@ -54,7 +54,7 @@ const orderRow = async id => (await s.from('orders').select('id,auction_id').eq(
     const guarded = await variant('g', 3231, t => t); runs.push(guarded);
     const unguarded = await variant('u', 3232, t => t.replace("if (existing.length) {", "if (false) {")); runs.push(unguarded);
     // PINNED "before" server for the uppercase-id bypass: 3c6dc5a has the order guard but not the uuid normalisation (fixed in c5caa33)
-    const pinned = await variant('p', 3234, () => execSync('git show 3c6dc5a:server.js', { cwd: BE, maxBuffer: 50e6 }).toString()); runs.push(pinned);
+    const pinned = await variant('p', 3234, () => require('./guard').sourceAt('3c6dc5a', BE)); runs.push(pinned);
     const failing = await variant('f', 3233, t => t.replace(".select('id, payment_status, shipping_payment_status')", ".select('no_such_column')")); runs.push(failing);
 
     // 1. Auction with orders -> 409, everything intact

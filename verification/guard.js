@@ -13,3 +13,10 @@ module.exports = function guard(file) {
   }
   console.log(`Target database: ${new URL(url).host}\n`);
 };
+
+// Source the suites patch and match markers against. Normalised to LF once,
+// here, so a CRLF checkout (core.autocrlf=true on Windows) can never turn a
+// multi-line marker into a false "marker not found" (#49).
+const lf = s => s.replace(/\r\n/g, '\n');
+module.exports.readSource = file => lf(require('fs').readFileSync(file, 'utf8'));
+module.exports.sourceAt = (commit, cwd) => lf(require('child_process').execSync('git show ' + commit + ':server.js', { cwd, maxBuffer: 50e6 }).toString());

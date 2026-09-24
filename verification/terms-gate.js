@@ -45,8 +45,8 @@ const item = async id => (await s.from('auction_items').select('leading_bidder,b
 const prebids = async id => (await s.from('pre_bids').select('id,auction_id,item_id').eq('item_id', id)).data;
 
 (async () => {
-  const oldSrc = execSync('git show c5caa33:server.js', { cwd: BE, maxBuffer: 50e6 }).toString();
-  const newSrc = fs.readFileSync(BE + '/server.js', 'utf8');
+  const oldSrc = require('./guard').sourceAt('c5caa33', BE);
+  const newSrc = require('./guard').readSource(BE + '/server.js');
   const servers = [];
   try {
     const A = await mkAuction('A', 15, 'shipping');

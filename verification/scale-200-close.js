@@ -37,7 +37,7 @@ const uname = n => 'zztest_scale_b' + pad(n);
 
 // ---------- patched server source ----------
 function patchedServer(fixId, tag) {
-  let src = fs.readFileSync(BE + '/server.js', 'utf8');
+  let src = require('./guard').readSource(BE + '/server.js');
   const rep = (a, b) => { if (!src.includes(a)) throw new Error('patch marker not found: ' + a.slice(0, 70)); src = src.replace(a, b); };
   // 1. fake Stripe
   rep("const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(process.env.STRIPE_SECRET_KEY) : null;",

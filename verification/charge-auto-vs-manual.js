@@ -63,8 +63,8 @@ const post = (port, path, body) => fetch('http://localhost:' + port + path, { me
   const servers = [];
   try {
     BUYER_ID = String(die(await s.from('users').select('id').eq('username', BUYER).single()).id);
-    const oldSrc = execSync('git show ' + OLD_COMMIT + ':server.js', { cwd: BE, maxBuffer: 50e6 }).toString();
-    const newSrc = fs.readFileSync(BE + '/server.js', 'utf8');
+    const oldSrc = require('./guard').sourceAt(OLD_COMMIT, BE);
+    const newSrc = require('./guard').readSource(BE + '/server.js');
     servers.push(await boot('old', 3311, patch(oldSrc, 'chargeInvoice(req.params.id)')), await boot('new', 3312, patch(newSrc, 'chargeInvoice(req.params.id, { auto: true })')));
 
     console.log(`== REPRODUCE on ${OLD_COMMIT} (pre-fix): the job's call re-attempts a FAILED invoice ==`);

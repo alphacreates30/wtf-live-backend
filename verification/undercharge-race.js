@@ -97,8 +97,8 @@ const auctionStatus = async id => (await s.from('auctions').select('status').eq(
 (async () => {
   const servers = [];
   try {
-    const oldSrc = execSync('git show ' + OLD_COMMIT + ':server.js', { cwd: BE, maxBuffer: 50e6 }).toString();
-    const newSrc = fs.readFileSync(BE + '/server.js', 'utf8');
+    const oldSrc = require('./guard').sourceAt(OLD_COMMIT, BE);
+    const newSrc = require('./guard').readSource(BE + '/server.js');
     servers.push(await boot('undold', 3331, patch(oldSrc, OLD_END_AUCTION_ROUTE)), await boot('undnew', 3332, patch(newSrc, NEW_END_AUCTION_ROUTE)));
 
     console.log(`== REPRODUCE on ${OLD_COMMIT} (pre-fix): invoice build runs while the sold lot's order is still in flight ==`);
