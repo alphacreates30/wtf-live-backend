@@ -1,3 +1,4 @@
+-- APPLIED on production 2026-09-24 in Albert's Supabase SQL editor - run by a Claude session there, not by Albert (per Albert; the session that wrote this file had no SQL access and did not run it). Verified in the SQL editor. DO NOT RUN AGAIN.
 -- STEP j (#44 step 2.3). Run in the Supabase SQL editor AFTER step i (uuid conversion), BEFORE step k.
 -- Adds the three missing foreign keys, so a lot or pre-bid can never again point at an auction or lot that does not
 -- exist. Fails with 23503 if any dangling row remains - that means step h was not run (or new debris appeared since):

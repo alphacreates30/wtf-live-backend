@@ -28,7 +28,7 @@ const U = crypto.randomUUID();
 const adminTok = jwt.sign({ id: crypto.randomUUID(), username: 'whatthefind' }, process.env.JWT_SECRET, { expiresIn: '10m' });
 const buyerTok = jwt.sign({ id: U, username: 'zztest_idnorm' }, process.env.JWT_SECRET, { expiresIn: '10m' });
 const future = h => new Date(Date.now() + h * 3600e3).toISOString();
-const made = { auctions: [], items: [], orders: [] };
+const made = { auctions: [], items: [], orders: [], xorders: [] };
 const call = (port, method, path, tok, body) => fetch('http://localhost:' + port + path, { method, headers: { ...(tok ? { Authorization: 'Bearer ' + tok } : {}), 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined }).then(async r => { const t = await r.text(); let j; try { j = JSON.parse(t); } catch { j = t; } return { s: r.status, j }; });
 async function mkAuction(label, status) {
   const r = await s.from('auctions').insert({ title: 'ZZTEST_idnorm_' + label, description: 'x', status, mode: 'standard', fulfillment_mode: 'shipping', buyers_premium_pct: 15, host_username: 'whatthefind', ends_at: future(48) }).select().single();
@@ -51,8 +51,14 @@ const socketTry = (port, event, payload, waitFor) => new Promise(resolve => {
   try {
     const oldSrc = require('./guard').sourceAt('385ea56', BE);
     const newSrc = require('./guard').readSource(BE + '/server.js');
-    const R = await s.from('auctions').select('id,title').like('title', 'ZZTEST_InvoiceBatch%').single();
-    const X = R.data.id;   // real auction that has lots + orders (read-only use)
+    // X: an auction with lots and orders for the read checks. Was a borrowed pre-existing fixture (ZZTEST_InvoiceBatch),
+    // which the 2026-09 test-data cleanup removed; now built and removed by this run.
+    const X = await mkAuction('reads', 'live');
+    for (const k of [0, 1]) await mkItem(X, 'ZZTEST idnorm reads lot ' + k, 'open');
+    for (let i = 0; i < 2; i++) {
+      const o = await s.from('orders').insert({ auction_id: X, buyer_username: 'zztest_idnorm', buyer_user_id: U, item_title: 'ZZTEST idnorm reads order ' + i, final_bid: 1, status: 'pending', payment_status: 'unpaid' }).select().single();
+      if (o.error) throw new Error(JSON.stringify(o.error)); made.xorders.push(o.data.id);
+    }
 
     // fixtures
     const LIVE = await mkAuction('live', 'live');
@@ -95,7 +101,10 @@ const socketTry = (port, event, payload, waitFor) => new Promise(resolve => {
     const stored = async id => (await s.from('pre_bids').select('auction_id').eq('item_id', id)).data.map(r => r.auction_id);
     let r = await call(OLD, 'POST', `/auction/${LIVE.toUpperCase()}/items/${pendingLot}/prebid`, buyerTok, { max_amount: 7 });
     let vals = await stored(pendingLot);
-    ok(r.s === 200 && vals.length === 1 && vals[0] === LIVE.toUpperCase(), `OLD pre-bid with UPPERCASE auction id stored auction_id='${vals[0]}' (non-canonical, invisible to lowercase lookups)  <- poisoning reproduced`);
+    // Was: OLD stored the UPPERCASE string (pre_bids.auction_id was TEXT) - poisoning reproduced. Since migration
+    // 2026-09-24i the column is uuid, so the database canonicalises whatever case arrives: even the pre-normalisation
+    // server can no longer store a non-canonical id.
+    ok(r.s === 200 && vals.length === 1 && vals[0] === LIVE, `DB (migration i, pre_bids.auction_id is uuid): even the pre-normalisation server's UPPERCASE pre-bid is stored canonical, auction_id='${vals[0]}' (was stored UPPERCASE when the column was text)`);
     await s.from('pre_bids').delete().eq('item_id', pendingLot);
     r = await call(NEW, 'POST', `/auction/${LIVE.toUpperCase()}/items/${pendingLot}/prebid`, buyerTok, { max_amount: 7 });
     vals = await stored(pendingLot);
@@ -105,7 +114,8 @@ const socketTry = (port, event, payload, waitFor) => new Promise(resolve => {
     const rawItems = async () => (await s.from('auction_items').select('id,auction_id').like('title', 'ZZTEST_idnorm_add%')).data;
     r = await call(OLD, 'POST', `/auction/${DRAFT.toUpperCase()}/items`, adminTok, { title: 'ZZTEST_idnorm_add_old' });
     let rows = await rawItems(); rows.forEach(x => made.items.push(x.id));
-    ok(r.s === 201 && rows.some(x => x.auction_id === DRAFT.toUpperCase()), `OLD admin add-item with UPPERCASE id stored auction_id='${(rows[0] || {}).auction_id}'  <- poisoning reproduced`);
+    // Was: OLD stored the UPPERCASE string (auction_items.auction_id was TEXT). uuid since migration 2026-09-24i.
+    ok(r.s === 201 && rows.length === 1 && rows[0].auction_id === DRAFT, `DB (migration i, auction_items.auction_id is uuid): even the pre-normalisation server's UPPERCASE add-item is stored canonical, auction_id='${(rows[0] || {}).auction_id}' (was stored UPPERCASE when the column was text)`);
     await s.from('auction_items').delete().like('title', 'ZZTEST_idnorm_add%');
     r = await call(NEW, 'POST', `/auction/${DRAFT.toUpperCase()}/items`, adminTok, { title: 'ZZTEST_idnorm_add_new' });
     rows = await rawItems(); rows.forEach(x => made.items.push(x.id));
@@ -116,7 +126,10 @@ const socketTry = (port, event, payload, waitFor) => new Promise(resolve => {
     const before = (await s.from('auctions').select('status').eq('id', DRAFT).single()).data.status;
     r = await call(OLD, 'POST', `/auction/${DRAFT.toUpperCase()}/publish`, adminTok, {});
     const afterOld = (await s.from('auctions').select('status').eq('id', DRAFT).single()).data.status;
-    ok(before === 'draft' && r.s === 400 && afterOld === 'draft', `OLD publish with UPPERCASE id: ${r.s} "${r.j.error}" (auction has a lot, still refused)  <- reproduced`);
+    // Was: OLD refused (400) - its "does this auction have lots?" lookup compared the UPPERCASE id to a TEXT column and
+    // found none. auction_items.auction_id is uuid since migration 2026-09-24i, so the lookup matches whatever the case.
+    ok(before === 'draft' && r.s === 200 && afterOld !== 'draft', `DB (migration i, auction_items.auction_id is uuid): even the pre-normalisation server's publish with an UPPERCASE id now finds the lot and succeeds: ${r.s}, status '${afterOld}' (was 400, auction left in draft, when the column was text)`);
+    await s.from('auctions').update({ status: 'draft' }).eq('id', DRAFT);   // back to draft for the NEW check
     r = await call(NEW, 'POST', `/auction/${DRAFT.toUpperCase()}/publish`, adminTok, {});
     const afterNew = (await s.from('auctions').select('status').eq('id', DRAFT).single()).data.status;
     ok(r.s === 200 && afterNew !== 'draft', `NEW publish with UPPERCASE id: ${r.s}, status now '${afterNew}'`);
@@ -151,6 +164,7 @@ const socketTry = (port, event, payload, waitFor) => new Promise(resolve => {
     servers.forEach(x => x.cleanup());
     await s.from('pre_bids').delete().eq('buyer_user_id', U);
     if (made.orders.length) await s.from('orders').delete().in('id', made.orders);
+    if (made.xorders.length) await s.from('orders').delete().in('id', made.xorders);
     await s.from('bids').delete().in('auction_id', made.auctions);
     await s.from('auction_terms_acceptances').delete().eq('user_id', U);
     await s.from('profiles').delete().eq('user_id', U);

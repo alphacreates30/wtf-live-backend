@@ -1,3 +1,4 @@
+-- APPLIED on production 2026-09-24 in Albert's Supabase SQL editor - run by a Claude session there, not by Albert (per Albert; the session that wrote this file had no SQL access and did not run it). Verified in the SQL editor. DO NOT RUN AGAIN.
 -- STEP k (#44 step 3; the brief's "migration h", renamed so the letters match run order). Run in the Supabase SQL
 -- editor AFTER steps i and j. Before i, the function would still be created, but every call on an auction with lots
 -- would fail with "operator does not exist: text = uuid" (the same failure as step e), because the columns are text.

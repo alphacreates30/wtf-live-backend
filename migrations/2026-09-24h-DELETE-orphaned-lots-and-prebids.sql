@@ -1,3 +1,4 @@
+-- APPLIED on production 2026-09-24 by Albert, verified in the SQL editor. DO NOT RUN AGAIN.
 -- STEP h (#44 step 1). DELETES ROWS. For Albert to run by hand in the Supabase SQL editor - NOT run by Claude.
 -- Run BEFORE step i (the uuid conversion) and step j (the foreign keys): j's constraints cannot be created while
 -- any of these rows exist, and would fail with 23503.

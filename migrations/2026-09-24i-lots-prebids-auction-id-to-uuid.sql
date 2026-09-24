@@ -1,3 +1,4 @@
+-- APPLIED on production 2026-09-24 in Albert's Supabase SQL editor - run by a Claude session there, not by Albert (per Albert; the session that wrote this file had no SQL access and did not run it). Verified in the SQL editor. DO NOT RUN AGAIN.
 -- STEP i (#44 step 2.1 + 2.2). Run in the Supabase SQL editor AFTER step h (orphan delete), BEFORE step j (FKs).
 -- auction_items.auction_id and pre_bids.auction_id hold auction uuids in TEXT columns (auctions.id is uuid), exactly
 -- as orders.auction_id did before migration c. Consequences: no foreign key is possible (text vs uuid), comparisons

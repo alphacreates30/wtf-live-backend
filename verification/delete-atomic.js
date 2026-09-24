@@ -97,14 +97,16 @@ const del = (port, id) => fetch('http://localhost:' + port + '/auction/' + id, {
     await s.from('invoices').delete().eq('id', inv.id);
     A = await mk('new_clean'); r = await del(3293, A.id); sn = await snapshot(A);
     ok(r.s === 200 && r.j.success && same(sn, GONE), `NEW: a deletable auction goes in ONE statement, every dependent removed with it: ${r.s}, ${JSON.stringify(sn)}`);
-    // rows poisoned with an UPPERCASE auction id (text columns; the id-normalisation bug used to store them) must not be orphaned
+    // UPPERCASE auction ids. Was: lots and pre-bids could be STORED with an uppercase id (text columns; the
+    // id-normalisation bug did it), and delete_auction_cascade (f) needed lower() to find them. Since migration
+    // 2026-09-24i both columns are uuid: writing an uppercase id stores the canonical form, so the poisoned state can
+    // no longer exist, and k's plain uuid equality removes everything.
     A = await mk('new_upper');
     await s.from('auction_items').update({ auction_id: A.id.toUpperCase() }).eq('auction_id', A.id);
     await s.from('pre_bids').update({ auction_id: A.id.toUpperCase() }).eq('auction_id', A.id);
-    const upperLots = (await s.from('auction_items').select('id').eq('auction_id', A.id.toUpperCase())).data.length;
+    const storedIds = [...(await s.from('auction_items').select('auction_id').in('id', A.lots)).data, ...(await s.from('pre_bids').select('auction_id').in('item_id', A.lots)).data].map(x => x.auction_id);
     r = await del(3293, A.id); sn = await snapshot(A);
-    const upperLeft = (await s.from('auction_items').select('id').eq('auction_id', A.id.toUpperCase())).data.length + (await s.from('pre_bids').select('item_id').eq('auction_id', A.id.toUpperCase())).data.length;
-    ok(upperLots === 2 && r.s === 200 && upperLeft === 0 && sn.auction === 0 && sn.images === 0 && sn.outbid === 0, `NEW: lots and pre-bids stored with an UPPERCASE auction id are removed too, not orphaned (${upperLots} such lots before, ${upperLeft} rows left): ${r.s}`);
+    ok(storedIds.length === 3 && storedIds.every(x => x === A.id) && r.s === 200 && same(sn, GONE), `NEW: writing an UPPERCASE auction id stores it canonical (${storedIds.length} rows, all '${A.id}'), and the delete removes every dependent: ${r.s}, ${JSON.stringify(sn)}`);
     r = await del(3293, A.id);
     ok(r.s === 200, `NEW: deleting an already-deleted auction is still a harmless ${r.s} (unchanged behaviour)`);
   } finally {

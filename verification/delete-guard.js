@@ -115,13 +115,14 @@ const orderRow = async id => (await s.from('orders').select('id,auction_id').eq(
     r = await del(3231, D.id, other);
     ok(r.s === 403 && (await exists(D.id)), 'non-admin still 403, nothing deleted');
 
-    // 6. Real auction with orders (skipped unless the guard already proved itself above - never risk a real row)
-    if (fails) throw new Error('guard checks failed - skipping the real-auction check');
-    const real = (await s.from('auctions').select('id,title').like('title', 'ZZTEST_InvoiceBatch%').single()).data;
+    // 6. A full auction - lots AND orders - through the guarded route. Was a borrowed pre-existing fixture
+    //    (ZZTEST_InvoiceBatch), removed by the 2026-09 test-data cleanup; now built by this run like the others.
+    if (fails) throw new Error('guard checks failed - skipping the full-auction check');
+    const real = await mk('full', true, true); made.push(real);
     const before = { items: (await s.from('auction_items').select('id', { count: 'exact', head: true }).eq('auction_id', real.id)).count, orders: (await s.from('orders').select('id', { count: 'exact', head: true }).eq('auction_id', real.id)).count };
     r = await del(3231, real.id);
     const after = { items: (await s.from('auction_items').select('id', { count: 'exact', head: true }).eq('auction_id', real.id)).count, orders: (await s.from('orders').select('id', { count: 'exact', head: true }).eq('auction_id', real.id)).count };
-    ok(r.s === 409 && JSON.stringify(before) === JSON.stringify(after) && (await exists(real.id)), 'real auction with ' + before.orders + ' orders: 409 "' + r.j.detail + '"; items/orders unchanged ' + JSON.stringify(after));
+    ok(r.s === 409 && JSON.stringify(before) === JSON.stringify(after) && (await exists(real.id)), 'auction with ' + before.items + ' lot(s) and ' + before.orders + ' order(s): 409 "' + r.j.detail + '"; items/orders unchanged ' + JSON.stringify(after));
   } finally {
     for (const id of (globalThis.__mk || [])) await s.from('auctions').delete().eq('id', id);
     for (const m of made) {
