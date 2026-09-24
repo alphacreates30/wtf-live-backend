@@ -1,4 +1,4 @@
--- STEP f. APPLIED on production 2026-09-21, verified (security_definer = false, ACL postgres+service_role only), followed by notify pgrst. DO NOT RUN AGAIN. Supersedes step e (whose function failed on any auction with rows: "operator does not exist: text = uuid").
+-- SUPERSEDED by step k (2026-09-24k, #44: plain uuid equality once the columns are uuid). STEP f. APPLIED on production 2026-09-21, verified (security_definer = false, ACL postgres+service_role only), followed by notify pgrst. DO NOT RUN AGAIN. Supersedes step e (whose function failed on any auction with rows: "operator does not exist: text = uuid").
 -- auction that has rows: "operator does not exist: text = uuid"). Run in the Supabase SQL editor.
 --
 -- Cause: auction_items.auction_id and pre_bids.auction_id / item_id are TEXT columns (auctions.id is uuid), and e

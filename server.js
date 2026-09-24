@@ -547,10 +547,11 @@ function requireAuth(req, res, next) {
 }
 
 // ---- Id normalisation at the edge ----
-// Several id columns are TEXT rather than uuid (orders/auction_items/pre_bids
-// .auction_id), so a comparison against one is a case-sensitive string match
-// while the same id against a uuid column is case-insensitive. An id that
-// arrives in the wrong case can therefore pass one check and miss another.
+// Every auction/lot id column is uuid now (orders.auction_id: migration c;
+// auction_items/pre_bids.auction_id: migration 2026-09-24i). They used to be
+// TEXT, where a wrong-case id matched case-sensitively and passed one check
+// while missing another. On a uuid column a malformed id is an error (22P02)
+// rather than a silent non-match, so validation here still matters.
 // Every id that comes in from a URL, body, query or socket event is validated
 // as a well-formed uuid and lowercased here, once, before any handler uses it.
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -1373,10 +1374,7 @@ app.get('/auction/:id/token', requireAuth, async (req, res) => {
 // view and easy to lose track of while still unpaid. Fails closed: if the
 // check itself errors, nothing is deleted.
 app.delete('/auction/:id', requireAdmin, async (req, res) => {
-  // orders.auction_id is a TEXT column (auctions.id is uuid), so the order
-  // check below is a case-sensitive string match while the auction delete is a
-  // case-insensitive uuid match. req.params.id is already a canonical lowercase
-  // uuid (app.param above), so the two can't disagree.
+  // req.params.id is already a canonical lowercase uuid (app.param above).
   const auctionId = req.params.id;
   const { data: existing, error: ordersErr } = await supabase
     .from('orders')
@@ -2645,12 +2643,28 @@ app.patch('/auction/:id/items/:itemId', requireAdmin, async (req, res) => {
 });
 
 app.delete('/auction/:id/items/:itemId', requireAdmin, async (req, res) => {
-  await supabase.from('auction_items').delete().eq('id', req.params.itemId).eq('auction_id', req.params.id);
+  // A lot that has an order cannot be deleted: orders.item_id references it
+  // (NO ACTION), so Postgres refuses with 23503. Report that - this used to
+  // ignore the error and answer { success: true } for a lot still sitting there
+  // (the same lie #45 fixed for DELETE /auction/:id). Its pre-bids, images,
+  // outbid-log rows and bids cascade with it when the delete does go through.
+  const { error } = await supabase.from('auction_items').delete().eq('id', req.params.itemId).eq('auction_id', req.params.id);
+  if (error) {
+    if (error.code === '23503') {
+      return res.status(409).json({
+        error: 'This lot has an order and cannot be deleted',
+        detail: 'Orders are the record of what buyers owe and were sold. Nothing was removed.',
+      });
+    }
+    console.error('DELETE /auction/:id/items/:itemId failed:', req.params.itemId, error.code, error.message);
+    return res.status(500).json({ error: 'Could not delete this lot. Nothing was removed.' });
+  }
   res.json({ success: true });
 });
 
-// auction_items.auction_id is a text column, so compare case-insensitively
-// (a uuid in the URL may be any case; the stored value is canonical lowercase).
+// auction_items.auction_id is uuid (migration 2026-09-24i) and req params are
+// canonical lowercase (app.param), so a plain === would do; the lowercasing is
+// kept as a harmless belt-and-braces from when the column was text.
 function lotBelongsToAuction(item, auctionId) {
   return String(item.auction_id || '').toLowerCase() === String(auctionId).toLowerCase();
 }

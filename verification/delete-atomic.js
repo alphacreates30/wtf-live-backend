@@ -37,7 +37,7 @@ async function boot(name, port, source) {
   for (let i = 0; i < 25; i++) { try { await fetch('http://localhost:' + port + '/auctions'); break; } catch { await sleep(1000); } }
   return { cleanup: () => { child.kill(); try { fs.unlinkSync(file); fs.unlinkSync(runner); } catch {} } };
 }
-const made = { auctions: [] };
+const made = { auctions: [], lots: [] };
 const die = r => { if (r.error) throw new Error(JSON.stringify(r.error)); return r.data; };
 const soon = () => new Date(Date.now() + 36e5).toISOString();
 // an auction with a child row in EVERY dependent table
@@ -52,6 +52,7 @@ async function mk(label) {
   die(await s.from('item_images').insert({ item_id: lots[0], url: 'https://example.invalid/zz.jpg', position: 0 }).select().single());
   die(await s.from('outbid_email_log').insert({ item_id: lots[0], username: 'zztest_delatomic' }).select().single());
   die(await s.from('auction_terms_acceptances').insert({ auction_id: a.id, user_id: 'zztest-delatomic', buyers_premium_pct: 15, fulfillment_mode: 'shipping', fulfillment_choice: 'shipping', terms_version: 'zz' }).select().single());
+  made.lots.push(...lots);
   return { id: a.id, lots };
 }
 const count = async (t, col, val) => (await s.from(t).select('*', { count: 'exact', head: true }).in(col, Array.isArray(val) ? val : [val])).count;
@@ -72,7 +73,7 @@ const del = (port, id) => fetch('http://localhost:' + port + '/auction/' + id, {
     // (a random id returns early, so also exercise it on a real row: e's first version passed this preflight and then failed on text = uuid)
     const probe = die(await s.from('auctions').insert({ title: 'ZZTEST_delatomic_preflight', description: 'x', status: 'ended', mode: 'standard', fulfillment_mode: 'shipping', host_username: 'whatthefind', ends_at: new Date().toISOString() }).select().single());
     made.auctions.push(probe.id);
-    die(await s.from('auction_items').insert({ auction_id: probe.id, title: 'ZZTEST_delatomic preflight lot', starting_bid: 0, position: 0, status: 'pending', ends_at: soon() }).select().single());
+    made.lots.push(die(await s.from('auction_items').insert({ auction_id: probe.id, title: 'ZZTEST_delatomic preflight lot', starting_bid: 0, position: 0, status: 'pending', ends_at: soon() }).select().single()).id);
     const pre = await s.rpc('delete_auction_cascade', { p_auction_id: probe.id });
     if (pre.error) { console.error('\nmigrations/2026-09-20e + 20f (delete-auction-cascade) not applied, or broken (' + pre.error.code + ' ' + pre.error.message + ').\n'); process.exit(2); }
     const oldSrc = require('./guard').sourceAt(OLD_COMMIT, BE);
@@ -108,9 +109,28 @@ const del = (port, id) => fetch('http://localhost:' + port + '/auction/' + id, {
     ok(r.s === 200, `NEW: deleting an already-deleted auction is still a harmless ${r.s} (unchanged behaviour)`);
   } finally {
     servers.forEach(x => x.cleanup());
-    for (const id of made.auctions) { await s.from('orders').delete().eq('auction_id', id); await s.from('invoices').delete().eq('auction_id', id); await s.from('auctions').delete().eq('id', id); }
-    const left = (await s.from('auctions').select('id').like('title', 'ZZTEST_delatomic_%')).data.length + (await s.from('orders').select('id').eq('buyer_username', 'zztest_delatomic')).data.length + (await s.from('invoices').select('id').eq('buyer_username', 'zztest_delatomic')).data.length;
-    console.log('\nleftover throwaway rows:', left);
+    // Orders and invoices first (they RESTRICT the auction), then the same transactional function the route uses.
+    // A bare `delete from auctions` here used to leave every surviving fixture's lots and pre-bids behind (nothing
+    // cascades from auctions to either) while still printing "leftover: 0" - 35 lots and 49 pre-bids of debris had
+    // piled up by 2026-09-24 (#44). Since migration 2026-09-24j it would be refused outright.
+    for (const id of made.auctions) {
+      await s.from('orders').delete().eq('auction_id', id); await s.from('invoices').delete().eq('auction_id', id);
+      const r = await s.rpc('delete_auction_cascade', { p_auction_id: id });
+      if (r.error) console.log('  cleanup: delete_auction_cascade', id, r.error.code, r.error.message);
+    }
+    // Scoped to THIS run's ids, and covering every table a fixture writes to - not just auctions/orders/invoices.
+    const n = async (t, col, ids) => ids.length ? (await s.from(t).select('*', { count: 'exact', head: true }).in(col, ids)).count : 0;
+    const leftBy = {
+      auctions: await n('auctions', 'id', made.auctions),
+      orders: (await s.from('orders').select('id').eq('buyer_username', 'zztest_delatomic')).data.length,
+      invoices: (await s.from('invoices').select('id').eq('buyer_username', 'zztest_delatomic')).data.length,
+      lots: await n('auction_items', 'id', made.lots),
+      pre_bids: await n('pre_bids', 'item_id', made.lots),
+      images: await n('item_images', 'item_id', made.lots),
+    };
+    const left = Object.values(leftBy).reduce((a, b) => a + b, 0);
+    console.log('\nleftover throwaway rows:', left, left ? JSON.stringify(leftBy) : '');
+    if (left) fails++;
   }
   console.log(fails ? '\n' + fails + ' FAILED' : '\nALL PASS');
   process.exit(fails ? 1 : 0);
