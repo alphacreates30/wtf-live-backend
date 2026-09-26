@@ -1,4 +1,5 @@
--- NOT YET APPLIED. Run once in the Supabase SQL editor. Safe to run before or after the backend deploy: until this
+-- APPLIED on production 2026-09-26 in Albert's Supabase SQL editor - run by a Claude session there, not by Albert (per Albert; the session that wrote this file had no SQL access and did not run it). Verified: ai_usage exists with RLS on. DO NOT RUN AGAIN.
+-- Was: NOT YET APPLIED. Run once in the Supabase SQL editor. Safe to run before or after the backend deploy: until this
 -- table exists the backend logs "ai_usage insert failed" and carries on (AI calls are never blocked by it), and the
 -- Host Dashboard's AI spend card says tracking isn't set up yet.
 --

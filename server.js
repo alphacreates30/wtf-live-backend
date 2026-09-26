@@ -782,18 +782,28 @@ const RESET_TTL_MS = 60 * 60 * 1000;
 const RESET_MAX_PER_HOUR = 3;   // per account: stops the form being used to flood someone's inbox
 const sha256 = v => crypto.createHash('sha256').update(v).digest('hex');
 
+// The limit is enforced insert-first: count-then-insert let parallel requests
+// all count before any of them inserted (4 of 4 sent, measured). Each request
+// inserts its link, then keeps it only if it is among the first
+// RESET_MAX_PER_HOUR in the window by id (identity order is fixed, so every
+// racer agrees which ones those are); otherwise it deletes its own row and
+// sends nothing. Fails closed: if the check errors, nothing is sent.
 async function sendPasswordReset(user) {
   const since = new Date(Date.now() - RESET_TTL_MS).toISOString();
-  const { count, error: countErr } = await supabase.from('password_resets')
-    .select('id', { count: 'exact', head: true }).eq('user_id', user.id).gte('created_at', since);
-  if (countErr) { console.error('password reset: count failed:', countErr.message); return; }
-  if ((count || 0) >= RESET_MAX_PER_HOUR) { console.error(`password reset: rate limited for ${user.username}`); return; }
-
   const token = crypto.randomBytes(32).toString('base64url');
-  const { error } = await supabase.from('password_resets').insert({
+  const { data: row, error } = await supabase.from('password_resets').insert({
     user_id: user.id, token_hash: sha256(token), expires_at: new Date(Date.now() + RESET_TTL_MS).toISOString(),
-  });
+  }).select('id').single();
   if (error) { console.error('password reset: insert failed:', error.message); return; }
+
+  const { data: first, error: limErr } = await supabase.from('password_resets')
+    .select('id').eq('user_id', user.id).gte('created_at', since)
+    .order('id', { ascending: true }).limit(RESET_MAX_PER_HOUR);
+  if (limErr || !first.some(r => r.id === row.id)) {
+    await supabase.from('password_resets').delete().eq('id', row.id);
+    console.error(limErr ? `password reset: limit check failed: ${limErr.message}` : `password reset: rate limited for ${user.username}`);
+    return;
+  }
 
   const link = `${SITE_URL}/reset-password?token=${token}`;
   await sendEmail({

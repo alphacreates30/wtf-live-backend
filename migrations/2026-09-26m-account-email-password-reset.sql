@@ -1,4 +1,5 @@
--- NOT YET APPLIED. Run once in the Supabase SQL editor, BEFORE deploying the backend commit that adds password
+-- APPLIED on production 2026-09-26 in Albert's Supabase SQL editor - run by a Claude session there, not by Albert (per Albert; the session that wrote this file had no SQL access and did not run it). Verified: users = 28 accounts, 13 with email, 0 with password_changed_at; password_resets exists with RLS on. DO NOT RUN AGAIN.
+-- Was: NOT YET APPLIED. Run once in the Supabase SQL editor, BEFORE deploying the backend commit that adds password
 -- reset. That backend reads users.password_changed_at on every signed-in request (and users.email at registration):
 -- deployed without this migration, every logged-in request would fail with 503. Safe to run while the CURRENT
 -- backend is live - it only adds columns, an index and a table. Idempotent.

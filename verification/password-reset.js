@@ -148,7 +148,8 @@ async function mkUser(n, email, password = 'oldpass1') {
 
   // --- rate limit: 3 links per account per hour (b already has 1 real + 1 expired row) ---
   clearMail();
-  for (let i = 0; i < 4; i++) await call('/auth/forgot-password', { body: { identifier: uname('b') } });
+  // All at once: count-then-insert let 4 of 4 through this way (the first run of this suite caught it).
+  await Promise.all([0, 1, 2, 3].map(() => call('/auth/forgot-password', { body: { identifier: uname('b') } })));
   await sleep(4000);
   const bRows = await s.from('password_resets').select('id').eq('user_id', b.id).gte('created_at', new Date(Date.now() - 36e5).toISOString());
   ok(bRows.data.length === 3 && mails().length === 1, `rate limited at 3 per hour (rows ${bRows.data.length}, new emails ${mails().length})`);
