@@ -18,6 +18,22 @@ const Anthropic = require('@anthropic-ai/sdk');
 
 const MODEL = 'claude-sonnet-5';
 
+// USD per million tokens, for the AI spend log (ai_usage). Cache writes are the
+// 5-minute TTL cacheableSystem() uses (1.25x input); cache reads are 0.1x.
+// Update alongside MODEL - an unpriced model logs tokens with cost_usd null.
+const PRICES = {
+  'claude-sonnet-5': { input: 2, output: 10, cacheWrite: 2.5, cacheRead: 0.2 },
+};
+
+function costUsd(model, u) {
+  const p = PRICES[model];
+  if (!p || !u) return null;
+  return ((u.input_tokens || 0) * p.input
+    + (u.output_tokens || 0) * p.output
+    + (u.cache_creation_input_tokens || 0) * p.cacheWrite
+    + (u.cache_read_input_tokens || 0) * p.cacheRead) / 1e6;
+}
+
 let _client = null;
 function client() {
   if (!process.env.ANTHROPIC_API_KEY) {
@@ -228,7 +244,9 @@ function repairGroups(groups, n) {
 // 1. Grouping
 // ---------------------------------------------------------------------------
 
-async function groupPhotosSingleCall(thumbs) {
+// Every exported call takes an optional `track(kind, response)`, called once per
+// Claude response so the caller can log what it cost. It must not throw.
+async function groupPhotosSingleCall(thumbs, track) {
   const content = [];
   thumbs.forEach((t, i) => {
     content.push({ type: 'text', text: `Photo ${i}:` });
@@ -245,6 +263,7 @@ async function groupPhotosSingleCall(thumbs) {
     system: cacheableSystem(GROUPING_SYSTEM_PROMPT),
     messages: [{ role: 'user', content }],
   }, { maxRetries: 5 });
+  track?.('group', response);
 
   let groups;
   try {
@@ -268,14 +287,14 @@ async function groupPhotosSingleCall(thumbs) {
  *
  * Returns [[0,1,2],[3,4]] with every index appearing exactly once.
  */
-async function groupPhotos(thumbs, chunkSize = GROUPING_CHUNK_SIZE) {
+async function groupPhotos(thumbs, chunkSize = GROUPING_CHUNK_SIZE, track) {
   if (!thumbs || !thumbs.length) return [];
-  if (thumbs.length <= chunkSize) return groupPhotosSingleCall(thumbs);
+  if (thumbs.length <= chunkSize) return groupPhotosSingleCall(thumbs, track);
 
   const groups = [];
   for (let start = 0; start < thumbs.length; start += chunkSize) {
     const chunk = thumbs.slice(start, start + chunkSize);
-    const chunkGroups = await groupPhotosSingleCall(chunk);
+    const chunkGroups = await groupPhotosSingleCall(chunk, track);
     for (const g of chunkGroups) groups.push(g.map(i => start + i));
   }
   return groups;
@@ -294,7 +313,7 @@ async function groupPhotos(thumbs, chunkSize = GROUPING_CHUNK_SIZE) {
  * model lead the title with the count - it reads that off the photos rather
  * than being told.
  */
-async function analyzeLot(images, condition = '') {
+async function analyzeLot(images, condition = '', track) {
   if (!images || !images.length) throw new Error('No images provided to analyze.');
 
   const content = images.map(toImageBlock);
@@ -315,6 +334,7 @@ async function analyzeLot(images, condition = '') {
     // than losing the lot to a blip the caller (analyzeAll) can't see.
     maxRetries: 5,
   });
+  track?.('analyze', response);
 
   const raw = textOf(response);
   try {
@@ -338,7 +358,7 @@ async function analyzeLot(images, condition = '') {
 // 3. Description regeneration from a corrected title
 // ---------------------------------------------------------------------------
 
-async function regenerateDescription(correctedTitle, condition = '') {
+async function regenerateDescription(correctedTitle, condition = '', track) {
   if (!correctedTitle) throw new Error('A corrected title is required.');
 
   let prompt = `The corrected lot title is: ${correctedTitle}`;
@@ -350,6 +370,7 @@ async function regenerateDescription(correctedTitle, condition = '') {
     system: cacheableSystem(CORRECTION_SYSTEM_PROMPT),
     messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
   });
+  track?.('regenerate', response);
 
   const raw = textOf(response);
   try {
@@ -369,4 +390,5 @@ module.exports = {
   GROUPING_CHUNK_SIZE,
   PHOTO_SOFT_CAP,
   MODEL,
+  costUsd,
 };

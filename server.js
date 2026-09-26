@@ -2368,6 +2368,66 @@ app.get('/admin/auctions/summary', requireAdmin, async (req, res) => {
   res.json((auctions || []).map((a, i) => ({ ...a, order_count: counts[i].count ?? 0 })));
 });
 
+// AI spend for the Host Dashboard, from the ai_usage log. Totals are summed
+// here rather than shipping every row: all time, per day (in the caller's time
+// zone, so "today" and "this month" match the host's calendar), per auction.
+app.get('/admin/ai-usage', requireAdmin, async (req, res) => {
+  let tz = 'UTC';
+  try { if (req.query.tz) { new Intl.DateTimeFormat('en-CA', { timeZone: String(req.query.tz) }); tz = String(req.query.tz); } } catch {}
+  const dayOf = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
+
+  // PostgREST caps a response at 1000 rows, so page through.
+  const rows = [];
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await supabase.from('ai_usage')
+      .select('id, created_at, kind, auction_id, cost_usd')
+      .order('id', { ascending: true })
+      .range(from, from + 999);
+    if (error) {
+      if (error.code === '42P01' || error.code === 'PGRST205') {
+        return res.status(503).json({ error: 'AI spend tracking is not set up yet', detail: 'Run migration 2026-09-26l-ai-usage.sql in the Supabase SQL editor.' });
+      }
+      return res.status(500).json({ error: 'Could not load AI spend' });
+    }
+    rows.push(...data);
+    if (data.length < 1000) break;
+  }
+
+  const byDay = {}, byAuction = {}, byKind = {};
+  let total = 0, unpriced = 0;
+  for (const r of rows) {
+    const cost = r.cost_usd == null ? 0 : Number(r.cost_usd);
+    if (r.cost_usd == null) unpriced++;
+    total += cost;
+    const day = dayOf.format(new Date(r.created_at));
+    (byDay[day] ||= { cost: 0, calls: 0 }); byDay[day].cost += cost; byDay[day].calls++;
+    const k = r.auction_id || 'none';
+    (byAuction[k] ||= { cost: 0, calls: 0 }); byAuction[k].cost += cost; byAuction[k].calls++;
+    (byKind[r.kind] ||= { cost: 0, calls: 0 }); byKind[r.kind].cost += cost; byKind[r.kind].calls++;
+  }
+
+  const ids = Object.keys(byAuction).filter(k => k !== 'none');
+  const titles = {};
+  if (ids.length) {
+    const { data } = await supabase.from('auctions').select('id, title').in('id', ids);
+    for (const a of data || []) titles[a.id] = a.title;
+  }
+  res.json({
+    tz,
+    total: { cost: total, calls: rows.length, unpriced_calls: unpriced },
+    by_day: byDay,
+    by_kind: byKind,
+    by_auction: Object.entries(byAuction)
+      .map(([id, v]) => ({
+        auction_id: id === 'none' ? null : id,
+        title: id === 'none' ? null : (titles[id] ?? null),
+        deleted: id !== 'none' && !(id in titles),
+        ...v,
+      }))
+      .sort((a, b) => b.cost - a.cost),
+  });
+});
+
 // Loads order_ids and rejects the request if any is missing, not found, or
 // set to local pickup - shared by the quote and charge+buy steps so neither
 // can silently drift from the other's notion of "valid orders for this
@@ -2819,9 +2879,35 @@ const PORT = process.env.PORT || 3001;
 // JSON bodies of base64 photos are far larger than the default 100kb limit.
 const aiJson = express.json({ limit: '60mb' });
 
+// AI spend log: one ai_usage row per Claude response (migration 2026-09-26l).
+// Fire-and-forget - the host is waiting on the AI result, so a failed insert
+// (e.g. the migration not run yet) is logged and never fails the request.
+// auction_id is optional in each AI route's body, for the per-auction breakdown.
+function aiUsageTracker(req) {
+    const auctionId = req.body?.auction_id || null;
+    return (kind, response) => {
+        const u = response?.usage || {};
+        const model = response?.model || aiLots.MODEL;
+        supabase.from('ai_usage').insert({
+            kind,
+            model,
+            auction_id: auctionId,
+            username: req.user?.username || null,
+            input_tokens: u.input_tokens || 0,
+            output_tokens: u.output_tokens || 0,
+            cache_creation_input_tokens: u.cache_creation_input_tokens || 0,
+            cache_read_input_tokens: u.cache_read_input_tokens || 0,
+            cost_usd: aiLots.costUsd(model, u),
+        }).then(({ error }) => {
+            if (error) console.error('ai_usage insert failed:', error.code, error.message);
+        }, e => console.error('ai_usage insert failed:', e.message));
+    };
+}
+const aiIds = normalizeBodyIds({ single: ['auction_id'] });
+
 // Step 1: which photos belong to the same lot. Thumbnails only - small and
 // cheap, since this pass only needs to tell items apart, not read maker marks.
-app.post('/ai/group-photos', requireAdmin, aiJson, async (req, res) => {
+app.post('/ai/group-photos', requireAdmin, aiJson, aiIds, async (req, res) => {
     const thumbnails = req.body?.thumbnails;
     if (!Array.isArray(thumbnails) || !thumbnails.length) {
         return res.status(400).json({ error: 'thumbnails array is required' });
@@ -2833,7 +2919,7 @@ app.post('/ai/group-photos', requireAdmin, aiJson, async (req, res) => {
         });
     }
     try {
-        const groups = await aiLots.groupPhotos(thumbnails);
+        const groups = await aiLots.groupPhotos(thumbnails, undefined, aiUsageTracker(req));
         res.json({ groups, photo_count: thumbnails.length, lot_count: groups.length });
     } catch (e) {
         console.error('AI grouping failed:', e.message);
@@ -2843,13 +2929,13 @@ app.post('/ai/group-photos', requireAdmin, aiJson, async (req, res) => {
 
 // Step 2: catalogue one confirmed group. Higher-resolution images than step 1,
 // because this pass reads labels, signatures and damage.
-app.post('/ai/analyze-lot', requireAdmin, aiJson, async (req, res) => {
+app.post('/ai/analyze-lot', requireAdmin, aiJson, aiIds, async (req, res) => {
     const { images, condition } = req.body || {};
     if (!Array.isArray(images) || !images.length) {
         return res.status(400).json({ error: 'images array is required' });
     }
     try {
-        const analysis = await aiLots.analyzeLot(images, condition || '');
+        const analysis = await aiLots.analyzeLot(images, condition || '', aiUsageTracker(req));
         res.json(analysis);
     } catch (e) {
         console.error('AI analysis failed:', e.message);
@@ -2859,11 +2945,11 @@ app.post('/ai/analyze-lot', requireAdmin, aiJson, async (req, res) => {
 
 // Step 2b: host corrected a wrong title and wants the body rewritten to match.
 // Text-only - no photos, so it is fast and cheap.
-app.post('/ai/regenerate-description', requireAdmin, async (req, res) => {
+app.post('/ai/regenerate-description', requireAdmin, aiIds, async (req, res) => {
     const { title, condition } = req.body || {};
     if (!title) return res.status(400).json({ error: 'title is required' });
     try {
-        const result = await aiLots.regenerateDescription(title, condition || '');
+        const result = await aiLots.regenerateDescription(title, condition || '', aiUsageTracker(req));
         res.json(result);
     } catch (e) {
         console.error('AI regeneration failed:', e.message);
