@@ -538,15 +538,72 @@ async function notifyShipped(orderId) {
 }
 
 // -- Auth middleware --
+// ---- Sessions ----
+// Changing a password (reset link, host temporary password, admin change) signs
+// out every existing session. Each token carries the account's
+// password_changed_at from when it was issued (claim `pca`, epoch ms); a token
+// older than the account's current value is refused. Tokens with no claim were
+// issued before this existed and stay valid until the account's password next
+// changes; an account with no recorded change (or no row) has nothing to
+// compare against, which is how things behaved before.
+//
+// Looked up through a 60s per-user cache so it isn't a DB hit per request. The
+// instance that made the change updates its cache at once; any other instance
+// (Railway briefly runs two during a deploy) can accept a revoked token for up
+// to 60s.
+const MIN_PASSWORD = 8;   // for newly set passwords; existing shorter ones still log in
+const PCA_TTL_MS = 60 * 1000;
+const pcaCache = new Map();   // userId -> { pca: ms | null, at: ms }
+
+async function currentPca(userId) {
+  const id = canonicalUuid(userId);
+  if (!id) return { pca: null };
+  const hit = pcaCache.get(id);
+  if (hit && Date.now() - hit.at < PCA_TTL_MS) return hit;
+  const { data, error } = await supabase.from('users').select('password_changed_at').eq('id', id).maybeSingle();
+  if (error) {
+    if (hit) return hit;   // serve stale rather than fail every request on a blip
+    throw error;
+  }
+  const entry = { pca: data?.password_changed_at ? Date.parse(data.password_changed_at) : null, at: Date.now() };
+  if (pcaCache.size > 50000) pcaCache.clear();
+  pcaCache.set(id, entry);
+  return entry;
+}
+
+function notePasswordChanged(userId, iso) {
+  const id = canonicalUuid(userId);
+  if (id) pcaCache.set(id, { pca: Date.parse(iso), at: Date.now() });
+}
+
+async function sessionValid(claims) {
+  const { pca } = await currentPca(claims.id);
+  if (pca == null) return true;
+  return typeof claims.pca === 'number' && claims.pca >= pca;
+}
+
+function signSession(user) {
+  const pca = user.password_changed_at ? Date.parse(user.password_changed_at) : undefined;
+  return jwt.sign({ id: user.id, username: user.username, ...(pca ? { pca } : {}) }, JWT_SECRET, { expiresIn: '30d' });
+}
+
 function requireAuth(req, res, next) {
   const auth = req.headers.authorization;
   if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing token' });
+  let claims;
   try {
-    req.user = jwt.verify(auth.slice(7), JWT_SECRET);
-    next();
+    claims = jwt.verify(auth.slice(7), JWT_SECRET);
   } catch {
-    res.status(401).json({ error: 'Invalid token' });
+    return res.status(401).json({ error: 'Invalid token' });
   }
+  sessionValid(claims).then(valid => {
+    if (!valid) return res.status(401).json({ error: 'Your password was changed, so you were signed out. Please log in again.', code: 'session_revoked' });
+    req.user = claims;
+    next();
+  }, e => {
+    console.error('session check failed:', e.message);
+    res.status(503).json({ error: 'Could not check your session. Try again in a moment.' });
+  });
 }
 
 // ---- Id normalisation at the edge ----
@@ -608,16 +665,28 @@ function requireAdmin(req, res, next) {
 // Decodes a bearer token if present but never rejects the request - lets a
 // route serve different data to a logged-in admin vs. everyone else (e.g.
 // draft auctions) while staying public for anonymous callers.
-function optionalAuth(req, res, next) {
+// A revoked session, or one that can't be checked, is treated as anonymous -
+// the lower-privilege answer.
+async function optionalAuth(req, res, next) {
   const auth = req.headers.authorization;
   if (auth && auth.startsWith('Bearer ')) {
-    try { req.user = jwt.verify(auth.slice(7), JWT_SECRET); } catch { /* not logged in - proceed anonymously */ }
+    try {
+      const claims = jwt.verify(auth.slice(7), JWT_SECRET);
+      if (await sessionValid(claims)) req.user = claims;
+    } catch { /* not logged in - proceed anonymously */ }
   }
   next();
 }
 
-function verifySocketToken(token) {
-  try { return jwt.verify(token, JWT_SECRET); } catch { return null; }
+// Sockets get the same session check as REST: a signed-out session must not
+// keep bidding or chatting over a socket it opened earlier.
+async function verifySocketToken(token) {
+  try {
+    const claims = jwt.verify(token, JWT_SECRET);
+    return (await sessionValid(claims)) ? claims : null;
+  } catch {
+    return null;
+  }
 }
 
 // ------------------------------------------------------------
@@ -648,18 +717,21 @@ app.post('/auth/register', async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: 'username and password required' });
   if (username.length < 3 || username.length > 30) return res.status(400).json({ error: 'Username must be 3-30 characters' });
-  if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  if (password.length < MIN_PASSWORD) return res.status(400).json({ error: `Password must be at least ${MIN_PASSWORD} characters` });
   const email = cleanEmail(req.body.email);
   if (!email) return res.status(400).json({ error: 'A valid email is required', detail: "It's how you reset your password if you forget it." });
 
   const password_hash = await bcrypt.hash(password, 10);
-  const { data, error } = await supabase.from('users').insert({ username, password_hash, email }).select('id, username, email, created_at').single();
+  const { data, error } = await supabase.from('users')
+    .insert({ username, password_hash, email, password_changed_at: new Date().toISOString() })
+    .select('id, username, email, password_changed_at, created_at').single();
   if (error) {
     if (error.code === '23505') return res.status(409).json({ error: 'Username already taken' });
     return res.status(500).json({ error: 'Registration failed' });
   }
-  const token = jwt.sign({ id: data.id, username: data.username }, JWT_SECRET, { expiresIn: '30d' });
-  res.json({ token, user: data });
+  const token = signSession(data);
+  const { password_changed_at, ...user } = data;
+  res.json({ token, user });
 });
 
 app.post('/auth/login', async (req, res) => {
@@ -669,7 +741,7 @@ app.post('/auth/login', async (req, res) => {
   if (error || !user) return res.status(401).json({ error: 'Invalid credentials' });
   const valid = await bcrypt.compare(password, user.password_hash);
   if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
-  const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '30d' });
+  const token = signSession(user);
   res.json({ token, user: { id: user.id, username: user.username, email: user.email || null, created_at: user.created_at } });
 });
 
@@ -760,8 +832,8 @@ app.post('/auth/forgot-password', async (req, res) => {
 app.post('/auth/reset-password', async (req, res) => {
   const { token, new_password } = req.body || {};
   if (typeof token !== 'string' || !token) return res.status(400).json({ error: 'This reset link is incomplete' });
-  if (typeof new_password !== 'string' || new_password.length < 6) {
-    return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  if (typeof new_password !== 'string' || new_password.length < MIN_PASSWORD) {
+    return res.status(400).json({ error: `Password must be at least ${MIN_PASSWORD} characters` });
   }
   const now = new Date().toISOString();
   // Claim the link atomically: only one request can flip used_at from null,
@@ -775,8 +847,9 @@ app.post('/auth/reset-password', async (req, res) => {
 
   const password_hash = await bcrypt.hash(new_password, 10);
   const { data: user, error: upErr } = await supabase.from('users')
-    .update({ password_hash }).eq('id', claimed.user_id).select('username').single();
+    .update({ password_hash, password_changed_at: now }).eq('id', claimed.user_id).select('username').single();
   if (upErr || !user) return res.status(500).json({ error: 'Could not reset your password. Try again.' });
+  notePasswordChanged(claimed.user_id, now);   // signs out every existing session
   // Any other outstanding links for this account are now pointless - retire them.
   await supabase.from('password_resets').update({ used_at: now }).eq('user_id', claimed.user_id).is('used_at', null);
   res.json({ success: true, username: user.username });
@@ -787,14 +860,16 @@ app.post('/auth/reset-password', async (req, res) => {
 // by email later.
 app.post('/admin/users/:userId/password', requireAdmin, async (req, res) => {
   const { new_password } = req.body || {};
-  if (typeof new_password !== 'string' || new_password.length < 6) {
-    return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  if (typeof new_password !== 'string' || new_password.length < MIN_PASSWORD) {
+    return res.status(400).json({ error: `Password must be at least ${MIN_PASSWORD} characters` });
   }
   const password_hash = await bcrypt.hash(new_password, 10);
+  const password_changed_at = new Date().toISOString();
   const { data, error } = await supabase.from('users')
-    .update({ password_hash }).eq('id', req.params.userId).select('username').maybeSingle();
+    .update({ password_hash, password_changed_at }).eq('id', req.params.userId).select('username').maybeSingle();
   if (error) return res.status(500).json({ error: 'Could not set the password' });
   if (!data) return res.status(404).json({ error: 'Account not found' });
+  notePasswordChanged(req.params.userId, password_changed_at);   // signs out the buyer's existing sessions
   console.log(`Admin ${req.user.username} set a temporary password for ${data.username}`);
   res.json({ success: true, username: data.username });
 });
@@ -804,16 +879,19 @@ app.post('/auth/change-password', requireAdmin, async (req, res) => {
   const { current_password, new_password } = req.body;
   if (!current_password || !new_password)
     return res.status(400).json({ error: 'current_password and new_password required' });
-  if (new_password.length < 6)
-    return res.status(400).json({ error: 'New password must be at least 6 characters' });
+  if (new_password.length < MIN_PASSWORD)
+    return res.status(400).json({ error: `New password must be at least ${MIN_PASSWORD} characters` });
   const { data: user } = await supabase.from('users').select('*').eq('username', ADMIN_USERNAME).single();
   if (!user) return res.status(404).json({ error: 'Admin user not found' });
   const valid = await bcrypt.compare(current_password, user.password_hash);
   if (!valid) return res.status(401).json({ error: 'Current password is incorrect' });
   const password_hash = await bcrypt.hash(new_password, 10);
-  const { error: updateErr } = await supabase.from('users').update({ password_hash }).eq('username', ADMIN_USERNAME);
+  const password_changed_at = new Date().toISOString();
+  const { error: updateErr } = await supabase.from('users').update({ password_hash, password_changed_at }).eq('username', ADMIN_USERNAME);
   if (updateErr) return res.status(500).json({ error: 'Failed to update password' });
-  res.json({ success: true });
+  notePasswordChanged(user.id, password_changed_at);
+  // This signs out every session, including the one making the change - hand it a fresh token.
+  res.json({ success: true, token: signSession({ ...user, password_changed_at }) });
 });
 
 app.post('/profile', requireAuth, async (req, res) => {
@@ -1652,7 +1730,7 @@ io.on('connection', (socket) => {
     // Support legacy string-only calls
     if (typeof auctionId === 'string' && !token) { /* auctionId already set */ }
 
-    const user = token ? verifySocketToken(token) : null;
+    const user = token ? await verifySocketToken(token) : null;
 
     // Drafts are private - resolve this BEFORE joining the room or emitting
     // any state (auction_state/bid_history/chat_history). Checking after
@@ -1718,7 +1796,7 @@ io.on('connection', (socket) => {
   // is only wired into autoCloseStandardItems, not the live socket path).
   // Don't re-enable without fixing both.
   socket.on('place_bid', async ({ auctionId, amount, token }) => {
-    const user = verifySocketToken(token);
+    const user = await verifySocketToken(token);
     if (!user) { socket.emit('bid_error', { message: 'You must be logged in to bid' }); return; }
 
     // Re-check approval
@@ -1742,7 +1820,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('send_chat', async ({ auctionId, text, token }) => {
-    const user = verifySocketToken(token);
+    const user = await verifySocketToken(token);
     if (!user) { socket.emit('chat_error', { message: 'You must be logged in to chat' }); return; }
     if (!text || !text.trim()) return;
     const clean = text.trim().slice(0, 200);
@@ -1762,7 +1840,7 @@ io.on('connection', (socket) => {
 
   // -- Admin: block user mid-auction --
     socket.on('block_user', async ({ targetUserId, targetUsername, auctionId, token }) => {
-    const admin = verifySocketToken(token);
+    const admin = await verifySocketToken(token);
     if (!admin || admin.username !== ADMIN_USERNAME) {
       socket.emit('host_error', { message: 'Admin only' }); return;
     }
@@ -1804,7 +1882,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('start_auction', async ({ auctionId, token }) => {
-    const user = verifySocketToken(token);
+    const user = await verifySocketToken(token);
     if (!user) return socket.emit('host_error', { message: 'Unauthorized' });
     const { data: auction } = await supabase.from('auctions').select('host_username, status, ends_at').eq('id', auctionId).single();
     if (!auction || auction.host_username !== user.username) return socket.emit('host_error', { message: 'Only the host can start this auction' });
@@ -1816,7 +1894,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('end_auction', async ({ auctionId, token }) => {
-    const user = verifySocketToken(token);
+    const user = await verifySocketToken(token);
     if (!user) return socket.emit('host_error', { message: 'Unauthorized' });
     const { data: auction } = await supabase.from('auctions').select('host_username, leading_bidder, current_bid').eq('id', auctionId).single();
     if (!auction || auction.host_username !== user.username) return socket.emit('host_error', { message: 'Only the host can end this auction' });
@@ -1828,7 +1906,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('extend_auction', async ({ auctionId, extraSeconds, token }) => {
-    const user = verifySocketToken(token);
+    const user = await verifySocketToken(token);
     if (!user) return socket.emit('host_error', { message: 'Unauthorized' });
     const { data: auction } = await supabase.from('auctions').select('host_username, ends_at, status').eq('id', auctionId).single();
     if (!auction || auction.host_username !== user.username) return socket.emit('host_error', { message: 'Only the host can extend this auction' });
@@ -1843,7 +1921,7 @@ io.on('connection', (socket) => {
 
 
   socket.on('next_item', async ({ auctionId, token, timerSeconds = 60 }) => {
-    const user = verifySocketToken(token);
+    const user = await verifySocketToken(token);
     if (!user || user.username !== ADMIN_USERNAME) return socket.emit('host_error', { message: 'Admin only' });
     await supabase.from('auction_items').update({ status: 'sold' }).eq('auction_id', auctionId).eq('status', 'active');
     const { data: nextItem } = await supabase.from('auction_items').select('*').eq('auction_id', auctionId).eq('status', 'pending').order('position', { ascending: true }).limit(1).single();

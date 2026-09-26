@@ -1,4 +1,5 @@
-// Account email + forgotten-password reset (migration 2026-09-26m). Needs that
+// Account email + forgotten-password reset + password changes signing out
+// existing sessions + 8-character minimum (migration 2026-09-26m). Needs that
 // migration applied. Emails are NOT sent: the variant's sendEmail() writes each
 // message to a local file instead, which is how this suite reads the links.
 // Throwaway accounts are named zztest_pw_* and deleted afterwards.
@@ -26,19 +27,19 @@ const shared = `zztest-${tag}@example.invalid`;
 
 const SEND_SIG = "async function sendEmail({ from, to, subject, html, text, kind = 'other' }) {";
 const files = [MAIL];
-let child;
-async function start() {
+const children = [];
+async function start(port = PORT) {
   if (!src.includes(SEND_SIG)) throw new Error('sendEmail signature marker not found');
   const out = src.replace(SEND_SIG, SEND_SIG + "\n  require('fs').appendFileSync(" + JSON.stringify(MAIL) + ", JSON.stringify({ to, subject, text, kind }) + '\\n'); return;");
-  const file = BE + '/server.tmp-pwreset.js', runner = BE + '/run.tmp-pwreset.js';
+  const file = BE + '/server.tmp-pwreset.js', runner = BE + '/run.tmp-pwreset-' + port + '.js';
   fs.writeFileSync(file, out);
-  fs.writeFileSync(runner, "global.setInterval = () => 0; process.env.PORT='" + PORT + "'; require('./server.tmp-pwreset.js');");
+  fs.writeFileSync(runner, "global.setInterval = () => 0; process.env.PORT='" + port + "'; require('./server.tmp-pwreset.js');");
   files.push(file, runner);
-  child = spawn(process.execPath, [runner], { cwd: BE, stdio: 'ignore' });
+  children.push(spawn(process.execPath, [runner], { cwd: BE, stdio: 'ignore' }));
   await sleep(5000);
 }
-const call = (path, { method = 'POST', body, tok } = {}) =>
-  fetch('http://localhost:' + PORT + path, { method, headers: { 'Content-Type': 'application/json', ...(tok ? { Authorization: 'Bearer ' + tok } : {}) }, body: body && JSON.stringify(body) })
+const call = (path, { method = 'POST', body, tok, port = PORT } = {}) =>
+  fetch('http://localhost:' + port + path, { method, headers: { 'Content-Type': 'application/json', ...(tok ? { Authorization: 'Bearer ' + tok } : {}) }, body: body && JSON.stringify(body) })
     .then(async r => ({ s: r.status, j: await r.json().catch(() => null) }));
 const mails = () => fs.existsSync(MAIL) ? fs.readFileSync(MAIL, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse) : [];
 const clearMail = () => { try { fs.unlinkSync(MAIL); } catch {} };
@@ -56,13 +57,18 @@ async function mkUser(n, email, password = 'oldpass1') {
   await start();
 
   // --- registration requires an email ---
-  const noEmail = await call('/auth/register', { body: { username: uname('r0'), password: 'secret1' } });
-  const badEmail = await call('/auth/register', { body: { username: uname('r0'), password: 'secret1', email: 'not-an-email' } });
+  const noEmail = await call('/auth/register', { body: { username: uname('r0'), password: 'secret12' } });
+  const badEmail = await call('/auth/register', { body: { username: uname('r0'), password: 'secret12', email: 'not-an-email' } });
   ok(noEmail.s === 400 && badEmail.s === 400, `register without / with a bad email is refused (${noEmail.s}, ${badEmail.s})`);
-  const reg = await call('/auth/register', { body: { username: uname('r1'), password: 'secret1', email: '  Buyer.' + tag + '@Example.INVALID ' } });
-  ok(reg.s === 200 && reg.j.user.email === `buyer.${tag}@example.invalid`, 'register with email: stored trimmed + lowercased');
-  const li = await login(uname('r1'), 'secret1');
+  const seven = await call('/auth/register', { body: { username: uname('r0'), password: 'secret1', email: `r0-${tag}@example.invalid` } });
+  ok(seven.s === 400 && /at least 8/.test(seven.j.error), 'register with a 7-character password is refused (min 8)');
+  const reg = await call('/auth/register', { body: { username: uname('r1'), password: 'secret12', email: '  Buyer.' + tag + '@Example.INVALID ' } });
+  ok(reg.s === 200 && reg.j.user.email === `buyer.${tag}@example.invalid` && !('password_changed_at' in reg.j.user), 'register with email: stored trimmed + lowercased');
+  ok(typeof jwt.decode(reg.j.token).pca === 'number', 'a new token carries the account\'s password_changed_at (pca)');
+  const li = await login(uname('r1'), 'secret12');
   ok(li.s === 200 && li.j.user.email === `buyer.${tag}@example.invalid` && !('password_hash' in li.j.user), 'login returns the email, never the hash');
+  const shortOld = await mkUser('short', `short-${tag}@example.invalid`, 'six666');
+  ok((await login(uname('short'), 'six666')).s === 200, 'an existing 6-character password still logs in');
 
   // --- accounts without an email: /auth/me + /auth/email ---
   const legacy = await mkUser('legacy', null);
@@ -99,15 +105,34 @@ async function mkUser(n, email, password = 'oldpass1') {
   const tokA2 = linkToken(m.find(x => x.text.includes(uname('a'))));
 
   // --- reset ---
-  const short = await call('/auth/reset-password', { body: { token: tokA1, new_password: '123' } });
-  ok(short.s === 400, 'too-short new password refused (link not consumed)');
+  // Sessions open before the reset: one issued by login, and one with no pca
+  // claim at all (as tokens issued before this feature look).
+  const preLogin = (await login(uname('a'), 'oldpass1')).j.token;
+  const preLegacy = jwt.sign({ id: a.id, username: a.username }, process.env.JWT_SECRET, { expiresIn: '10m' });
+  const preMe = await call('/auth/me', { method: 'GET', tok: preLogin });
+  const preMeLegacy = await call('/auth/me', { method: 'GET', tok: preLegacy });
+  ok(preMe.s === 200 && preMeLegacy.s === 200, 'before the reset both sessions work (account has no recorded change yet)');
+  const short = await call('/auth/reset-password', { body: { token: tokA1, new_password: 'seven77' } });
+  ok(short.s === 400 && /at least 8/.test(short.j.error), 'reset to a 7-character password refused (link not consumed)');
   const [r1, r2] = await Promise.all([
     call('/auth/reset-password', { body: { token: tokA1, new_password: 'newpass1' } }),
     call('/auth/reset-password', { body: { token: tokA1, new_password: 'hijack99' } }),
   ]);
   ok([r1.s, r2.s].sort().join() === '200,400', `same link submitted twice at once: exactly one succeeds (${r1.s}, ${r2.s})`);
   const winner = r1.s === 200 ? 'newpass1' : 'hijack99';
-  ok((await login(uname('a'), winner)).s === 200 && (await login(uname('a'), 'oldpass1')).s === 401, 'new password works, old one no longer does');
+  const post = await login(uname('a'), winner);
+  ok(post.s === 200 && (await login(uname('a'), 'oldpass1')).s === 401, 'new password works, old one no longer does');
+  const afterMe = await call('/auth/me', { method: 'GET', tok: preLogin });
+  const afterLegacy = await call('/auth/me', { method: 'GET', tok: preLegacy });
+  ok(afterMe.s === 401 && afterMe.j?.code === 'session_revoked', `token issued before the reset is rejected after it (${afterMe.s} ${afterMe.j?.code})`);
+  ok(afterLegacy.s === 401 && afterLegacy.j?.code === 'session_revoked', 'token with no pca claim is rejected after the reset');
+  ok((await call('/auth/me', { method: 'GET', tok: post.j.token })).s === 200, 'a session started after the reset works');
+  // A second instance started now has an empty cache, so it decides from the
+  // database - what any other Railway instance sees once its 60s entry lapses.
+  await start(PORT + 1);
+  const fresh = await call('/auth/me', { method: 'GET', tok: preLogin, port: PORT + 1 });
+  const freshNew = await call('/auth/me', { method: 'GET', tok: post.j.token, port: PORT + 1 });
+  ok(fresh.s === 401 && freshNew.s === 200, `another instance, deciding from the database, agrees (${fresh.s}, ${freshNew.s})`);
   const reuse = await call('/auth/reset-password', { body: { token: tokA1, new_password: 'again123' } });
   ok(reuse.s === 400 && /expired or was already used/.test(reuse.j.error), 'used link refused');
   const sibling = await call('/auth/reset-password', { body: { token: tokA2, new_password: 'again123' } });
@@ -132,8 +157,13 @@ async function mkUser(n, email, password = 'oldpass1') {
   const c = await mkUser('c', `c-${tag}@example.invalid`);
   const notAdmin = await call(`/admin/users/${c.id}/password`, { body: { new_password: 'temp1234' }, tok: legacyTok });
   ok(notAdmin.s === 403, 'non-admin cannot set passwords');
+  const cBefore = (await login(uname('c'), 'oldpass1')).j.token;
+  const tempShort = await call(`/admin/users/${c.id}/password`, { body: { new_password: 'temp123' }, tok: admin });
+  ok(tempShort.s === 400, 'temporary password under 8 characters refused');
   const temp = await call(`/admin/users/${c.id}/password`, { body: { new_password: 'temp1234' }, tok: admin });
   ok(temp.s === 200 && (await login(uname('c'), 'temp1234')).s === 200, 'host sets a temporary password; buyer can log in with it');
+  const cAfter = await call('/auth/me', { method: 'GET', tok: cBefore });
+  ok(cAfter.s === 401 && cAfter.j?.code === 'session_revoked', "host temporary password signs out the buyer's existing sessions");
   const missing = await call(`/admin/users/${crypto.randomUUID()}/password`, { body: { new_password: 'temp1234' }, tok: admin });
   ok(missing.s === 404, 'unknown account: 404');
 
@@ -147,7 +177,7 @@ async function mkUser(n, email, password = 'oldpass1') {
   const dAfter = await s.from('users').select('email').eq('id', d.id).single();
   ok(p1.s === 200 && dAfter.data.email === `d-${tag}@example.invalid`, 'saving a profile gives an email-less account its email');
 })().catch(e => { console.error(e); fails++; }).finally(async () => {
-  if (child) child.kill();
+  for (const c of children) c.kill();
   const { data: us } = await s.from('users').select('id').like('username', `zztest_pw_${tag}_%`);
   const ids = (us || []).map(u => u.id);
   if (ids.length) {
