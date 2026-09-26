@@ -5,6 +5,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 const { AccessToken } = require('livekit-server-sdk');
 const Stripe = require('stripe');
@@ -58,6 +59,8 @@ const mailer = nodemailer.createTransport({
 // inbox so a buyer replying to a "you won" email actually reaches someone.
 const ADMIN_FROM = 'WhatTheFind Live <alerts@whatthefind.live>';
 const BUYER_FROM = 'WhatTheFind Live <auctions@whatthefind.live>';
+// Where links in emails point (password reset). Override for a staging frontend.
+const SITE_URL = (process.env.SITE_URL || 'https://whatthefind.live').replace(/\/+$/, '');
 const REPLY_TO = 'whatthefind.co@gmail.com';
 
 // Resend Pro: 50,000 emails per billing period, no daily cap. The limit that can
@@ -631,14 +634,26 @@ const STARTED_AT = new Date().toISOString();
 app.get('/version', (req, res) => res.json({ commit: process.env.RAILWAY_GIT_COMMIT_SHA || null, started_at: STARTED_AT }));
 
 // -- Auth --
+// Every account has an email (migration 2026-09-26m): it's how a forgotten
+// password gets reset. Stored trimmed + lowercased. Not unique - two accounts
+// may share one; a reset by email then sends a link for each.
+const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+function cleanEmail(v) {
+  if (typeof v !== 'string') return null;
+  const e = v.trim().toLowerCase();
+  return e.length <= 254 && EMAIL_RE.test(e) ? e : null;
+}
+
 app.post('/auth/register', async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: 'username and password required' });
   if (username.length < 3 || username.length > 30) return res.status(400).json({ error: 'Username must be 3-30 characters' });
   if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  const email = cleanEmail(req.body.email);
+  if (!email) return res.status(400).json({ error: 'A valid email is required', detail: "It's how you reset your password if you forget it." });
 
   const password_hash = await bcrypt.hash(password, 10);
-  const { data, error } = await supabase.from('users').insert({ username, password_hash }).select('id, username, created_at').single();
+  const { data, error } = await supabase.from('users').insert({ username, password_hash, email }).select('id, username, email, created_at').single();
   if (error) {
     if (error.code === '23505') return res.status(409).json({ error: 'Username already taken' });
     return res.status(500).json({ error: 'Registration failed' });
@@ -655,7 +670,133 @@ app.post('/auth/login', async (req, res) => {
   const valid = await bcrypt.compare(password, user.password_hash);
   if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
   const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '30d' });
-  res.json({ token, user: { id: user.id, username: user.username, created_at: user.created_at } });
+  res.json({ token, user: { id: user.id, username: user.username, email: user.email || null, created_at: user.created_at } });
+});
+
+// The signed-in account, including whether it still needs an email (accounts
+// made before emails were required are asked for one at their next visit).
+app.get('/auth/me', requireAuth, async (req, res) => {
+  const { data: user, error } = await supabase.from('users').select('id, username, email, created_at').eq('id', req.user.id).single();
+  if (error || !user) return res.status(401).json({ error: 'Account not found' });
+  res.json(user);
+});
+
+// Add an email to an account that has none, or change it. Changing an existing
+// email needs the current password: otherwise anyone holding a stolen session
+// could point the account's resets at their own inbox and take it over.
+app.post('/auth/email', requireAuth, async (req, res) => {
+  const email = cleanEmail(req.body?.email);
+  if (!email) return res.status(400).json({ error: 'Enter a valid email address' });
+  const { data: user } = await supabase.from('users').select('id, email, password_hash').eq('id', req.user.id).single();
+  if (!user) return res.status(401).json({ error: 'Account not found' });
+  if (user.email && user.email !== email) {
+    const pw = req.body?.current_password;
+    if (!pw || !(await bcrypt.compare(pw, user.password_hash))) {
+      return res.status(401).json({ error: 'Enter your current password to change your email' });
+    }
+  }
+  const { error } = await supabase.from('users').update({ email }).eq('id', user.id);
+  if (error) return res.status(500).json({ error: 'Could not save your email' });
+  res.json({ email });
+});
+
+// ---- Forgotten password ----
+// POST /auth/forgot-password { identifier } - a username or an email. Always
+// answers the same thing, immediately, whether or not anything matched, so it
+// can't be used to find out which usernames or emails have accounts; the
+// lookup and email happen after the response is sent.
+// POST /auth/reset-password { token, new_password } - single use, 1 hour.
+const RESET_TTL_MS = 60 * 60 * 1000;
+const RESET_MAX_PER_HOUR = 3;   // per account: stops the form being used to flood someone's inbox
+const sha256 = v => crypto.createHash('sha256').update(v).digest('hex');
+
+async function sendPasswordReset(user) {
+  const since = new Date(Date.now() - RESET_TTL_MS).toISOString();
+  const { count, error: countErr } = await supabase.from('password_resets')
+    .select('id', { count: 'exact', head: true }).eq('user_id', user.id).gte('created_at', since);
+  if (countErr) { console.error('password reset: count failed:', countErr.message); return; }
+  if ((count || 0) >= RESET_MAX_PER_HOUR) { console.error(`password reset: rate limited for ${user.username}`); return; }
+
+  const token = crypto.randomBytes(32).toString('base64url');
+  const { error } = await supabase.from('password_resets').insert({
+    user_id: user.id, token_hash: sha256(token), expires_at: new Date(Date.now() + RESET_TTL_MS).toISOString(),
+  });
+  if (error) { console.error('password reset: insert failed:', error.message); return; }
+
+  const link = `${SITE_URL}/reset-password?token=${token}`;
+  await sendEmail({
+    from: BUYER_FROM,
+    to: user.email,
+    subject: 'Reset your WhatTheFind password',
+    kind: 'password_reset',
+    text: `Someone asked to reset the password for the WhatTheFind account "${user.username}".\n\n`
+      + `Set a new password here (the link works once, for 1 hour):\n${link}\n\n`
+      + `If this wasn't you, ignore this email - your password hasn't changed.`,
+    html: `<p>Someone asked to reset the password for the WhatTheFind account <strong>${escapeHtml(user.username)}</strong>.</p>`
+      + `<p><a href="${link}">Set a new password</a> (the link works once, for 1 hour).</p>`
+      + `<p>If this wasn't you, ignore this email - your password hasn't changed.</p>`,
+  });
+}
+
+app.post('/auth/forgot-password', async (req, res) => {
+  const identifier = typeof req.body?.identifier === 'string' ? req.body.identifier.trim() : '';
+  if (!identifier) return res.status(400).json({ error: 'Enter your username or email' });
+  res.json({ ok: true });
+
+  try {
+    const email = cleanEmail(identifier);
+    const { data: users, error } = email
+      ? await supabase.from('users').select('id, username, email').eq('email', email)
+      : await supabase.from('users').select('id, username, email').eq('username', identifier);
+    if (error) { console.error('password reset: lookup failed:', error.message); return; }
+    for (const u of users || []) {
+      if (u.email) await sendPasswordReset(u);
+    }
+  } catch (e) {
+    console.error('password reset failed:', e.message);
+  }
+});
+
+app.post('/auth/reset-password', async (req, res) => {
+  const { token, new_password } = req.body || {};
+  if (typeof token !== 'string' || !token) return res.status(400).json({ error: 'This reset link is incomplete' });
+  if (typeof new_password !== 'string' || new_password.length < 6) {
+    return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  }
+  const now = new Date().toISOString();
+  // Claim the link atomically: only one request can flip used_at from null,
+  // so the same link can't be used twice even if submitted twice at once.
+  const { data: claimed, error } = await supabase.from('password_resets')
+    .update({ used_at: now })
+    .eq('token_hash', sha256(token)).is('used_at', null).gt('expires_at', now)
+    .select('user_id').maybeSingle();
+  if (error) return res.status(500).json({ error: 'Could not reset your password. Try again.' });
+  if (!claimed) return res.status(400).json({ error: 'This reset link has expired or was already used', detail: 'Request a new one from the login page.' });
+
+  const password_hash = await bcrypt.hash(new_password, 10);
+  const { data: user, error: upErr } = await supabase.from('users')
+    .update({ password_hash }).eq('id', claimed.user_id).select('username').single();
+  if (upErr || !user) return res.status(500).json({ error: 'Could not reset your password. Try again.' });
+  // Any other outstanding links for this account are now pointless - retire them.
+  await supabase.from('password_resets').update({ used_at: now }).eq('user_id', claimed.user_id).is('used_at', null);
+  res.json({ success: true, username: user.username });
+});
+
+// Host fallback: a buyer who can't reach their email asks the host, who sets a
+// temporary password here and tells them. The buyer can keep it or reset it
+// by email later.
+app.post('/admin/users/:userId/password', requireAdmin, async (req, res) => {
+  const { new_password } = req.body || {};
+  if (typeof new_password !== 'string' || new_password.length < 6) {
+    return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  }
+  const password_hash = await bcrypt.hash(new_password, 10);
+  const { data, error } = await supabase.from('users')
+    .update({ password_hash }).eq('id', req.params.userId).select('username').maybeSingle();
+  if (error) return res.status(500).json({ error: 'Could not set the password' });
+  if (!data) return res.status(404).json({ error: 'Account not found' });
+  console.log(`Admin ${req.user.username} set a temporary password for ${data.username}`);
+  res.json({ success: true, username: data.username });
 });
 
 // -- Profile --
@@ -676,10 +817,12 @@ app.post('/auth/change-password', requireAdmin, async (req, res) => {
 });
 
 app.post('/profile', requireAuth, async (req, res) => {
-  const { full_name, email, phone, address_line1, address_line2, city, state, zip, country } = req.body;
+  const { full_name, phone, address_line1, address_line2, city, state, zip, country } = req.body;
   if (!full_name || !phone || !address_line1 || !city || !state || !zip) {
     return res.status(400).json({ error: 'full_name, phone, address_line1, city, state, zip are required' });
   }
+  const email = cleanEmail(req.body.email);
+  if (!email) return res.status(400).json({ error: 'A valid email is required' });
 
   // Check if existing profile is already approved/blocked - don't allow edit
   const { data: existing } = await supabase.from('profiles').select('status').eq('user_id', req.user.id).single();
@@ -701,6 +844,8 @@ app.post('/profile', requireAuth, async (req, res) => {
     .single();
 
   if (error) return res.status(500).json({ error: 'Failed to save profile' });
+  // An account with no email yet takes the profile's, so it can reset its password.
+  await supabase.from('users').update({ email }).eq('id', req.user.id).is('email', null);
   res.json(data);
 });
 
