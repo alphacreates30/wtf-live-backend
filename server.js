@@ -31,7 +31,13 @@ app.use(express.json({ limit: '60mb' }));
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
-const JWT_SECRET = process.env.JWT_SECRET || 'change-me-in-production';
+// No fallback: a known default secret would let anyone forge any login,
+// including the admin account. Refuse to start instead.
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET || JWT_SECRET.length < 32) {
+  console.error('FATAL: JWT_SECRET is unset or shorter than 32 characters. Set a strong JWT_SECRET (32+ chars) in the environment. Refusing to start.');
+  process.exit(1);
+}
 const ADMIN_USERNAME = 'whatthefind';
 
 // -- Email transport (Nodemailer - set SMTP_* env vars or swap for Resend) --
