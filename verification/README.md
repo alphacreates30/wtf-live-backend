@@ -70,7 +70,7 @@ routes below.
 > for leftover `ZZTEST_` rows (`select * from auctions where title like 'ZZTEST_%'`).
 
 They start local copies of the server on ports 3231-3234, 3241-3242, 3251-3252,
-3261-3262, 3271-3272, 3281-3285, 3291-3293, 3301-3312, 3321-3322, 3331-3332 and 3341-3342 with the background jobs (`setInterval`) stubbed out, so nothing
+3261-3262, 3271-3272, 3281-3285, 3291-3293, 3301-3312, 3321-3322, 3331-3332, 3341-3342 and 3351-3352 with the background jobs (`setInterval`) stubbed out, so nothing
 auto-closes or charges. They write temporary `server.tmp-*.js` / `run.tmp-*.js`
 files next to `server.js` and delete them on exit (both are git-ignored).
 
@@ -80,7 +80,7 @@ are minted in-process with `JWT_SECRET` and expire in minutes. `id-normalisation
 also needs `../wtf-live-frontend` checked out next to this repo (for
 `socket.io-client`).
 
-## The thirteen suites
+## The suites
 
 Each suite's "before" server is pinned to a commit, not to `HEAD`, so its
 reproduction assertions stay valid however far `main` moves on. A suite that is
@@ -103,6 +103,7 @@ always red teaches people to ignore red.
 | `orphan-protection.js` | #44: lots and pre-bids could point at auctions/lots that no longer exist (text `auction_id` columns, no foreign keys) - 35 lots and 49 pre-bids had by 2026-09-24. **Two phases, detected from the live schema.** BEFORE migrations i+j it records the controls: a raw lot insert for a non-existent auction, a raw pre-bid insert for a non-existent lot, and a bare auction delete all succeed and orphan rows, and deleting a lot leaves its pre-bid behind; then exits 2. AFTER: each of those is refused (23503, `auction_items_auction_id_fkey` / `pre_bids_*_fkey`), deleting a lot cascades to its pre-bids, images, outbid log and bids, and `delete_auction_cascade` on a fixture with lots/pre-bids/images/bids leaves zero orphans. Both phases: `DELETE /auction/:id/items/:itemId` on a lot with an order - pinned commit answers `{ success: true }` with the lot still there (the database refused it), now 409. Controls recorded on the pre-migration schema 2026-09-24 (all four reproduced); AFTER phase green on 2026-09-24 once h-k were applied. | **`a836135`** | _this slice (#44)_ |
 | `ai-usage.js` | AI spend log (migration `2026-09-26l`): one `ai_usage` row per Claude response from `/ai/group-photos`, `/ai/analyze-lot`, `/ai/regenerate-description`, attributed to the body's `auction_id`, raw tokens + `cost_usd`; a failed log insert never fails the AI call; malformed `auction_id` 400; `/admin/ai-usage` admin-only, pages past 1000 rows, buckets days in the caller's time zone (invalid tz -> UTC), flags deleted/unassigned auctions and unpriced calls; 503 "not set up" when the table is missing. **Claude is stubbed - no AI spend.** Summary checks run against an in-memory table. | n/a (new feature) | `c0876a5` |
 | `password-reset.js` | Account email + forgotten password (migration `2026-09-26m`): registration requires an email (stored lowercased) and 8+ characters, existing short passwords still log in; `/auth/forgot-password` answers identically for unknown accounts, emails one single-use 1-hour link per matching account (shared address -> one each), stores only a SHA-256; the same link submitted twice at once succeeds exactly once; a reset retires the account's other links; **rate limit 3 per account per hour holds when 4 requests arrive at once** (count-then-insert let 4 of 4 through - caught by this suite's first run, fixed insert-first); **a token issued before a reset (with or without the `pca` claim) is refused after it**, also by a second instance deciding from the database; a host temporary password signs out the buyer; changing an account email needs the current password; `/profile` requires an email and fills a missing account email. Emails are written to a local file, never sent. | n/a (new feature) | _this slice_ |
+| `secret-max.js` | A standard lot's leading max is secret: `auction_items.top_pre_bid` (the highest max - on a standard lot, the leader's proxy ceiling) went out on the public `GET /auction/:id/items` and `/items/standard-status` (no login needed; TEST Auction showed 5 / 10 / 12, exactly the maxes), in the lot row a losing challenger got back from `POST .../bid`, and in the `item_activated` socket broadcast. Pinned commit: 10 leaking responses. Now stripped for everyone but the admin / the auction's host (`hideLotMax`). As anonymous and as a non-leading buyer, every REST read, the bid and pre-bid responses and every socket event on join/activation are searched for the leader's max values and the key; controls: admin still sees it, the leader still sees their OWN max (`GET .../prebid`, `/my-bids`). Needs `../wtf-live-frontend` (socket.io-client). **Known, not fixed:** live mode (gated off, v2) opens a lot at the top pre-bid max, so `item_activated`'s `current_bid` equals it; the suite prints this as a NOTE. | **`18b79c5`** | _this slice_ |
 
 ## Not covered
 

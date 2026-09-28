@@ -1945,7 +1945,7 @@ io.on('connection', (socket) => {
     const ts = timerSeconds || 60;
   startItemTimer(auctionId, ts);
   io.to(auctionId).emit('item_timer_tick', { seconds: ts });
-  io.to(auctionId).emit('item_activated', { item: activeItem, pre_bid_count: preBids ? preBids.length : 0, timer_seconds: ts });
+  io.to(auctionId).emit('item_activated', { item: hideLotMax(activeItem), pre_bid_count: preBids ? preBids.length : 0, timer_seconds: ts });
   });
 
   socket.on('disconnect', () => {
@@ -2898,15 +2898,29 @@ app.post('/webhook/shippo', async (req, res) => {
 
 // AUCTION ITEMS AND PRE-BIDS
 
+// auction_items.top_pre_bid is the highest max on the lot - on a standard lot,
+// the leader's secret proxy ceiling. Anyone who can read it can bid a rival up
+// to exactly their limit, so it only ever leaves the server for the host/admin.
+// Every lot row sent to anyone else (REST, bid responses, socket broadcasts)
+// goes through this. A buyer's own max comes from GET .../prebid and /my-bids.
+function canSeeLotMaxes(user, auction) {
+  return !!user && (user.username === ADMIN_USERNAME || (!!auction && user.username === auction.host_username));
+}
+function hideLotMax(item) {
+  if (!item) return item;
+  const { top_pre_bid, ...rest } = item;
+  return rest;
+}
+
 app.get('/auction/:id/items', optionalAuth, async (req, res) => {
-  const { data: auction } = await supabase.from('auctions').select('status').eq('id', req.params.id).single();
+  const { data: auction } = await supabase.from('auctions').select('status, host_username').eq('id', req.params.id).single();
   if (auction?.status === 'draft' && req.user?.username !== ADMIN_USERNAME) {
     return res.status(404).json({ error: 'Auction not found' });
   }
   const { data, error } = await supabase
     .from('auction_items').select('*').eq('auction_id', req.params.id).order('position', { ascending: true });
   if (error) return res.status(500).json({ error });
-  res.json(data);
+  res.json(canSeeLotMaxes(req.user, auction) ? data : data.map(hideLotMax));
 });
 
 app.post('/auction/:id/items', requireAdmin, async (req, res) => {
@@ -3072,7 +3086,7 @@ app.post('/auction/:id/items/:itemId/bid', requireAuth, async (req, res) => {
       p_max_amount: max_amount
     });
     if (maxErr) console.error('update_standard_leader_max failed:', maxErr.code, maxErr.message);
-    if (rows && rows.length) return res.json({ ...rows[0], extended: false, max_only: true });
+    if (rows && rows.length) return res.json({ ...hideLotMax(rows[0]), extended: false, max_only: true });
   }
 
   const { data, error } = await supabase.rpc('place_standard_bid', {
@@ -3095,7 +3109,9 @@ app.post('/auction/:id/items/:itemId/bid', requireAuth, async (req, res) => {
     io.to(req.params.id).emit('item_extended', { item_id: req.params.itemId, ends_at: data.ends_at });
     console.log(`Soft close: lot ${req.params.itemId} extended to ${data.ends_at}`);
   }
-  res.json({ ...data, extended });
+  // data is the lot row after the proxy battle: top_pre_bid is the leader's
+  // max, which a losing challenger must not get back.
+  res.json({ ...hideLotMax(data), extended });
 
   // Fire-and-forget: this notifies whoever *lost* the lead, a different user
   // than the one who just bid, so it must never delay this response.
@@ -3104,13 +3120,13 @@ app.post('/auction/:id/items/:itemId/bid', requireAuth, async (req, res) => {
 });
 
 app.get('/auction/:id/items/standard-status', optionalAuth, async (req, res) => {
-  const { data: auction } = await supabase.from('auctions').select('status').eq('id', req.params.id).single();
+  const { data: auction } = await supabase.from('auctions').select('status, host_username').eq('id', req.params.id).single();
   if (auction?.status === 'draft' && req.user?.username !== ADMIN_USERNAME) {
     return res.status(404).json({ error: 'Auction not found' });
   }
   const { data, error } = await supabase.from('auction_items').select('*').eq('auction_id', req.params.id).order('position', { ascending: true });
   if (error) return res.status(500).json({ error: 'Failed to load items' });
-  res.json(data);
+  res.json(canSeeLotMaxes(req.user, auction) ? data : data.map(hideLotMax));
 });
 
 const PORT = process.env.PORT || 3001;
