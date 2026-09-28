@@ -32,11 +32,12 @@ routes below.
 
 > ## ✅ Deploy check: `GET /version` (#49)
 >
-> After every push, confirm the pushed commit is the one serving traffic:
+> After every push, confirm the pushed commit is the one serving traffic. Production backend:
+> **`https://wtf-live-backend-production.up.railway.app`** (Railway project "clever-quietude", production).
 >
 > ```
 > git rev-parse HEAD
-> curl -s https://<backend-host>/version
+> curl -s https://wtf-live-backend-production.up.railway.app/version
 > # {"commit":"<sha>","started_at":"<ISO time the process booted>"}
 > ```
 >
