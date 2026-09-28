@@ -27,6 +27,10 @@ async function boot(name, port, source) {
 const U = crypto.randomUUID();
 const USERNAME = 'zztest_termsgate';
 const tok = jwt.sign({ id: U, username: USERNAME }, process.env.JWT_SECRET, { expiresIn: '10m' });
+// A second buyer, only used to challenge the leader's raised max.
+const U2 = crypto.randomUUID();
+const tok2 = jwt.sign({ id: U2, username: USERNAME + '2' }, process.env.JWT_SECRET, { expiresIn: '10m' });
+let leaderMaxMigrated = true;
 const future = h => new Date(Date.now() + h * 3600e3).toISOString();
 const ids = { auctions: [], items: [] };
 
@@ -40,7 +44,8 @@ async function mkItem(auctionId, title, status) {
   if (r.error) throw new Error('item: ' + JSON.stringify(r.error));
   ids.items.push(r.data.id); return r.data.id;
 }
-const post = (port, path, body) => fetch('http://localhost:' + port + path, { method: 'POST', headers: { Authorization: 'Bearer ' + tok, 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(async r => ({ s: r.status, j: await r.json().catch(() => ({})) }));
+const post = (port, path, body, token = tok) => fetch('http://localhost:' + port + path, { method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(async r => ({ s: r.status, j: await r.json().catch(() => ({})) }));
+const bidRows = async id => (await s.from('bids').select('id').eq('item_id', id)).data;
 const item = async id => (await s.from('auction_items').select('leading_bidder,bid_count,current_bid,auction_id').eq('id', id).single()).data;
 const prebids = async id => (await s.from('pre_bids').select('id,auction_id,item_id').eq('item_id', id)).data;
 
@@ -98,22 +103,49 @@ const prebids = async id => (await s.from('pre_bids').select('id,auction_id,item
     r = await post(3242, `/auction/${A}/items/${itemA2}/prebid`, { max_amount: 7 });
     pb = await prebids(itemA2);
     ok(r.s === 200 && pb.length === 1 && pb[0].auction_id === A, `NEW legit pre-bid on A's lot via /auction/A: ${r.s}, row auction_id=A`);
+    const before = await item(itemA);
     r = await post(3242, `/auction/${A.toUpperCase()}/items/${itemA}/bid`, { max_amount: 20 });
     ok(r.s === 200, `NEW legit bid using an UPPERCASE auction id on A's own lot still works (${r.s}) - compare is case-insensitive`);
+
+    // The leader resubmitting their max (raise, then repeat) must update the max only: no bids row, no bid_count
+    // bump, price unchanged (TEST Auction lot 1 showed "Bids: 2" for one bidder). Needs migration 2026-09-27n;
+    // without it the route falls back to place_standard_bid, which adds a row each time.
+    console.log('\n== Leader resubmits their own max (raise $5 -> $20, then repeat $20) ==');
+    const probe = await s.rpc('update_standard_leader_max', { p_item_id: crypto.randomUUID(), p_username: 'nobody', p_max_amount: 1 });
+    leaderMaxMigrated = !probe.error;
+    r = await post(3242, `/auction/${A}/items/${itemA}/bid`, { max_amount: 20 });
+    const after = await item(itemA);
+    const rows = await bidRows(itemA);
+    const max = (await s.from('pre_bids').select('max_amount').eq('item_id', itemA).eq('buyer_username', USERNAME).single()).data;
+    const clean = after.bid_count === before.bid_count && rows.length === before.bid_count && Number(after.current_bid) === Number(before.current_bid) && after.leading_bidder === USERNAME && Number(max.max_amount) === 20;
+    const detail = `bid_count ${before.bid_count} -> ${after.bid_count}, bids rows ${rows.length}, current_bid ${before.current_bid} -> ${after.current_bid}, max ${max.max_amount}`;
+    if (leaderMaxMigrated) {
+      ok(r.s === 200 && clean, `NEW leader raise + repeat: max recorded, no new visible bid (${detail})`);
+      // The raised max must still be the one a challenger fights: $10 < $20, so the leader keeps the lot.
+      const t2 = await s.from('auction_terms_acceptances').insert({ auction_id: A, user_id: U2, accepted_at: new Date().toISOString(), buyers_premium_pct: 15, fulfillment_mode: 'shipping', fulfillment_choice: 'shipping', terms_version: '1' });
+      if (t2.error) throw new Error('acceptance 2: ' + JSON.stringify(t2.error));
+      r = await post(3242, `/auction/${A}/items/${itemA}/bid`, { max_amount: 10 }, tok2);
+      const fought = await item(itemA);
+      ok(r.s === 200 && fought.leading_bidder === USERNAME && Number(fought.current_bid) >= 10 && fought.bid_count === after.bid_count + 1, `NEW challenger at $10 vs the raised $20 max: leader keeps the lot at $${fought.current_bid}, bid_count ${fought.bid_count} (the challenge is a real bid)`);
+    } else {
+      console.log(`SKIP migration 2026-09-27n not applied: leader resubmit still goes through place_standard_bid (${detail})${clean ? '' : '  <- BUG REPRODUCED'}`);
+    }
   } finally {
     servers.forEach(x => x.cleanup());
-    await s.from('pre_bids').delete().eq('buyer_user_id', U);
+    await s.from('pre_bids').delete().in('buyer_user_id', [U, U2]);
     await s.from('bids').delete().in('auction_id', ids.auctions);
-    await s.from('auction_terms_acceptances').delete().eq('user_id', U);
+    await s.from('auction_terms_acceptances').delete().in('user_id', [U, U2]);
     await s.from('profiles').delete().eq('user_id', U);
     if (ids.items.length) await s.from('auction_items').delete().in('id', ids.items);
     if (ids.auctions.length) await s.from('auctions').delete().in('id', ids.auctions);
     const left = (await s.from('auctions').select('id').like('title', 'ZZTEST_termsgate%')).data.length
       + (await s.from('auction_items').select('id').like('title', 'ZZTEST %lot')).data.length
-      + (await s.from('pre_bids').select('id').eq('buyer_user_id', U)).data.length
+      + (await s.from('pre_bids').select('id').in('buyer_user_id', [U, U2])).data.length
+      + (await s.from('auction_terms_acceptances').select('user_id').in('user_id', [U, U2])).data.length
       + (await s.from('profiles').select('id').eq('user_id', U)).data.length;
     console.log('\nleftover throwaway rows:', left);
   }
+  if (!fails && !leaderMaxMigrated) { console.log('\nALL PASS except the leader-resubmit check, skipped: apply migrations/2026-09-27n and re-run'); process.exit(2); }
   console.log(fails ? '\n' + fails + ' FAILED' : '\nALL PASS');
   process.exit(fails ? 1 : 0);
 })().catch(e => { console.log('ERR', e); process.exit(1); });

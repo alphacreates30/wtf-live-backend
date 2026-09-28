@@ -3060,6 +3060,21 @@ app.post('/auction/:id/items/:itemId/bid', requireAuth, async (req, res) => {
     : (bidItem.bid_count > 0 ? floor + minInc : Math.max(floor, OPENING_BID_MIN));
   if (max_amount < minBid) return res.status(400).json({ error: `Min bid: $${minBid.toFixed(2)}` });
 
+  // The leader resubmitting their max is not a new bid: place_standard_bid
+  // would insert a bids row at the unchanged price and bump bid_count. This
+  // RPC (migration 2026-09-27n) re-checks the lead under the lot's row lock
+  // and only records the max. No row back means the lead changed since the
+  // read above (or the function isn't installed yet): place it as a real bid.
+  if (isLeader) {
+    const { data: rows, error: maxErr } = await supabase.rpc('update_standard_leader_max', {
+      p_item_id: req.params.itemId,
+      p_username: req.user.username,
+      p_max_amount: max_amount
+    });
+    if (maxErr) console.error('update_standard_leader_max failed:', maxErr.code, maxErr.message);
+    if (rows && rows.length) return res.json({ ...rows[0], extended: false, max_only: true });
+  }
+
   const { data, error } = await supabase.rpc('place_standard_bid', {
     p_item_id: req.params.itemId,
     p_user_id: String(req.user.id),
