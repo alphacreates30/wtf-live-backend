@@ -1,4 +1,5 @@
--- STEP o. DELETES ROWS. For Albert to run by hand in the Supabase SQL editor - NOT run by Claude.
+-- APPLIED on production 2026-09-27 in Albert's Supabase SQL editor - run by Albert himself (per Albert). Verified: all counts 0. DO NOT RUN AGAIN.
+-- Was: STEP o. DELETES ROWS. For Albert to run by hand in the Supabase SQL editor - NOT run by Claude.
 -- Removes the ended "TEST Auction" (d8f605a0-345f-4a89-ad9b-78b4d6b8c16a, 34 horror-figure lots, 2026-09-26/27 live
 -- test) and everything under it, so it no longer shows on the homepage.
 --
