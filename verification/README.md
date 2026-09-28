@@ -120,6 +120,14 @@ always red teaches people to ignore red.
      AND buyers - renders unstyled. The file itself is on the cream palette
      (admin restyle, frontend `2b7fa3e`), ready to import; importing it changes
      that room's layout, so check the live room at phone width when you do.
+- **Follow-up (parked 2026-09-28): outbid alert in the auction room.** A buyer
+  who loses the lead finds out only by email (`notifyOutbidIfNeeded`) or on
+  My Bids; the standard auction room shows nothing when it happens. The mark's
+  outbid expression is ready for it (frontend `public/brand/state-outbid.svg`,
+  copied but not placed, see frontend `8c019a2`). Needs: detect that the viewer
+  WAS the leader and no longer is (poll result or a socket event), then a
+  dismissible banner/toast with the state. Leading/won checks must use
+  `isViewerLeader` (frontend `be87022`) so a logged-out viewer never gets it.
 - The DB-level guards are now covered: `delete-guard.js` asserts that a raw
   delete of an auction with orders / invoices is refused by Postgres (23503,
   `orders_auction_id_fkey` / `invoices_auction_id_fkey`), that an order for a
