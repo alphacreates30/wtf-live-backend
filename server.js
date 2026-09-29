@@ -791,10 +791,31 @@ function cleanEmail(v) {
   return e.length <= 254 && EMAIL_RE.test(e) ? e : null;
 }
 
+// Usernames (security review #14): admin is decided by the username, and names
+// had no rules - 'WhatTheFind', 'WHATTHEFIND', 'whatthefind ' (trailing space),
+// a Cyrillic-a lookalike and markup all registered, and could impersonate the
+// host in chat and bids. New names are stored lowercase, only a-z 0-9 _, 3-30
+// long, unique regardless of case (checked here and by the lower(username)
+// index, migration q), and can't contain 'whatthefind' or be a staff-sounding
+// name. Existing accounts keep their names; login accepts any casing.
+const USERNAME_RE = /^[a-z0-9_]{3,30}$/;
+const RESERVED_USERNAMES = new Set(['admin', 'administrator', 'host', 'support', 'staff', 'moderator', 'mod', 'system', 'root', 'official', 'help', 'owner']);
+function usernameProblem(name) {
+  if (!USERNAME_RE.test(name)) return 'Usernames are 3-30 characters: lowercase letters, numbers and _ only';
+  if (name.replace(/_/g, '').includes('whatthefind') || RESERVED_USERNAMES.has(name.replace(/_/g, ''))) return "That username isn't available";
+  return null;
+}
+const likeExact = v => v.replace(/[\\%_]/g, c => '\\' + c);   // ilike with no wildcards = case-insensitive equality
+
 app.post('/auth/register', LIMITS.register, async (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ error: 'username and password required' });
-  if (username.length < 3 || username.length > 30) return res.status(400).json({ error: 'Username must be 3-30 characters' });
+  const { password } = req.body || {};
+  if (typeof req.body?.username !== 'string' || typeof password !== 'string' || !password) return res.status(400).json({ error: 'username and password required' });
+  const username = req.body.username.trim().toLowerCase();
+  const problem = usernameProblem(username);
+  if (problem) return res.status(400).json({ error: problem });
+  const { data: taken, error: takenErr } = await supabase.from('users').select('id').ilike('username', likeExact(username)).limit(1);
+  if (takenErr) return res.status(500).json({ error: 'Registration failed' });
+  if (taken.length) return res.status(409).json({ error: 'Username already taken' });
   if (password.length < MIN_PASSWORD) return res.status(400).json({ error: `Password must be at least ${MIN_PASSWORD} characters` });
   const email = cleanEmail(req.body.email);
   if (!email) return res.status(400).json({ error: 'A valid email is required', detail: "It's how you reset your password if you forget it." });
@@ -813,10 +834,14 @@ app.post('/auth/register', LIMITS.register, async (req, res) => {
 });
 
 app.post('/auth/login', LIMITS.loginIp, LIMITS.loginUser, async (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ error: 'username and password required' });
-  const { data: user, error } = await supabase.from('users').select('*').eq('username', username).single();
-  if (error || !user) return res.status(401).json({ error: 'Invalid credentials' });
+  const { username, password } = req.body || {};
+  if (typeof username !== 'string' || typeof password !== 'string' || !username || !password) return res.status(400).json({ error: 'username and password required' });
+  // Exact name first (older accounts may have capitals), then the lowercase form new names are stored in.
+  let { data: user } = await supabase.from('users').select('*').eq('username', username).maybeSingle();
+  if (!user && username.trim().toLowerCase() !== username) {
+    ({ data: user } = await supabase.from('users').select('*').eq('username', username.trim().toLowerCase()).maybeSingle());
+  }
+  if (!user) return res.status(401).json({ error: 'Invalid credentials' });
   const valid = await bcrypt.compare(password, user.password_hash);
   if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
   const token = signSession(user);
