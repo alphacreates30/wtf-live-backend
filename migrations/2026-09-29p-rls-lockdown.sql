@@ -39,6 +39,11 @@ alter table public.auction_items  enable row level security;
 alter table public.item_images    enable row level security;
 alter table public.chat_messages  enable row level security;
 
+-- 1b. The backend's role keeps full access - stated here so the file doesn't depend on the grants Supabase made
+--     when each table was created (production already had them; verified by Cowork 2026-09-29).
+grant all on all tables    in schema public to service_role;
+grant all on all sequences in schema public to service_role;
+
 -- 2. No table or sequence access for the API roles.
 revoke all on all tables    in schema public from anon, authenticated;
 revoke all on all sequences in schema public from anon, authenticated;
@@ -57,7 +62,7 @@ alter default privileges for role postgres revoke execute on functions from publ
 
 -- 5. Verify, or abort the whole transaction.
 do $$
-declare n_tab int; n_seq int; n_fn int; n_rls int; probe boolean;
+declare n_tab int; n_seq int; n_fn int; n_rls int; probe boolean; sr_tab text; sr_fn text;
 begin
   -- A function created now must not be callable by anon (checks step 4); dropped straight away.
   create function public.zz_rls_probe_fn() returns int language sql as $f$ select 1 $f$;
@@ -82,7 +87,22 @@ begin
   if n_tab + n_seq + n_fn + n_rls > 0 then
     raise exception 'STOP: still open - table grants %, sequences %, functions %, tables without RLS %', n_tab, n_seq, n_fn, n_rls;
   end if;
-  raise notice 'OK: RLS on every public table; anon/authenticated have no table, sequence or function access';
+
+  -- The backend (service_role) must still reach everything: every public table SELECT/INSERT/UPDATE/DELETE, every
+  -- public function EXECUTE. CASE guards the table check the same way as the sequence check above.
+  select string_agg(c.relname, ', ') into sr_tab from pg_class c
+   where c.relnamespace = 'public'::regnamespace and c.relkind in ('r', 'p')
+     and case when c.relkind in ('r', 'p')
+              -- one call per privilege: a comma list in has_table_privilege means ANY of them, not all
+              then not (has_table_privilege('service_role', c.oid, 'SELECT') and has_table_privilege('service_role', c.oid, 'INSERT')
+                        and has_table_privilege('service_role', c.oid, 'UPDATE') and has_table_privilege('service_role', c.oid, 'DELETE'))
+              else false end;
+  select string_agg(p.oid::regprocedure::text, ', ') into sr_fn from pg_proc p
+   where p.pronamespace = 'public'::regnamespace and not has_function_privilege('service_role', p.oid, 'EXECUTE');
+  if sr_tab is not null or sr_fn is not null then
+    raise exception 'STOP: service_role lost access - tables: %; functions: %', coalesce(sr_tab, 'none'), coalesce(sr_fn, 'none');
+  end if;
+  raise notice 'OK: RLS on every public table; anon/authenticated have no table, sequence or function access; service_role keeps every table and function';
 end $$;
 
 commit;
