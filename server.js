@@ -9,7 +9,6 @@ const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 const { AccessToken } = require('livekit-server-sdk');
 const Stripe = require('stripe');
-const nodemailer = require('nodemailer');
 const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const helmet = require('helmet');
 const sharp = require('sharp');
@@ -109,25 +108,9 @@ if (!JWT_SECRET || JWT_SECRET.length < 32) {
 }
 const ADMIN_USERNAME = 'whatthefind';
 
-// -- Email transport (Nodemailer - set SMTP_* env vars or swap for Resend) --
-// Short timeouts: nodemailer's defaults (connectionTimeout alone is 2
-// minutes) mean a wrong host/port/credential silently blocks every caller
-// of sendAdminEmail for that long - including chargeOrder on its way to
-// resolving, and the sequential auto-close loop's processing of every
-// other lot in that same tick. sendAdminEmail already never throws past
-// this file; this makes sure it also never hangs.
-const mailer = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || 'smtp.gmail.com',
-  port: parseInt(process.env.SMTP_PORT || '587'),
-  secure: false,
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  },
-  connectionTimeout: 8000,
-  greetingTimeout: 8000,
-  socketTimeout: 8000,
-});
+// -- Email: every message goes through Resend's HTTP API (sendEmail below). The
+// old Nodemailer SMTP transport was created here but never used, and pulled in
+// a dependency with open advisories; removed (security review #23).
 
 // whatthefind.live is Resend-verified for sending; it has no MX on the apex,
 // so mail sent TO @whatthefind.live bounces. Reply-To always points at a real
