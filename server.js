@@ -16,13 +16,30 @@ const aiLots = require('./ai_lots');
 const app = express();
 const server = http.createServer(app);
 
+// -- Allowed browser origins (security review #11) --
+// Was '*' on both Express and Socket.io. Only the site itself (and the local
+// Vite dev server, when not running on Railway) may call the API from a
+// browser. CORS_EXTRA_ORIGINS (comma-separated) adds more, e.g. a preview URL.
+// Requests with no Origin (servers, webhooks, curl) are unaffected. Auth is a
+// bearer token, not a cookie, so this is defence in depth rather than CSRF.
+const ON_RAILWAY = !!(process.env.RAILWAY_ENVIRONMENT_NAME || process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID);
+const ALLOWED_ORIGINS = new Set([
+  'https://whatthefind.live', 'https://www.whatthefind.live',
+  ...(ON_RAILWAY ? [] : ['http://localhost:5173', 'http://127.0.0.1:5173']),
+  ...String(process.env.CORS_EXTRA_ORIGINS || '').split(',').map(o => o.trim()).filter(Boolean),
+]);
+const originAllowed = origin => !origin || ALLOWED_ORIGINS.has(origin);
+const corsOrigin = (origin, cb) => cb(null, originAllowed(origin));
+
 const io = new Server(server, {
-  cors: { origin: '*', methods: ['GET', 'POST'] }
+  cors: { origin: corsOrigin, methods: ['GET', 'POST'] },
+  // Browsers don't apply CORS to a WebSocket upgrade, so check the origin here too.
+  allowRequest: (req, cb) => cb(null, originAllowed(req.headers.origin)),
 });
 
 // -- Stripe webhook needs raw body --
 app.use('/webhook/stripe', express.raw({ type: 'application/json' }));
-app.use(cors());
+app.use(cors({ origin: corsOrigin }));
 // JSON bodies: 100kb (security review #12). This used to be 60mb for every
 // route, anonymous ones included, so repeated 60mb POSTs to /auth/login could
 // exhaust the instance's memory. Express applies only the first JSON parser a
