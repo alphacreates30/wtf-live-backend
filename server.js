@@ -1678,7 +1678,7 @@ function startAuctionTimer(auctionId, endsAt) {
     if (remaining <= 0) {
       clearInterval(auctionTimers[auctionId]);
       delete auctionTimers[auctionId];
-      const { data: auction } = await supabase.from('auctions').update({ status: 'ended' }).eq('id', auctionId).eq('status', 'live').select().single();
+      const { data: auction } = await supabase.from('auctions').update({ status: 'ended' }).eq('id', auctionId).eq('status', 'live').eq('mode', 'live').select().single();
       if (auction) {
         io.to(auctionId).emit('auction_ended', { auctionId, winner: auction.leading_bidder, final_bid: auction.current_bid });
         await createOrderOnWin(auctionId, auction.leading_bidder, auction.current_bid);
@@ -1700,8 +1700,13 @@ function startItemTimer(auctionId, seconds) {
   }, 1000);
 }
 
+// Live-MODE auctions only. A standard auction is also status 'live' while it
+// runs, but it is closed by autoCloseStandardItems, lot by lot, and invoiced
+// only while still 'live' (maybeEndStandardAuction). Arming this timer on one
+// ended it at the auction-level ends_at with lots still open, so those lots
+// sold with no invoice and no charge (security review #2, 2026-09-29).
 async function resumeLiveAuctions() {
-  const { data: liveAuctions } = await supabase.from('auctions').select('id, ends_at').eq('status', 'live');
+  const { data: liveAuctions } = await supabase.from('auctions').select('id, ends_at').eq('status', 'live').eq('mode', 'live').not('ends_at', 'is', null);
   if (!liveAuctions) return;
   for (const auction of liveAuctions) {
     console.log(`- Resuming timer for auction ${auction.id}`);
@@ -1717,6 +1722,17 @@ async function sweepExpiredStandardItems() { /* intentionally disabled */ }
 // ------------------------------------------------------------
 // SOCKET.IO
 // ------------------------------------------------------------
+
+// The live-mode events below act on the auction row itself (auction-level
+// current_bid/leading_bidder, status, ends_at). None of that applies to a
+// standard auction, which runs lot by lot: a socket place_bid used to set a
+// standard auction's leading_bidder, and end_auction ended it without invoices
+// (security review #6). They refuse anything that isn't live mode.
+const LIVE_ONLY = 'This is not a live auction.';
+async function isLiveModeAuction(auctionId) {
+  const { data } = await supabase.from('auctions').select('mode').eq('id', auctionId).maybeSingle();
+  return data?.mode === 'live';
+}
 
 io.on('connection', (socket) => {
   // Every socket event that carries an auctionId gets it validated and
@@ -1793,7 +1809,7 @@ io.on('connection', (socket) => {
 
     if (auction) {
       socket.emit('auction_state', auction);
-      if (auction.status === 'live' && auction.ends_at) startAuctionTimer(auctionId, auction.ends_at);
+      if (auction.mode === 'live' && auction.status === 'live' && auction.ends_at) startAuctionTimer(auctionId, auction.ends_at);
     }
 
     const { data: bids } = await supabase.from('bids').select('*').eq('auction_id', auctionId).order('created_at', { ascending: false }).limit(20);
@@ -1822,6 +1838,8 @@ io.on('connection', (socket) => {
         socket.emit('bid_error', { message: 'Your account must be approved to bid' }); return;
       }
     }
+
+    if (!(await isLiveModeAuction(auctionId))) { socket.emit('bid_error', { message: 'Bidding on this auction happens lot by lot.' }); return; }
 
     const { data, error } = await supabase.rpc('place_bid', { p_auction_id: auctionId, p_username: user.username, p_amount: amount });
     if (error || !data.success) { socket.emit('bid_error', { message: (data && data.error) || 'Failed to place bid' }); return; }
@@ -1900,8 +1918,9 @@ io.on('connection', (socket) => {
   socket.on('start_auction', async ({ auctionId, token }) => {
     const user = await verifySocketToken(token);
     if (!user) return socket.emit('host_error', { message: 'Unauthorized' });
-    const { data: auction } = await supabase.from('auctions').select('host_username, status, ends_at').eq('id', auctionId).single();
+    const { data: auction } = await supabase.from('auctions').select('host_username, status, ends_at, mode').eq('id', auctionId).single();
     if (!auction || auction.host_username !== user.username) return socket.emit('host_error', { message: 'Only the host can start this auction' });
+    if (auction.mode !== 'live') return socket.emit('host_error', { message: LIVE_ONLY });
     if (auction.status !== 'upcoming') return socket.emit('host_error', { message: 'Auction is already live or ended' });
     await supabase.from('auctions').update({ status: 'live', starts_at: new Date().toISOString() }).eq('id', auctionId);
     io.to(auctionId).emit('auction_started', { auctionId });
@@ -1912,8 +1931,9 @@ io.on('connection', (socket) => {
   socket.on('end_auction', async ({ auctionId, token }) => {
     const user = await verifySocketToken(token);
     if (!user) return socket.emit('host_error', { message: 'Unauthorized' });
-    const { data: auction } = await supabase.from('auctions').select('host_username, leading_bidder, current_bid').eq('id', auctionId).single();
+    const { data: auction } = await supabase.from('auctions').select('host_username, leading_bidder, current_bid, mode').eq('id', auctionId).single();
     if (!auction || auction.host_username !== user.username) return socket.emit('host_error', { message: 'Only the host can end this auction' });
+    if (auction.mode !== 'live') return socket.emit('host_error', { message: LIVE_ONLY });
     if (auctionTimers[auctionId]) { clearInterval(auctionTimers[auctionId]); delete auctionTimers[auctionId]; }
     await supabase.from('auctions').update({ status: 'ended' }).eq('id', auctionId);
     await createOrderOnWin(auctionId, auction.leading_bidder, auction.current_bid);
@@ -1924,8 +1944,9 @@ io.on('connection', (socket) => {
   socket.on('extend_auction', async ({ auctionId, extraSeconds, token }) => {
     const user = await verifySocketToken(token);
     if (!user) return socket.emit('host_error', { message: 'Unauthorized' });
-    const { data: auction } = await supabase.from('auctions').select('host_username, ends_at, status').eq('id', auctionId).single();
+    const { data: auction } = await supabase.from('auctions').select('host_username, ends_at, status, mode').eq('id', auctionId).single();
     if (!auction || auction.host_username !== user.username) return socket.emit('host_error', { message: 'Only the host can extend this auction' });
+    if (auction.mode !== 'live') return socket.emit('host_error', { message: LIVE_ONLY });
     if (auction.status !== 'live') return socket.emit('host_error', { message: 'Can only extend a live auction' });
     const newEndsAt = new Date(new Date(auction.ends_at).getTime() + extraSeconds * 1000).toISOString();
     await supabase.from('auctions').update({ ends_at: newEndsAt }).eq('id', auctionId);
@@ -1939,6 +1960,7 @@ io.on('connection', (socket) => {
   socket.on('next_item', async ({ auctionId, token, timerSeconds = 60 }) => {
     const user = await verifySocketToken(token);
     if (!user || user.username !== ADMIN_USERNAME) return socket.emit('host_error', { message: 'Admin only' });
+    if (!(await isLiveModeAuction(auctionId))) return socket.emit('host_error', { message: LIVE_ONLY });
     await supabase.from('auction_items').update({ status: 'sold' }).eq('auction_id', auctionId).eq('status', 'active');
     const { data: nextItem } = await supabase.from('auction_items').select('*').eq('auction_id', auctionId).eq('status', 'pending').order('position', { ascending: true }).limit(1).single();
     if (!nextItem) { if (itemTimers[auctionId]) { clearInterval(itemTimers[auctionId].interval); delete itemTimers[auctionId]; } io.to(auctionId).emit('items_finished', { auctionId }); return; }
@@ -3433,6 +3455,76 @@ async function maybeEndStandardAuction(auctionId) {
   return { ended: true }
 }
 
+// Recovery for security review #2. Before the fix, the live-mode timer could
+// end a standard auction while lots were still open; those lots then sold with
+// an order but no invoice, and nothing revisits an ended auction. This finds
+// standard-lot orders with no invoice on an ENDED standard auction and bills
+// them: one new invoice per buyer, charged like any other (auto: an unpaid
+// invoice only) - but only when the auction's last lot closed within the last
+// 24 hours. Anything older is reported to the admin and never charged
+// automatically: a buyer shouldn't find a surprise charge days after the sale.
+// A buyer who already has an invoice on that auction is also only reported:
+// linking a late order onto an invoice that may already be charged would hide
+// it as paid. Each report goes out once per process, not every tick.
+const STRANDED_AUTO_CHARGE_MS = 24 * 60 * 60 * 1000
+const strandedReported = new Set()
+async function reportStranded(key, subject, lines) {
+  if (strandedReported.has(key)) return
+  strandedReported.add(key)
+  console.error('UNBILLED ORDERS: ' + lines.join(' | '))
+  await sendAdminEmail(subject, lines.join('\n'))
+}
+async function invoiceStrandedOrders() {
+  const { data: stranded, error } = await supabase.from('orders')
+    .select('id, auction_id, buyer_user_id, buyer_username, total_cents')
+    .is('invoice_id', null).not('item_id', 'is', null).not('buyer_user_id', 'is', null)
+  if (error) { console.error('invoiceStrandedOrders: failed to load orders:', error.message); return }
+  if (!stranded?.length) return
+  const { data: ended, error: endedErr } = await supabase.from('auctions').select('id')
+    .in('id', [...new Set(stranded.map(o => o.auction_id))]).eq('mode', 'standard').eq('status', 'ended')
+  if (endedErr) { console.error('invoiceStrandedOrders: failed to load auctions:', endedErr.message); return }
+  const endedIds = new Set((ended || []).map(a => a.id))
+  if (!endedIds.size) return
+  // When selling actually stopped: the auction's last lot close.
+  const { data: lots, error: lotsErr } = await supabase.from('auction_items').select('auction_id, ends_at').in('auction_id', [...endedIds])
+  if (lotsErr) { console.error('invoiceStrandedOrders: failed to load lots:', lotsErr.message); return }
+  const lastClose = {}
+  for (const l of lots || []) {
+    const t = l.ends_at ? Date.parse(l.ends_at) : NaN
+    if (Number.isFinite(t) && !(lastClose[l.auction_id] >= t)) lastClose[l.auction_id] = t
+  }
+  const groups = new Map()
+  for (const o of stranded) {
+    if (!endedIds.has(o.auction_id)) continue
+    const k = o.auction_id + '|' + o.buyer_user_id
+    if (!groups.has(k)) groups.set(k, [])
+    groups.get(k).push(o)
+  }
+  for (const [k, orders] of groups) {
+    const { auction_id: auctionId, buyer_user_id: buyerUserId, buyer_username: buyerUsername } = orders[0]
+    const summary = [`Auction: ${auctionId}`, `Buyer: ${buyerUsername}`, `Orders with no invoice: ${orders.map(o => o.id).join(', ')}`, `Total not billed: ${formatMoney(orders.reduce((n, o) => n + (o.total_cents || 0), 0))}`]
+    const closed = lastClose[auctionId]
+    if (!(Date.now() - closed <= STRANDED_AUTO_CHARGE_MS)) {
+      await reportStranded(k, `Unbilled order(s) - ${buyerUsername}`, [...summary, `Last lot closed: ${closed ? new Date(closed).toISOString() : 'unknown'}`, 'Older than 24 hours: not charged automatically.'])
+      continue
+    }
+    const { data: existing, error: exErr } = await supabase.from('invoices').select('id')
+      .eq('auction_id', auctionId).eq('buyer_user_id', buyerUserId).maybeSingle()
+    if (exErr) { console.error('invoiceStrandedOrders: invoice lookup failed:', auctionId, exErr.message); continue }
+    if (existing) {
+      await reportStranded(k, `Unbilled order(s) - ${buyerUsername}`, [...summary, `Existing invoice: ${existing.id}`, 'Not linked automatically: the existing invoice may already be charged.'])
+      continue
+    }
+    const { data: inv, error: insErr } = await supabase.from('invoices')
+      .insert({ auction_id: auctionId, buyer_user_id: buyerUserId, buyer_username: buyerUsername, total_cents: orders.reduce((n, o) => n + (o.total_cents || 0), 0) })
+      .select('id').single()
+    if (insErr) { console.error('invoiceStrandedOrders: invoice insert failed (another instance?):', auctionId, insErr.message); continue }
+    await supabase.from('orders').update({ invoice_id: inv.id }).in('id', orders.map(o => o.id)).is('invoice_id', null)
+    console.error(`Recovered unbilled orders: auction ${auctionId} buyer ${buyerUsername}, ${orders.length} order(s) -> invoice ${inv.id}`)
+    await chargeInvoice(inv.id, { auto: true })
+  }
+}
+
 async function autoCloseStandardItems() {
   if (autoCloseRunningSince && Date.now() - autoCloseRunningSince < AUTO_CLOSE_STALE_MS) return
   autoCloseRunningSince = Date.now()
@@ -3517,11 +3609,13 @@ async function autoCloseStandardItems() {
       .select('id')
       .eq('mode', 'standard')
       .eq('status', 'live')
-    if (!liveAuctions?.length) return
 
-    for (const auction of liveAuctions) {
+    for (const auction of liveAuctions || []) {
       await maybeEndStandardAuction(auction.id)
     }
+
+    // Step 3: bill any orders an earlier bug left without an invoice.
+    await invoiceStrandedOrders()
   } catch (e) {
     console.error('autoCloseStandardItems error:', e)
   } finally {
