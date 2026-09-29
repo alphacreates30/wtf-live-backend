@@ -12,6 +12,7 @@ const Stripe = require('stripe');
 const nodemailer = require('nodemailer');
 const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const helmet = require('helmet');
+const sharp = require('sharp');
 const aiLots = require('./ai_lots');
 
 const app = express();
@@ -3541,21 +3542,42 @@ async function initStorage() {
   } catch (e) { console.error('Storage init error:', e.message); }
 }
 
+// Every photo is decoded and re-encoded here before it is stored (security
+// review #13). The file used to be stored byte-for-byte, so a phone photo's EXIF
+// - GPS included, often the host's home - went into the PUBLIC bucket whenever
+// the browser hadn't stripped it, and any image/* was accepted (SVG too). Now:
+// the real format is read from the bytes (never the header), only JPEG, PNG
+// and WebP are accepted, EXIF orientation is applied, size is capped, and the
+// output carries no metadata at all (sharp drops it unless asked to keep it).
+const UPLOAD_TYPES = { jpeg: ['image/jpeg', 'jpg'], png: ['image/png', 'png'], webp: ['image/webp', 'webp'] };
+const UPLOAD_MAX_EDGE = 2400;
+async function reencodeUpload(buffer) {
+  let meta;
+  try { meta = await sharp(buffer, { limitInputPixels: 60e6 }).metadata(); } catch { return { error: 'That file is not an image we can read' }; }
+  const type = UPLOAD_TYPES[meta.format];
+  if (!type) return { error: 'Only JPEG, PNG or WebP images can be uploaded' };
+  const img = sharp(buffer, { limitInputPixels: 60e6 }).rotate()
+    .resize({ width: UPLOAD_MAX_EDGE, height: UPLOAD_MAX_EDGE, fit: 'inside', withoutEnlargement: true });
+  const out = meta.format === 'png' ? img.png() : meta.format === 'webp' ? img.webp({ quality: 85 }) : img.jpeg({ quality: 85, mozjpeg: true });
+  return { buffer: await out.toBuffer(), contentType: type[0], ext: type[1] };
+}
+
 app.post('/upload-image', requireAdmin, express.raw({ type: 'image/*', limit: '5mb' }), async (req, res) => {
   try {
-    const mimeType = (req.headers['content-type'] || 'image/jpeg').split(';')[0];
     const buffer = req.body;
-    if (!buffer || !buffer.length) return res.status(400).json({ error: 'No image data' });
-    const ext = mimeType.includes('png') ? 'png' : mimeType.includes('webp') ? 'webp' : 'jpg';
-    const filePath = `items/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+    if (!Buffer.isBuffer(buffer) || !buffer.length) return res.status(400).json({ error: 'No image data' });
+    const img = await reencodeUpload(buffer);
+    if (img.error) return res.status(400).json({ error: img.error });
+    const filePath = `items/${Date.now()}-${crypto.randomBytes(8).toString('hex')}.${img.ext}`;
     const { error: upErr } = await supabase.storage
       .from('item-images')
-      .upload(filePath, buffer, { contentType: mimeType, upsert: false });
-    if (upErr) return res.status(500).json({ error: upErr.message });
+      .upload(filePath, img.buffer, { contentType: img.contentType, upsert: false });
+    if (upErr) { console.error('upload-image: storage upload failed:', upErr.message); return res.status(500).json({ error: 'Upload failed' }); }
     const { data: { publicUrl } } = supabase.storage.from('item-images').getPublicUrl(filePath);
     res.json({ url: publicUrl });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('upload-image failed:', err.message);
+    res.status(500).json({ error: 'Upload failed' });
   }
 });
 
