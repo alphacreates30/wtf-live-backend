@@ -175,7 +175,8 @@ addresses. Production never sets it, and Railway traffic never arrives from loop
 - Migration `2026-09-29p-rls-lockdown.sql`: **applied on production 2026-09-29** (Cowork; all checks 0). Its
   sequence check is now guarded with CASE, after it threw "saml_providers_pkey is not a sequence" there.
 - Migration `2026-09-29q-username-unique-lower.sql`: applied on wtf-test; **on hold for production**, which has
-  the case-duplicate test accounts bidder305TEST / Bidder305TEST.
+  the case-duplicate test accounts bidder305TEST / Bidder305TEST. Albert: delete both - migration
+  `2026-09-29r-DELETE-case-duplicate-test-accounts.sql` first (gated: stops on any order/invoice), then q.
 
 ## Not covered
 
