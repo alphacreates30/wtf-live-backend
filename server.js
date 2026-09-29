@@ -187,12 +187,17 @@ async function shouldSuppressOutbid() {
 // Resend outage can't block a charge, an auto-close tick, or a bid response.
 // kind categorizes the send for the rolling-window volume count and the outbid
 // suppression check above; pass 'outbid' only for the outbid email itself.
+// Logs never carry a buyer's email address (security review #21): the outbid
+// suppression line used to print the recipient, and Resend's error body can
+// echo it back. Railway keeps logs; addresses stay in the database.
+const redactEmails = t => String(t ?? '').replace(/[^\s@"'<>,;:()]+@[^\s@"'<>,;:()]+\.[^\s@"'<>,;:()]+/g, '[email]');
+
 async function sendEmail({ from, to, subject, html, text, kind = 'other' }) {
   if (!process.env.RESEND_API_KEY) return; // skip if not configured
   if (!to) return;
 
   if (kind === 'outbid' && await shouldSuppressOutbid()) {
-    console.error(`OUTBID EMAIL SUPPRESSED (at ${OUTBID_SUPPRESS_AT} of the ${MONTHLY_EMAIL_CAP} Resend quota, rolling ${EMAIL_WINDOW_DAYS} days): to=${to} subject="${subject}"`);
+    console.error(`OUTBID EMAIL SUPPRESSED (at ${OUTBID_SUPPRESS_AT} of the ${MONTHLY_EMAIL_CAP} Resend quota, rolling ${EMAIL_WINDOW_DAYS} days): subject="${redactEmails(subject)}"`);
     return;
   }
 
@@ -207,7 +212,7 @@ async function sendEmail({ from, to, subject, html, text, kind = 'other' }) {
       signal: AbortSignal.timeout(8000),
     });
     if (!res.ok) {
-      console.error('Email send error:', res.status, await res.text());
+      console.error('Email send error:', res.status, redactEmails(await res.text()).slice(0, 300));
       return;
     }
     try {
