@@ -97,6 +97,12 @@ routes below.
 > default privileges, so the `anon`/`authenticated` EXECUTE revokes on
 > `delete_auction_cascade` and `update_standard_leader_max` had to be applied to
 > wtf-test by hand. Check those after any re-copy.
+>
+> **Production's connection string is not kept.** `PROD_DB_URL` was in
+> `.env.test` only for that one-time copy and was removed afterwards. No suite
+> uses it. A future re-copy needs it added back **temporarily** (session pooler
+> string, password URL-encoded), used only for the read-only `pg_dump`, then
+> removed again. `TEST_DB_URL` stays.
 
 They start local copies of the server on ports 3231-3234, 3241-3242, 3251-3252,
 3261-3262, 3271-3272, 3281-3285, 3291-3293, 3301-3312, 3321-3322, 3331-3332, 3341-3342 and 3351-3352 with the background jobs (`setInterval`) stubbed out, so nothing
