@@ -23,10 +23,15 @@ const io = new Server(server, {
 // -- Stripe webhook needs raw body --
 app.use('/webhook/stripe', express.raw({ type: 'application/json' }));
 app.use(cors());
-// 60mb to accommodate base64 photo batches on the AI lot endpoints - Express
-// only applies the first body parser it hits, so a route-specific limit
-// declared later (e.g. on /ai/analyze-lot) never overrides this default.
-app.use(express.json({ limit: '60mb' }));
+// JSON bodies: 100kb (security review #12). This used to be 60mb for every
+// route, anonymous ones included, so repeated 60mb POSTs to /auth/login could
+// exhaust the instance's memory. Express applies only the first JSON parser a
+// request hits, so the three routes that take big bodies (base64 photo batches,
+// 200-lot bulk create) are skipped here and parse their own - after
+// requireAdmin, so a big body is only ever read for the admin.
+const BIG_JSON_ROUTES = [/^\/ai\/(group-photos|analyze-lot)\/?$/, /^\/auction\/[^/]+\/items\/bulk\/?$/];
+const smallJson = express.json({ limit: '100kb' });
+app.use((req, res, next) => BIG_JSON_ROUTES.some(re => re.test(req.path)) ? next() : smallJson(req, res, next));
 
 // -- Rate limits (security review #5) --
 // There were none: 30 wrong passwords in under 5s, no lockout, and nothing
@@ -3762,6 +3767,17 @@ async function autoCloseStandardItems() {
 setInterval(autoCloseStandardItems, 30000)
 autoCloseStandardItems()
 
+
+// Last error handler: errors thrown before or inside a route (a body over the
+// limit, malformed JSON, an unexpected throw) answer with a short JSON error
+// instead of Express's default HTML page, which includes a stack trace
+// whenever NODE_ENV isn't 'production'.
+app.use((err, req, res, next) => {
+  const status = Number.isInteger(err.status) && err.status >= 400 && err.status < 600 ? err.status : 500;
+  if (status >= 500) console.error('Unhandled route error:', req.method, req.path, err.message);
+  if (res.headersSent) return next(err);
+  res.status(status).json({ error: status === 413 ? 'Request too large' : status < 500 ? 'Bad request' : 'Something went wrong' });
+});
 
 // Backstop for #4: a rejected promise nobody awaited is logged, not fatal.
 // (Uncaught synchronous exceptions still exit - that state can't be trusted.)
