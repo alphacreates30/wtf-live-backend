@@ -1762,13 +1762,22 @@ app.delete('/auction/:id', requireAdmin, async (req, res) => {
   }
   res.json({ success: true });
 });
-app.get('/auction/:id/bids', async (req, res) => {
+// A draft's bids and chat stay as private as the draft itself (security review
+// #17): anonymous reads by id used to return them. 404, as for /auction/:id.
+async function hideDraftFromNonAdmin(req, res, next) {
+  const { data: auction, error } = await supabase.from('auctions').select('status').eq('id', req.params.id).maybeSingle();
+  if (error) return dbFailure(req, res, error);
+  if (auction?.status === 'draft' && req.user?.username !== ADMIN_USERNAME) return res.status(404).json({ error: 'Auction not found' });
+  next();
+}
+
+app.get('/auction/:id/bids', optionalAuth, hideDraftFromNonAdmin, async (req, res) => {
   const { data, error } = await supabase.from('bids').select('*').eq('auction_id', req.params.id).order('created_at', { ascending: false }).limit(50);
   if (error) return dbFailure(req, res, error);
   res.json(data);
 });
 
-app.get('/auction/:id/chat', async (req, res) => {
+app.get('/auction/:id/chat', optionalAuth, hideDraftFromNonAdmin, async (req, res) => {
   const { data, error } = await supabase.from('chat_messages').select('*').eq('auction_id', req.params.id).eq('flagged', false).order('created_at', { ascending: true }).limit(100);
   if (error) return dbFailure(req, res, error);
   res.json(data);
