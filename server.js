@@ -3500,6 +3500,157 @@ app.get('/auction/:id/items/standard-status', optionalAuth, async (req, res) => 
   res.json(canSeeLotMaxes(req.user, auction) ? data : data.map(hideLotMax));
 });
 
+// ---------------------------------------------------------------------------
+// Homepage (wtf-handoff HOMEPAGE_REFRESH_BRIEF.md). Public, no login, and the
+// same answer for everyone - which is what makes the short cache below safe.
+// The web page and a future app both render from these; contracts in API.md.
+//
+// Public rules as everywhere else: drafts never appear, and a lot is sent as
+// HOME_LOT_FIELDS only - an allow-list, so top_pre_bid, reserve_price and the
+// leading bidder can't slip out when a column is added to auction_items.
+// ---------------------------------------------------------------------------
+const HOME_LOT_FIELDS = 'id, auction_id, position, title, image_url, current_bid, bid_count, ends_at, status';
+const HOME_RAIL_MAX = 12;
+const HOME_UPCOMING_MAX = 6;
+const HOME_FEATURED_IMAGES = 5;
+// "Most wanted" is only worth showing once bidding is actually happening: a
+// rail of lots with one bid each reads as an empty room. Below this many lots
+// with bids the rail is sent empty, and an empty rail is hidden.
+const MOST_WANTED_MIN_LOTS = 3;
+const HOME_CACHE_MS = 10_000;
+
+// Standard auctions have no job that flips 'upcoming' to 'live' at starts_at:
+// bidding opens by the clock. So "live" here means status 'live', or
+// 'upcoming' with starts_at passed; "upcoming" means not started yet.
+function auctionPhase(a, nowMs) {
+  if (a.status === 'live') return 'live';
+  if (a.status === 'upcoming') return a.starts_at && new Date(a.starts_at).getTime() > nowMs ? 'upcoming' : 'live';
+  return null;
+}
+const isoOrNull = v => (v ? new Date(v).toISOString() : null);
+// Premium is always shown beside a bid (BRAND.md), so every lot list carries its
+// auctions' own buyer's premium - keyed by auction id, the lot shape stays as it is.
+const premiumMap = auctions => Object.fromEntries((auctions || []).map(a => [a.id, a.buyers_premium_pct == null ? null : Number(a.buyers_premium_pct)]));
+const homeLot = l => ({
+  id: l.id, auction_id: l.auction_id, position: l.position, title: l.title, image_url: l.image_url || null,
+  current_bid: Number(l.current_bid ?? 0), bid_count: l.bid_count ?? 0, ends_at: isoOrNull(l.ends_at), status: l.status,
+});
+
+async function buildHome() {
+  const nowMs = Date.now(), now = new Date(nowMs).toISOString();
+  const { data: auctions, error } = await supabase.from('auctions')
+    .select('id, title, description, status, starts_at, ends_at, image_url, buyers_premium_pct')
+    .in('status', ['live', 'upcoming']);
+  if (error) throw error;
+  const live = [], upcoming = [];
+  for (const a of auctions || []) (auctionPhase(a, nowMs) === 'live' ? live : upcoming).push(a);
+  const liveIds = live.map(a => a.id);
+
+  // One query per rail. auction_items is indexed on ends_at and on (auction_id, status).
+  const openLots = () => supabase.from('auction_items').select(HOME_LOT_FIELDS)
+    .in('auction_id', liveIds).not('status', 'in', '("sold","unsold")').gt('ends_at', now);
+  const [ending, wanted, first] = liveIds.length ? await Promise.all([
+    openLots().order('ends_at', { ascending: true }).order('position', { ascending: true }).limit(HOME_RAIL_MAX),
+    openLots().gt('bid_count', 0).order('bid_count', { ascending: false }).order('ends_at', { ascending: true }).limit(HOME_RAIL_MAX),
+    openLots().eq('bid_count', 0).order('ends_at', { ascending: true }).order('position', { ascending: true }).limit(HOME_RAIL_MAX),
+  ]) : [{ data: [] }, { data: [] }, { data: [] }];
+  for (const r of [ending, wanted, first]) if (r.error) throw r.error;
+
+  // Featured: the live auction ending soonest (no end date sorts last), else
+  // the next to open, else nothing.
+  const byEnd = (a, b) => (a.ends_at ? Date.parse(a.ends_at) : Infinity) - (b.ends_at ? Date.parse(b.ends_at) : Infinity);
+  const byStart = (a, b) => (a.starts_at ? Date.parse(a.starts_at) : Infinity) - (b.starts_at ? Date.parse(b.starts_at) : Infinity);
+  live.sort(byEnd);
+  upcoming.sort(byStart);
+  const pick = live[0] || upcoming[0] || null;
+  let featured = null;
+  if (pick) {
+    const { data: lots, count, error: lotsErr } = await supabase.from('auction_items')
+      .select('image_url', { count: 'exact' }).eq('auction_id', pick.id).order('position', { ascending: true });
+    if (lotsErr) throw lotsErr;
+    const images = [...new Set([pick.image_url, ...(lots || []).map(l => l.image_url)].filter(Boolean))].slice(0, HOME_FEATURED_IMAGES);
+    featured = {
+      id: pick.id, title: pick.title, description: pick.description || '',
+      status: auctionPhase(pick, nowMs), starts_at: isoOrNull(pick.starts_at), ends_at: isoOrNull(pick.ends_at),
+      lot_count: count ?? (lots || []).length, images,
+    };
+  }
+
+  const wantedLots = (wanted.data || []).length >= MOST_WANTED_MIN_LOTS ? wanted.data : [];
+  return {
+    featured,
+    premium_pct: premiumMap(auctions),
+    rails: {
+      ending_soon: (ending.data || []).map(homeLot),
+      most_wanted: wantedLots.map(homeLot),
+      first_bid: (first.data || []).map(homeLot),
+    },
+    upcoming: upcoming.filter(a => a.starts_at).slice(0, HOME_UPCOMING_MAX).map(a => ({
+      id: a.id, title: a.title, description: a.description || '', starts_at: isoOrNull(a.starts_at), ends_at: isoOrNull(a.ends_at),
+      image_url: a.image_url || null,
+    })),
+  };
+}
+
+// The busiest page: build it at most once per HOME_CACHE_MS per instance, and
+// let concurrent callers share one build. server_now is stamped per response,
+// so the countdowns (which tick client-side from it) never drift by the cache age.
+let homeCache = { at: 0, body: null, pending: null };
+app.get('/home', async (req, res) => {
+  try {
+    if (!homeCache.body || Date.now() - homeCache.at > HOME_CACHE_MS) {
+      if (!homeCache.pending) {
+        homeCache.pending = buildHome()
+          .then(body => { homeCache = { at: Date.now(), body, pending: null }; return body; })
+          .catch(e => { homeCache.pending = null; throw e; });
+      }
+      await homeCache.pending;
+    }
+    res.set('Cache-Control', 'no-store');
+    res.json({ server_now: new Date().toISOString(), ...homeCache.body });
+  } catch (e) {
+    dbFailure(req, res, e);
+  }
+});
+
+// Simple search over lot titles in live and upcoming auctions (the full
+// filtered lots page comes later). Same lot fields as the homepage rails.
+const SEARCH_MAX = 48;
+app.get('/search', async (req, res) => {
+  const q = typeof req.query.q === 'string' ? req.query.q.trim().replace(/\s+/g, ' ') : '';
+  if (q.length < 2) return res.json({ server_now: new Date().toISOString(), q, lots: [], premium_pct: {} });
+  if (q.length > 100) return res.status(400).json({ error: 'Search is too long' });
+  const nowMs = Date.now();
+  const { data: auctions, error } = await supabase.from('auctions').select('id, status, starts_at, buyers_premium_pct').in('status', ['live', 'upcoming']);
+  if (error) return dbFailure(req, res, error);
+  const open = (auctions || []).filter(a => auctionPhase(a, nowMs)), ids = open.map(a => a.id);
+  if (!ids.length) return res.json({ server_now: new Date().toISOString(), q, lots: [], premium_pct: {} });
+  const { data: lots, error: lotsErr } = await supabase.from('auction_items').select(HOME_LOT_FIELDS)
+    .in('auction_id', ids).ilike('title', `%${likeExact(q)}%`)
+    .order('ends_at', { ascending: true, nullsFirst: false }).order('position', { ascending: true }).limit(SEARCH_MAX);
+  if (lotsErr) return dbFailure(req, res, lotsErr);
+  const found = (lots || []).map(homeLot), inResults = new Set(found.map(l => l.auction_id));
+  res.json({ server_now: new Date().toISOString(), q, lots: found, premium_pct: premiumMap(open.filter(a => inResults.has(a.id))) });
+});
+
+// "Wake me when it opens" (migration u). Stores the address only - nothing is
+// sent yet. Always the same answer, whether the address is new, already on the
+// list or caught by the honeypot, so the form can't be used to test who signed up.
+const SIGNUP_OK = { ok: true, message: "Thanks. We'll email you when the next collection opens." };
+const signupLimit = limiter({ windowMs: 60 * 60e3, limit: 5, message: 'Too many sign-ups from here. Try again later.' });
+app.post('/signup', signupLimit, async (req, res) => {
+  // Honeypot: a field people never see. A bot that fills it gets the normal answer.
+  if (req.body?.website) return res.json(SIGNUP_OK);
+  const email = cleanEmail(req.body?.email);
+  if (!email) return res.status(400).json({ error: 'Enter a valid email address' });
+  const { error } = await supabase.from('drop_signups').upsert({ email }, { onConflict: 'email', ignoreDuplicates: true });
+  if (error) {
+    if (error.code === '42P01' || error.code === 'PGRST205') return res.status(503).json({ error: "Sign-up isn't open yet. Please try again soon." });
+    return dbFailure(req, res, error);
+  }
+  res.json(SIGNUP_OK);
+});
+
 const PORT = process.env.PORT || 3001;
 
 // ---------------------------------------------------------------------------

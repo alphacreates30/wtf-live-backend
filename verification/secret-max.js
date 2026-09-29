@@ -117,7 +117,9 @@ async function scenario(port, label) {
   seen.push(['C: pre-bid response', r.j]);
 
   const reads = [`/auction/${S}/items`, `/auction/${S}/items/standard-status`, `/auction/${S}`, `/auction/${S}/bids`,
-    `/auction/${V}/items`, `/auction/${V}`, `/auction/${V}/items/standard-status`, `/auction/${V}/items/${VL}/images`, `/auctions`];
+    `/auction/${V}/items`, `/auction/${V}`, `/auction/${V}/items/standard-status`, `/auction/${V}/items/${VL}/images`, `/auctions`,
+    // Homepage (2026-09-30): the rails and search send lots to everyone. Not on the pinned commit (404 there).
+    '/home', '/search?q=secretmax'];
   for (const [who, tok] of [['anonymous', null], ['C', tokC]]) {
     for (const p of reads) { const x = await call(port, 'GET', p, tok); seen.push([`${who}: GET ${p.replace(S, 'S').replace(V, 'V').replace(VL, 'VL')} (${x.s})`, x.j]); }
   }
@@ -139,6 +141,9 @@ async function scenario(port, label) {
     adminItems: (await call(port, 'GET', `/auction/${S}/items`, tokAdmin)).j,
     leaderPrebid: (await call(port, 'GET', `/auction/${V}/items/${VL}/prebid`, tokL)).j,
     leaderMyBids: (await call(port, 'GET', '/my-bids', tokL)).j,
+    // So the /home and /search 'no max' checks aren't vacuous: S's lot must actually be in them.
+    home: (await call(port, 'GET', '/home')).j,
+    search: (await call(port, 'GET', '/search?q=secretmax')).j,
   };
   return { seen, openingPrice, controls };
 }
@@ -176,6 +181,9 @@ async function cleanup() {
     const adminLot = (now.controls.adminItems || [])[0] || {};
     ok(Number(adminLot.top_pre_bid) === STD_MAX, `NEW admin/host still sees top_pre_bid on the items list (${adminLot.top_pre_bid})`);
     ok(now.controls.leaderPrebid && Number(now.controls.leaderPrebid.max_amount) === PRE_MAX, `NEW L still sees their OWN pre-bid max (${now.controls.leaderPrebid && now.controls.leaderPrebid.max_amount})`);
+    const homeLots = Object.values((now.controls.home || {}).rails || {}).flat();
+    ok(homeLots.some(l => l.bid_count > 0 && /secretmax/.test(l.title)) && ((now.controls.search || {}).lots || []).some(l => /secretmax/.test(l.title)),
+      `NEW /home rails and /search do carry S's bid-on lot (so their no-max checks above mean something)`);
     const mine = (now.controls.leaderMyBids || []).find(i => Number(i.max_bid) === STD_MAX);
     ok(!!mine, `NEW L's /my-bids still shows their OWN max on the standard lot (${mine && mine.max_bid})`);
     console.log(`\nNOTE live mode (gated off in v2) opens a lot at the top pre-bid max: item_activated current_bid = ${now.openingPrice} (L's pre-bid max ${PRE_MAX}). Not fixed here; see README.`);

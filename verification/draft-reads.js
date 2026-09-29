@@ -23,6 +23,8 @@ async function mkAuction(label, status) {
   made.push(a.id);
   die(await s.from('chat_messages').insert({ auction_id: a.id, username: 'zztest_draftreads', text: 'ZZTEST secret draft chat', role: 'viewer' }).select().single());
   die(await s.from('bids').insert({ auction_id: a.id, username: 'zztest_draftreads', amount: 7 }).select().single());
+  // An open, bid-on lot ending soon: exactly what the homepage rails and search pick up (2026-09-30).
+  die(await s.from('auction_items').insert({ auction_id: a.id, title: 'ZZTEST draftreads lot ' + label, starting_bid: 0, current_bid: 7, bid_count: 1, position: 0, status: 'open', ends_at: new Date(Date.now() + 3600e3).toISOString() }).select().single());
   return a.id;
 }
 
@@ -47,6 +49,13 @@ async function mkAuction(label, status) {
     ok(b.s === 200 && b.j.length === 1 && c.s === 200 && c.j.length === 1, 'NEW: the admin still reads a draft\'s bids and chat');
     b = await get(newSrv.url, `/auction/${live}/bids`); c = await get(newSrv.url, `/auction/${live}/chat`);
     ok(b.s === 200 && b.j.length === 1 && c.s === 200 && c.j.length === 1, 'NEW: a live auction\'s bids and chat are still public');
+    // Homepage (2026-09-30): the draft's lot never reaches /home or /search, for anyone; the live one's does.
+    for (const [who, t] of [['anonymous', null], ['a logged-in buyer', BUYER], ['the admin', ADMIN]]) {
+      const h = await get(newSrv.url, '/home', t), q = await get(newSrv.url, '/search?q=draftreads', t);
+      const hl = Object.values(h.j.rails).flat(), txt = JSON.stringify(h.j) + JSON.stringify(q.j);
+      ok(h.s === 200 && q.s === 200 && !txt.includes(draft) && !txt.includes('lot draft') && hl.some(l => l.auction_id === live) && q.j.lots.some(l => l.auction_id === live),
+        `NEW: ${who} -> /home and /search show the live auction's lot, nothing of the draft`);
+    }
     b = await get(newSrv.url, `/auction/${crypto.randomUUID()}/bids`);
     ok(b.s === 200 && Array.isArray(b.j) && b.j.length === 0, 'NEW: an unknown auction id still answers an empty list (as before)');
   } finally {

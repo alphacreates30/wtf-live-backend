@@ -185,6 +185,15 @@ process (`local-server.js` options `env`, `preload`, `patch`), so nothing leaves
 | `account-delete.js` | A clean deletion end to end: personal fields empty, old session rejected, login impossible, Stripe cards detached + customer deleted, orders/invoices intact (totals unchanged), username -> `deleted_<12 hex>` everywhere, old username held 30 days (SHA-256 only), audit row, confirmation email to the old address, nothing of the buyer's in any API response (anonymous, another buyer, admin; the completed order's shipping address stays as the tax record), admin can't re-approve or re-password it. |
 | `account-delete-premigration.js` | The new code on a database without migration t: registration, login and admin screens work; the delete route answers 503 and changes nothing. |
 
+**Homepage refresh (F1)** (wtf-handoff `HOMEPAGE_REFRESH_BRIEF.md`, 2026-09-30). `GET /home`, `GET /search`,
+`POST /signup`; contracts in `API.md`. Sign-up needs migration `2026-09-30u-drop-signups.sql` (applied on wtf-test;
+**not yet on production**: until it is, `/signup` answers 503 and the rest of the homepage works).
+
+| Suite | Proves |
+|---|---|
+| `home.js` | `/home`: shape; featured = live auction ending soonest, else next upcoming, else null; every rail's order and 12-limit computed independently from the fixtures; an `upcoming` auction past its start counts as live; sold, unsold, past-its-end, upcoming-auction, draft and ended lots never in a rail; each lot exactly the nine public fields and no max/reserve/leader by key or value; Most wanted empty below 3 bid-on lots; upcoming max 6; the empty-site answer; the 10 s cache with a fresh `server_now`. `/search`: live + upcoming only, `%` literal, short/long queries. `/signup`: one lowercased row, identical answer for new / repeat / honeypot, 400 on bad addresses, 429 after 5 per IP per hour. Before migration u: 503 asserted, exit 2. |
+| `secret-max.js`, `draft-reads.js` | Extended: `/home` and `/search` carry the bid-on lot but never the leader's max, and never a draft's lot (anonymous, buyer, admin). |
+
 **Rate limits and the suites.** `guard.js` sets `RATE_LIMIT_EXEMPT_LOOPBACK=1`, which the suites' local servers
 inherit, because a suite fires many logins and bids from localhost. The server honours it only for loopback
 addresses. Production never sets it, and Railway traffic never arrives from loopback. `rate-limits.js` clears it.
