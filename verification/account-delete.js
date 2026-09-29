@@ -17,7 +17,7 @@ const { createClient } = require(BE + '/node_modules/@supabase/supabase-js');
 const s = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 let fails = 0;
 const ok = (c, m) => { console.log((c ? 'PASS ' : 'FAIL ') + m); if (!c) fails++; };
-const PW = 'correct-horse-delete', tag = Date.now().toString(36);
+const PW = 'correct-horse-delete', tag = Date.now().toString(36), RUN_START = new Date().toISOString();
 const CALLS = BE + '/run.tmp-del-stripe.log', MAIL = BE + '/run.tmp-del-mail.log';
 const STRIPE_LINE = 'const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(process.env.STRIPE_SECRET_KEY) : null;';
 const FAKE_STRIPE = `const __log = (op, id) => require('fs').appendFileSync(${JSON.stringify(CALLS)}, op + ' ' + id + '\\n');
@@ -153,8 +153,11 @@ async function history(D, E) {
     await s.from('profiles').delete().in('user_id', made.users.map(String));
     await s.from('users').delete().in('id', made.users);
     await s.from('reserved_usernames').delete().in('username_hash', ['d', 'e'].map(l => sha(`zzdel_${l}_${tag}`)));
+    // the stubbed Resend accepts the confirmation email, so the server logs it in email_send_log: remove this run's row
+    await s.from('email_send_log').delete().eq('kind', 'account_deleted').gte('sent_at', RUN_START);
     const left = (await s.from('users').select('id').in('id', made.users)).data.length + (await s.from('auctions').select('id').like('title', 'ZZTEST_del %')).data.length
-      + (await s.from('account_deletions').select('id').in('user_id', made.users)).data.length + (await s.from('reserved_usernames').select('username_hash')).data.length;
+      + (await s.from('account_deletions').select('id').in('user_id', made.users)).data.length + (await s.from('reserved_usernames').select('username_hash')).data.length
+      + (await s.from('email_send_log').select('id').eq('kind', 'account_deleted').gte('sent_at', RUN_START)).data.length;
     console.log('\nleftover throwaway rows:', left);
     if (left) fails++;
   }
