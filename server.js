@@ -1250,12 +1250,15 @@ app.post('/webhook/stripe', async (req, res) => {
       // Source of truth for whether an invoice is paid - not profiles, which
       // Phase D's UI doesn't read for this. Mirror onto every child order so
       // orders.payment_status stays in sync with its invoice.
-      await supabase.from('invoices').update({ payment_status: 'failed', payment_error: reason }).eq('id', invoice_id);
-      await supabase.from('orders').update({ payment_status: 'failed', payment_error: reason }).eq('invoice_id', invoice_id);
+      // Never over a charge that went through (security review #19): a late
+      // failure event for an EARLIER attempt must not relabel an invoice that a
+      // later attempt paid - the PaymentIntent id is set only on success.
+      await supabase.from('invoices').update({ payment_status: 'failed', payment_error: reason }).eq('id', invoice_id).is('payment_intent_id', null);
+      await supabase.from('orders').update({ payment_status: 'failed', payment_error: reason }).eq('invoice_id', invoice_id).is('payment_intent_id', null);
     } else if (order_id) {
       // Source of truth for whether an order is paid - not profiles, which
       // Phase D's UI doesn't read for this.
-      await supabase.from('orders').update({ payment_status: 'failed', payment_error: reason }).eq('id', order_id);
+      await supabase.from('orders').update({ payment_status: 'failed', payment_error: reason }).eq('id', order_id).is('payment_intent_id', null);
     }
     if (winner_username) {
       await sendAdminEmail(
