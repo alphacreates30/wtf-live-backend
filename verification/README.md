@@ -141,6 +141,39 @@ always red teaches people to ignore red.
 | `password-reset.js` | Account email + forgotten password (migration `2026-09-26m`): registration requires an email (stored lowercased) and 8+ characters, existing short passwords still log in; `/auth/forgot-password` answers identically for unknown accounts, emails one single-use 1-hour link per matching account (shared address -> one each), stores only a SHA-256; the same link submitted twice at once succeeds exactly once; a reset retires the account's other links; **rate limit 3 per account per hour holds when 4 requests arrive at once** (count-then-insert let 4 of 4 through - caught by this suite's first run, fixed insert-first); **a token issued before a reset (with or without the `pca` claim) is refused after it**, also by a second instance deciding from the database; a host temporary password signs out the buyer; changing an account email needs the current password; `/profile` requires an email and fills a missing account email. Emails are written to a local file, never sent. | n/a (new feature) | _this slice_ |
 | `secret-max.js` | A standard lot's leading max is secret: `auction_items.top_pre_bid` (the highest max - on a standard lot, the leader's proxy ceiling) went out on the public `GET /auction/:id/items` and `/items/standard-status` (no login needed; TEST Auction showed 5 / 10 / 12, exactly the maxes), in the lot row a losing challenger got back from `POST .../bid`, and in the `item_activated` socket broadcast. Pinned commit: 10 leaking responses. Now stripped for everyone but the admin / the auction's host (`hideLotMax`). As anonymous and as a non-leading buyer, every REST read, the bid and pre-bid responses and every socket event on join/activation are searched for the leader's max values and the key; controls: admin still sees it, the leader still sees their OWN max (`GET .../prebid`, `/my-bids`). Needs `../wtf-live-frontend` (socket.io-client). **Known, not fixed:** live mode (gated off, v2) opens a lot at the top pre-bid max, so `item_activated`'s `current_bid` equals it; the suite prints this as a NOTE; parked with the other live-mode item under **Not covered**. | **`18b79c5`** | _this slice_ |
 
+### Security review fixes (2026-09-29)
+
+One suite per finding in the wtf-handoff `SECURITY_PRIVACY_REVIEW_PHASE1_REPORT.md`. Each has a control on the
+commit before its fix. The newer suites boot their local servers through `verification/local-server.js`.
+
+| Suite | Finding | Proves | Control pinned to |
+|---|---|---|---|
+| `live-timer-scope.js` | #2 Critical | The live-MODE auction timer (armed at every boot and by an anonymous `join_auction`) ended STANDARD auctions at the auction-level `ends_at` with lots still open, so those lots sold with no invoice. Now it never touches them. Also the recovery sweep: stranded orders are invoiced and charged only if the auction's last lot closed within 24h; older ones, or a buyer who already has an invoice, email the admin only. | `a928646` |
+| `live-socket-scope.js` | #6 High | Socket `place_bid` / `end_auction` acted on a standard auction's row. Now refused; a real live-mode auction still takes socket bids. | `a928646` |
+| `bid-eligibility.js` | #3 Critical | Accounts with no profile, pending, rejected, blocked, or no saved card could accept terms, pre-bid and bid. Now 403 with a `code`, nothing written. Max bid $1 to $100,000. | `528c94e` |
+| `socket-robustness.js` | #4 High | One anonymous `socket.emit('place_bid')` with no payload killed the process. Now 8 events × 7 bad payloads leave the server up. | `2a89576` |
+| `rls-lockdown.js` | #1 Critical | Acts as `anon`/`authenticated` exactly as PostgREST does (`SET ROLE`, rolled back). BEFORE migration `p` it records the controls and exits 2; AFTER, every table, sequence and function is refused, new objects start closed, and service_role still works. Test database only (needs `TEST_DB_URL`). | the live schema |
+| `rate-limits.js` | #5 High | Failed logins (per address, per account), register, reset, current-password checks, bids, chat. Switches the suites' loopback exemption off and simulates client IPs with `X-Forwarded-For`. | `7e8e352` |
+| `chat-standing.js` | #7 | Blocked or unapproved users could chat, drafts included. | `05db001` |
+| `reserve-hidden.js` | #8 | `reserve_price` went to everyone; now admin/host only. | `6db2e29` |
+| `shippo-webhook-auth.js` | #9 | Anyone could POST a tracking update. Now needs `?key=<SHIPPO_WEBHOOK_SECRET>`; refuses everything with no secret set. | `28457dc` |
+| `body-limit.js` | #12 | 60MB JSON on every route. Now 100kb, except the admin's photo and bulk routes; errors are short JSON, never a stack trace. | `6ff4d7d` |
+| `cors-origins.js` | #11 | CORS `*`. Now the site (plus local dev off Railway, plus `CORS_EXTRA_ORIGINS`), REST and the socket handshake. | `f72be77` |
+| `security-headers.js` | #10 | API headers (helmet) and 7-day sessions. The site's CSP is in the frontend's `vercel.json`. | `2116b90` |
+| `upload-reencode.js` | #13 | Uploads were stored byte-for-byte (EXIF GPS in the public bucket; SVG accepted). Now re-encoded: no metadata, orientation applied, JPEG/PNG/WebP only, 2400px max. | `1e24469` |
+| `username-rules.js` | #14 | Host lookalikes registered. Now lowercase `a-z 0-9 _`, no `whatthefind`/staff names, unique by case (migration `q`). | `8d21f1e` |
+
+**Rate limits and the suites.** `guard.js` sets `RATE_LIMIT_EXEMPT_LOOPBACK=1`, which the suites' local servers
+inherit, because a suite fires many logins and bids from localhost. The server honours it only for loopback
+addresses. Production never sets it, and Railway traffic never arrives from loopback. `rate-limits.js` clears it.
+
+**Production settings these fixes need** (Railway, backend service):
+- `SHIPPO_WEBHOOK_SECRET`: a long random value (32+ chars). The webhook URL registered in Shippo must end in
+  `?key=<that value>`. Until both are set, Shippo tracking updates are refused (401), and order status can still
+  be set by hand.
+- `CORS_EXTRA_ORIGINS` (optional): extra browser origins, comma-separated (e.g. a Vercel preview URL).
+- Migrations `2026-09-29p-rls-lockdown.sql` and `2026-09-29q-username-unique-lower.sql` (applied on wtf-test).
+
 ## Not covered
 
 - **Before live mode is turned back on (parked 2026-09-27, do both together).**
