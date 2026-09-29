@@ -1931,15 +1931,27 @@ io.on('connection', (socket) => {
   on('send_chat', async ({ auctionId, text, token }) => {
     const user = await verifySocketToken(token);
     if (!user) { socket.emit('chat_error', { message: 'You must be logged in to chat' }); return; }
-    if (!text || !text.trim()) return;
+    if (typeof text !== 'string' || !text.trim()) return;
     const clean = text.trim().slice(0, 200);
 
-    let role = 'viewer';
-    const { data: auction } = await supabase.from('auctions').select('host_username, leading_bidder').eq('id', auctionId).single();
-    if (auction) {
-      if (auction.host_username === user.username) role = 'host';
-      else if (auction.leading_bidder === user.username) role = 'bidder';
+    // Same standing as joining the room (security review #7): this used to check
+    // the token only, so a blocked user kept posting - into any auction, drafts
+    // included - just by emitting the event.
+    const { data: auction } = await supabase.from('auctions').select('host_username, leading_bidder, status').eq('id', auctionId).maybeSingle();
+    if (!auction || (auction.status === 'draft' && user.username !== ADMIN_USERNAME)) {
+      socket.emit('chat_error', { message: 'Auction not found' }); return;
     }
+    if (user.username !== ADMIN_USERNAME) {
+      const { data: profile, error: pErr } = await supabase.from('profiles').select('status').eq('user_id', String(user.id)).maybeSingle();
+      if (pErr) { socket.emit('chat_error', { message: 'Could not check your account. Try again in a moment.' }); return; }
+      if (!profile || profile.status !== 'approved') {
+        socket.emit('chat_error', { message: profile?.status === 'blocked' ? 'You have been removed from this auction.' : 'Your account must be approved before you can chat.' }); return;
+      }
+    }
+
+    let role = 'viewer';
+    if (auction.host_username === user.username) role = 'host';
+    else if (auction.leading_bidder === user.username) role = 'bidder';
 
     const { data: msg, error } = await supabase.from('chat_messages').insert({ auction_id: auctionId, username: user.username, text: clean, role }).select().single();
     if (error) { console.error('Chat save error:', error); return; }
