@@ -11,6 +11,7 @@ const { AccessToken } = require('livekit-server-sdk');
 const Stripe = require('stripe');
 const nodemailer = require('nodemailer');
 const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
+const helmet = require('helmet');
 const aiLots = require('./ai_lots');
 
 const app = express();
@@ -36,6 +37,12 @@ const io = new Server(server, {
   // Browsers don't apply CORS to a WebSocket upgrade, so check the origin here too.
   allowRequest: (req, cb) => cb(null, originAllowed(req.headers.origin)),
 });
+
+// Security headers on every API response (security review #10): nosniff,
+// no framing, a locked-down CSP (the API only ever returns JSON), HSTS, and no
+// x-powered-by. The site's own headers (CSP etc.) are set in the frontend's
+// vercel.json.
+app.use(helmet());
 
 // -- Stripe webhook needs raw body --
 app.use('/webhook/stripe', express.raw({ type: 'application/json' }));
@@ -649,9 +656,12 @@ async function sessionValid(claims) {
   return typeof claims.pca === 'number' && claims.pca >= pca;
 }
 
+const SESSION_TTL = '7d';
 function signSession(user) {
   const pca = user.password_changed_at ? Date.parse(user.password_changed_at) : undefined;
-  return jwt.sign({ id: user.id, username: user.username, ...(pca ? { pca } : {}) }, JWT_SECRET, { expiresIn: '30d' });
+  // 7 days (security review #10; was 30): the token lives in localStorage, so a
+  // stolen one should stop working sooner. Existing 30-day tokens run out as issued.
+  return jwt.sign({ id: user.id, username: user.username, ...(pca ? { pca } : {}) }, JWT_SECRET, { expiresIn: SESSION_TTL });
 }
 
 function requireAuth(req, res, next) {
