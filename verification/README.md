@@ -172,7 +172,10 @@ addresses. Production never sets it, and Railway traffic never arrives from loop
   `?key=<that value>`. Until both are set, Shippo tracking updates are refused (401), and order status can still
   be set by hand.
 - `CORS_EXTRA_ORIGINS` (optional): extra browser origins, comma-separated (e.g. a Vercel preview URL).
-- Migrations `2026-09-29p-rls-lockdown.sql` and `2026-09-29q-username-unique-lower.sql` (applied on wtf-test).
+- Migration `2026-09-29p-rls-lockdown.sql`: **applied on production 2026-09-29** (Cowork; all checks 0). Its
+  sequence check is now guarded with CASE, after it threw "saml_providers_pkey is not a sequence" there.
+- Migration `2026-09-29q-username-unique-lower.sql`: applied on wtf-test; **on hold for production**, which has
+  the case-duplicate test accounts bidder305TEST / Bidder305TEST.
 
 ## Not covered
 

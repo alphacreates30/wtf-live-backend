@@ -1,5 +1,8 @@
--- STEP p (security review #1). NOT YET APPLIED ON PRODUCTION - for Albert/Cowork to run in the Supabase SQL editor.
--- Applied and verified on wtf-test 2026-09-29 (every verification suite green with it in place).
+-- APPLIED on production 2026-09-29 by Cowork in the Supabase SQL editor. Verified: all checks 0; service_role keeps
+-- every table/function; /auctions still serves. DO NOT RUN AGAIN (it is idempotent, but there is no need).
+-- Run-time correction on production: step 5's sequence check threw "saml_providers_pkey is not a sequence" (the
+-- planner evaluated has_sequence_privilege on non-sequence rows); it is now guarded with CASE (below).
+-- Was: STEP p (security review #1). Applied and verified on wtf-test 2026-09-29 (every suite green with it in place).
 --
 -- What was wrong: RLS was off on 9 public tables, and the Supabase roles `anon` and `authenticated` held ALL
 -- privileges (select, insert, update, delete, truncate, ...) on all 15 public tables, with no policies. Both
@@ -64,9 +67,13 @@ begin
 
   select count(*) into n_tab from information_schema.role_table_grants
    where table_schema = 'public' and grantee in ('anon', 'authenticated');
+  -- CASE, not AND: the planner may evaluate has_sequence_privilege before the relkind filter, and it throws on a
+  -- non-sequence ("saml_providers_pkey is not a sequence" on production, 2026-09-29). CASE guarantees the order.
   select count(*) into n_seq from pg_class c
    where c.relnamespace = 'public'::regnamespace and c.relkind = 'S'
-     and (has_sequence_privilege('anon', c.oid, 'USAGE,SELECT,UPDATE') or has_sequence_privilege('authenticated', c.oid, 'USAGE,SELECT,UPDATE'));
+     and case when c.relkind = 'S'
+              then has_sequence_privilege('anon', c.oid, 'USAGE,SELECT,UPDATE') or has_sequence_privilege('authenticated', c.oid, 'USAGE,SELECT,UPDATE')
+              else false end;
   select count(*) into n_fn from pg_proc p
    where p.pronamespace = 'public'::regnamespace
      and (has_function_privilege('anon', p.oid, 'EXECUTE') or has_function_privilege('authenticated', p.oid, 'EXECUTE'));

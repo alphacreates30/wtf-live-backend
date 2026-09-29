@@ -1,5 +1,7 @@
--- STEP q (security review #14). NOT YET APPLIED ON PRODUCTION - for Albert/Cowork to run in the Supabase SQL editor.
--- Applied and verified on wtf-test 2026-09-29.
+-- STEP q (security review #14). ON HOLD for production (2026-09-29): production has case-duplicate test accounts
+-- bidder305TEST / Bidder305TEST, so the check below would stop it. Decide which to rename or remove first.
+-- Applied and verified on wtf-test 2026-09-29. Until q is on production, the server's own case-insensitive check
+-- at registration still refuses new case-duplicates; only a direct database insert could make one.
 --
 -- Usernames were unique only case-sensitively, so 'WhatTheFind' and 'WHATTHEFIND' could register next to the admin's
 -- 'whatthefind' and impersonate the host in chat and bids. The server now stores new names lowercase (a-z 0-9 _ only)
