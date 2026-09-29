@@ -833,6 +833,7 @@ app.post('/auth/register', LIMITS.register, async (req, res) => {
   res.json({ token, user });
 });
 
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString('hex'), 10);   // same cost as real hashes
 app.post('/auth/login', LIMITS.loginIp, LIMITS.loginUser, async (req, res) => {
   const { username, password } = req.body || {};
   if (typeof username !== 'string' || typeof password !== 'string' || !username || !password) return res.status(400).json({ error: 'username and password required' });
@@ -841,7 +842,12 @@ app.post('/auth/login', LIMITS.loginIp, LIMITS.loginUser, async (req, res) => {
   if (!user && username.trim().toLowerCase() !== username) {
     ({ data: user } = await supabase.from('users').select('*').eq('username', username.trim().toLowerCase()).maybeSingle());
   }
-  if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+  if (!user) {
+    // Same bcrypt work as a real account, so the response time doesn't say
+    // whether the username exists (security review #15: ~150ms vs ~80ms).
+    await bcrypt.compare(password, DUMMY_PASSWORD_HASH);
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
   const valid = await bcrypt.compare(password, user.password_hash);
   if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
   const token = signSession(user);

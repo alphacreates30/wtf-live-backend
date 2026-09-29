@@ -4,13 +4,21 @@
 //   timers: 'stubbed' (default) - setInterval is a no-op; the auto-close job still runs once at boot.
 //           'real'    - setInterval works (so live-mode timers really fire), but the auto-close job is removed.
 //   log:    true to capture the server's stdout+stderr (read it with .log()).
+//   patch:  [[from, to], ...] exact replacements in the source (each must match once, or boot throws).
+//   env:    extra environment for this server only, applied AFTER the Stripe/Resend blanking (e.g. a fake key a
+//           suite needs to reach a code path; pair it with a preload stub so nothing leaves the machine).
+//   preload: JavaScript run in the server process before server.js loads (e.g. a global.fetch stub).
 const fs = require('fs');
 const { spawn } = require('child_process');
 const BE = require('path').resolve(__dirname, '..').replace(/\\/g, '/');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const AUTOCLOSE = 'setInterval(autoCloseStandardItems, 30000)\nautoCloseStandardItems()';
 
-module.exports = async function boot(name, port, source, { timers = 'stubbed', log = false } = {}) {
+module.exports = async function boot(name, port, source, { timers = 'stubbed', log = false, patch = [], env = {}, preload = '' } = {}) {
+  for (const [from, to] of patch) {
+    if (source.split(from).length !== 2) throw new Error('patch marker must match exactly once: ' + from.slice(0, 60));
+    source = source.replace(from, to);
+  }
   if (timers === 'real') {
     if (!source.includes(AUTOCLOSE)) throw new Error('auto-close marker not found in source');
     source = source.replace(AUTOCLOSE, '');
@@ -18,7 +26,10 @@ module.exports = async function boot(name, port, source, { timers = 'stubbed', l
   const file = `${BE}/server.tmp-${name}.js`, runner = `${BE}/run.tmp-${name}.js`;
   fs.writeFileSync(file, source);
   fs.writeFileSync(runner, (timers === 'real' ? '' : 'global.setInterval = () => 0; ')
-    + `process.env.PORT='${port}'; process.env.STRIPE_SECRET_KEY=''; process.env.RESEND_API_KEY=''; require('./server.tmp-${name}.js');`);
+    + `process.env.PORT='${port}'; process.env.STRIPE_SECRET_KEY=''; process.env.RESEND_API_KEY=''; `
+    + Object.entries(env).map(([k, v]) => `process.env[${JSON.stringify(k)}]=${JSON.stringify(v)}; `).join('')
+    + preload + `
+require('./server.tmp-${name}.js');`);
   const child = spawn(process.execPath, [runner], { cwd: BE, stdio: ['ignore', log ? 'pipe' : 'ignore', log ? 'pipe' : 'ignore'] });
   let out = '';
   if (log) { child.stdout.on('data', d => out += d); child.stderr.on('data', d => out += d); }
