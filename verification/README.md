@@ -176,6 +176,15 @@ process (`local-server.js` options `env`, `preload`, `patch`), so nothing leaves
 | `shipping-label-amount.js` | #20 | The label route charged the browser's `amount_cents`. Now Shippo's re-read rate; mismatch -> 409, nothing charged. | `18002ac` |
 | `email-log-privacy.js` | #21 | Buyers' email addresses in two log lines. Now redacted. | `e4e4f8f` |
 
+**A5 "Delete my account"** (wtf-handoff `DELETE_ACCOUNT_BRIEF.md`, 2026-09-30). Needs migration
+`2026-09-30t-delete-account.sql`, which is applied on wtf-test; for production, see below.
+
+| Suite | Proves |
+|---|---|
+| `account-delete-refusals.js` | Refused and nothing changed (no Stripe call) while the buyer leads an open lot, has a max bid on an open lot, has an unpaid/failed invoice, or has an order not yet shipped/collected; also a wrong password, no typed `DELETE`, the admin, no login. Control on `c96a5a1`: the route didn't exist. |
+| `account-delete.js` | A clean deletion end to end: personal fields empty, old session rejected, login impossible, Stripe cards detached + customer deleted, orders/invoices intact (totals unchanged), username -> `deleted_<12 hex>` everywhere, old username held 30 days (SHA-256 only), audit row, confirmation email to the old address, nothing of the buyer's in any API response (anonymous, another buyer, admin; the completed order's shipping address stays as the tax record), admin can't re-approve or re-password it. |
+| `account-delete-premigration.js` | The new code on a database without migration t: registration, login and admin screens work; the delete route answers 503 and changes nothing. |
+
 **Rate limits and the suites.** `guard.js` sets `RATE_LIMIT_EXEMPT_LOOPBACK=1`, which the suites' local servers
 inherit, because a suite fires many logins and bids from localhost. The server honours it only for loopback
 addresses. Production never sets it, and Railway traffic never arrives from loopback. `rate-limits.js` clears it.
@@ -190,6 +199,8 @@ addresses. Production never sets it, and Railway traffic never arrives from loop
 - Migration `2026-09-29q-username-unique-lower.sql`: **applied on production 2026-09-29** (Cowork), after Albert
   deleted the two case-duplicate June test accounts in the same transaction (migration r was not needed).
   Verified: 0 leftovers, `users_username_lower_key` present, 28 users. Security Advisor: 0 errors.
+- Migration `2026-09-30t-delete-account.sql` (A5): applied on wtf-test with every suite green; **not yet on
+  production**. Until it is, "Delete my account" answers "not available yet" and everything else works.
 - Migration `2026-09-29s-function-search-path.sql` (review #27, the Advisor's 5 "function search path mutable"
   warnings): **applied on production 2026-09-29** (Cowork; bodies matched exactly beforehand; after: 5/5 pinned,
   grants unchanged). Security Advisor: 0 errors, 0 warnings. Suite: `function-search-path.js`
