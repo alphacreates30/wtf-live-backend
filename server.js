@@ -3018,12 +3018,14 @@ app.post('/webhook/shippo', async (req, res) => {
 // to exactly their limit, so it only ever leaves the server for the host/admin.
 // Every lot row sent to anyone else (REST, bid responses, socket broadcasts)
 // goes through this. A buyer's own max comes from GET .../prebid and /my-bids.
+// reserve_price goes the same way (security review #8): the terms call reserves
+// "undisclosed", and a bidder who can read one bids exactly to it or walks away.
 function canSeeLotMaxes(user, auction) {
   return !!user && (user.username === ADMIN_USERNAME || (!!auction && user.username === auction.host_username));
 }
 function hideLotMax(item) {
   if (!item) return item;
-  const { top_pre_bid, ...rest } = item;
+  const { top_pre_bid, reserve_price, ...rest } = item;
   return rest;
 }
 
