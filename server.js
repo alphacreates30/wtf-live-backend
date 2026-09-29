@@ -767,6 +767,14 @@ async function verifySocketToken(token) {
   }
 }
 
+// A database error is logged with the route, and the client gets a short
+// generic message - never the error object itself, which carries table and
+// column names, constraint names and Postgres detail (security review #16).
+function dbFailure(req, res, err) {
+  console.error(`${req.method} ${req.path} failed:`, err?.code || '', err?.message || err);
+  return res.status(500).json({ error: 'Something went wrong. Please try again.' });
+}
+
 // ------------------------------------------------------------
 // REST ENDPOINTS
 // ------------------------------------------------------------
@@ -1266,7 +1274,7 @@ app.get('/admin/buyers', requireAdmin, async (req, res) => {
     .from('profiles')
     .select('*')
     .order('created_at', { ascending: false });
-  if (error) return res.status(500).json({ error });
+  if (error) return dbFailure(req, res, error);
   res.json(data);
 });
 
@@ -1453,7 +1461,7 @@ app.get('/auctions', optionalAuth, async (req, res) => {
     query = query.neq('status', 'draft');
   }
   const { data, error } = await query;
-  if (error) return res.status(500).json({ error });
+  if (error) return dbFailure(req, res, error);
   res.json(data);
 });
 
@@ -1756,13 +1764,13 @@ app.delete('/auction/:id', requireAdmin, async (req, res) => {
 });
 app.get('/auction/:id/bids', async (req, res) => {
   const { data, error } = await supabase.from('bids').select('*').eq('auction_id', req.params.id).order('created_at', { ascending: false }).limit(50);
-  if (error) return res.status(500).json({ error });
+  if (error) return dbFailure(req, res, error);
   res.json(data);
 });
 
 app.get('/auction/:id/chat', async (req, res) => {
   const { data, error } = await supabase.from('chat_messages').select('*').eq('auction_id', req.params.id).eq('flagged', false).order('created_at', { ascending: true }).limit(100);
-  if (error) return res.status(500).json({ error });
+  if (error) return dbFailure(req, res, error);
   res.json(data);
 });
 
@@ -2735,7 +2743,7 @@ app.get('/admin/orders', requireAdmin, async (req, res) => {
   }
 
   const { data: page, error, count } = await query;
-  if (error) return res.status(500).json({ error });
+  if (error) return dbFailure(req, res, error);
 
   const have = new Set(page.map(o => o.id));
   const invoiceIds = [...new Set(page.map(o => o.invoice_id).filter(Boolean))];
@@ -2751,7 +2759,7 @@ app.get('/admin/orders', requireAdmin, async (req, res) => {
       .or(sibClauses.join(','))
       .order('created_at', { ascending: false })
       .order('id', { ascending: true });
-    if (sibErr) return res.status(500).json({ error: sibErr });
+    if (sibErr) return dbFailure(req, res, sibErr);
     orders = [...page, ...sibs.filter(o => !have.has(o.id))]
       .sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : a.id < b.id ? -1 : 1));
   }
@@ -2771,12 +2779,12 @@ app.get('/admin/auctions/summary', requireAdmin, async (req, res) => {
     .select('id, title, status, starts_at, ends_at, created_at')
     .order('created_at', { ascending: false })
     .limit(100);
-  if (error) return res.status(500).json({ error });
+  if (error) return dbFailure(req, res, error);
   const counts = await Promise.all((auctions || []).map(a =>
     supabase.from('orders').select('id', { count: 'exact', head: true }).eq('auction_id', a.id)
   ));
   const failed = counts.find(c => c.error);
-  if (failed) return res.status(500).json({ error: failed.error });
+  if (failed) return dbFailure(req, res, failed.error);
   res.json((auctions || []).map((a, i) => ({ ...a, order_count: counts[i].count ?? 0 })));
 });
 
@@ -3043,7 +3051,7 @@ app.patch('/admin/orders/:id/status', requireAdmin, async (req, res) => {
   const valid = ['pending', 'label_created', 'shipped', 'delivered'];
   if (!valid.includes(status)) return res.status(400).json({ error: 'Invalid status' });
   const { data, error } = await supabase.from('orders').update({ status }).eq('id', req.params.id).select().single();
-  if (error) return res.status(500).json({ error });
+  if (error) return dbFailure(req, res, error);
   res.json(data);
 });
 
@@ -3118,7 +3126,7 @@ app.get('/auction/:id/items', optionalAuth, async (req, res) => {
   }
   const { data, error } = await supabase
     .from('auction_items').select('*').eq('auction_id', req.params.id).order('position', { ascending: true });
-  if (error) return res.status(500).json({ error });
+  if (error) return dbFailure(req, res, error);
   res.json(canSeeLotMaxes(req.user, auction) ? data : data.map(hideLotMax));
 });
 
@@ -3130,7 +3138,7 @@ app.post('/auction/:id/items', requireAdmin, async (req, res) => {
       const { data: auctionRow } = await supabase.from('auctions').select('mode').eq('id', req.params.id).single();
       const isStandard = auctionRow && auctionRow.mode === 'standard';
       const { data, error } = await supabase.from('auction_items').insert({ auction_id: req.params.id, title, description, image_url, starting_bid: starting_bid ?? 0, position, status: isStandard ? 'open' : 'pending', current_bid: isStandard ? (starting_bid ?? 0) : null, ends_at: isStandard ? (ends_at || null) : null }).select().single();
-      if (error) return res.status(500).json({ error });
+      if (error) return dbFailure(req, res, error);
   res.status(201).json(data);
 });
 
@@ -3228,7 +3236,7 @@ app.post('/auction/:id/items/:itemId/prebid', requireAuth, LIMITS.bidding, async
   if (!lotBelongsToAuction(item, req.params.id)) return res.status(404).json({ error: 'Item not found' });
   if (item.status !== 'pending') return res.status(400).json({ error: 'Pre-bidding closed' });
   const { data, error } = await supabase.from('pre_bids').upsert({ item_id: req.params.itemId, auction_id: req.params.id, buyer_username: req.user.username, buyer_user_id: String(req.user.id), max_amount }, { onConflict: 'item_id,buyer_username' }).select().single();
-  if (error) return res.status(500).json({ error });
+  if (error) return dbFailure(req, res, error);
   const { data: all } = await supabase.from('pre_bids').select('max_amount').eq('item_id', req.params.itemId);
   const top = all ? Math.max(...all.map(b => parseFloat(b.max_amount))) : max_amount;
   await supabase.from('auction_items').update({ pre_bid_count: all ? all.length : 1, top_pre_bid: top }).eq('id', req.params.itemId);
@@ -3326,7 +3334,13 @@ app.post('/auction/:id/items/:itemId/bid', requireAuth, LIMITS.bidding, async (r
     p_opening_min: OPENING_BID_MIN,
     p_soft_close_minutes: SOFT_CLOSE_MINUTES
   });
-  if (error) return res.status(400).json({ error: error.message || 'Bid failed' });
+  if (error) {
+    // The bid function's own checks raise readable messages (P0001, e.g. "Item is not open for bidding");
+    // anything else is a database error, which is logged, not sent (security review #16).
+    if (error.code === 'P0001') return res.status(400).json({ error: error.message });
+    console.error('place_standard_bid failed:', error.code, error.message);
+    return res.status(400).json({ error: 'Bid failed' });
+  }
 
   // The RPC already extended ends_at atomically if this bid landed inside
   // the soft-close window. Detect it by comparing to the pre-call read
@@ -3521,7 +3535,7 @@ app.get('/auction/:auctionId/items/:itemId/images', async (req, res) => {
           .select('id, url, position, created_at')
           .eq('item_id', req.params.itemId)
           .order('position', { ascending: true });
-    if (error) return res.status(500).json({ error });
+    if (error) return dbFailure(req, res, error);
     res.json(data || []);
 });
 
