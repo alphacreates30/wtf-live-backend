@@ -2983,7 +2983,25 @@ app.patch('/admin/orders/:id/status', requireAdmin, async (req, res) => {
   res.json(data);
 });
 
+// Shippo webhooks carry no signature we verify, and this route used to accept
+// anyone's POST: knowing a tracking number (every buyer knows their own) was
+// enough to mark an order delivered, or shipped with a "your item has shipped"
+// email (security review #9). The webhook URL registered in Shippo must now
+// carry ?key=<SHIPPO_WEBHOOK_SECRET>, compared in constant time. Fails closed:
+// with no secret configured, every call is refused.
+function shippoWebhookAuthorised(req) {
+  const secret = process.env.SHIPPO_WEBHOOK_SECRET;
+  const given = typeof req.query.key === 'string' ? req.query.key : '';
+  if (!secret || secret.length < 32 || !given) return false;
+  const a = crypto.createHash('sha256').update(given).digest(), b = crypto.createHash('sha256').update(secret).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
 app.post('/webhook/shippo', async (req, res) => {
+  if (!shippoWebhookAuthorised(req)) {
+    if (!process.env.SHIPPO_WEBHOOK_SECRET) console.error('Shippo webhook refused: SHIPPO_WEBHOOK_SECRET is not set');
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
   try {
     const event = req.body;
     if (event.event === 'track_updated') {
