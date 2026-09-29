@@ -10,6 +10,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { AccessToken } = require('livekit-server-sdk');
 const Stripe = require('stripe');
 const nodemailer = require('nodemailer');
+const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const aiLots = require('./ai_lots');
 
 const app = express();
@@ -26,6 +27,44 @@ app.use(cors());
 // only applies the first body parser it hits, so a route-specific limit
 // declared later (e.g. on /ai/analyze-lot) never overrides this default.
 app.use(express.json({ limit: '60mb' }));
+
+// -- Rate limits (security review #5) --
+// There were none: 30 wrong passwords in under 5s, no lockout, and nothing
+// slowing registration, reset emails, bids or chat. In-memory per instance.
+// Railway puts exactly one proxy in front: trust that hop, so req.ip is the
+// client (and a client can't pick its own IP by sending X-Forwarded-For).
+app.set('trust proxy', 1);
+// The verification suites fire many requests from localhost; guard.js sets
+// this for the local servers they start. Loopback only - Railway traffic never
+// arrives from loopback, and production never sets it.
+const RATE_LIMIT_EXEMPT_LOOPBACK = process.env.RATE_LIMIT_EXEMPT_LOOPBACK === '1';
+const isLoopback = ip => ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+function limiter({ windowMs, limit, key, skipSuccessfulRequests = false, message = 'Too many requests. Please wait a few minutes and try again.' }) {
+  return rateLimit({
+    windowMs, limit, skipSuccessfulRequests,
+    standardHeaders: 'draft-7', legacyHeaders: false,
+    keyGenerator: key || (req => ipKeyGenerator(req.ip)),
+    skip: req => RATE_LIMIT_EXEMPT_LOOPBACK && isLoopback(req.ip),
+    handler: (req, res) => res.status(429).json({ error: message, code: 'rate_limited' }),
+  });
+}
+const perUser = req => 'u:' + String(req.user?.id);
+const LIMITS = {
+  // Failed logins only: per IP, and per username across IPs (slows a spread-out
+  // guess at one account - the admin's - without an easy lockout of it).
+  loginIp: limiter({ windowMs: 15 * 60e3, limit: 10, skipSuccessfulRequests: true, message: 'Too many failed logins. Try again in 15 minutes.' }),
+  loginUser: limiter({ windowMs: 60 * 60e3, limit: 30, skipSuccessfulRequests: true, key: req => 'login:' + String(req.body?.username ?? '').trim().toLowerCase(), message: 'Too many failed logins for this account. Try again later, or reset your password.' }),
+  register: limiter({ windowMs: 60 * 60e3, limit: 5, message: 'Too many new accounts from here. Try again later.' }),
+  forgot: limiter({ windowMs: 15 * 60e3, limit: 5 }),
+  reset: limiter({ windowMs: 15 * 60e3, limit: 10 }),
+  // Routes that check the current password: no guessing it through them.
+  passwordCheck: limiter({ windowMs: 15 * 60e3, limit: 10, key: perUser }),
+  bidding: limiter({ windowMs: 60e3, limit: 30, key: perUser, message: 'Too many bids too quickly. Wait a moment and try again.' }),
+  ai: limiter({ windowMs: 60e3, limit: 30, key: perUser }),
+  // Backstop for everything else, per IP.
+  api: limiter({ windowMs: 60e3, limit: 1200 }),
+};
+app.use(LIMITS.api);
 
 // -- Clients --
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
@@ -719,7 +758,7 @@ function cleanEmail(v) {
   return e.length <= 254 && EMAIL_RE.test(e) ? e : null;
 }
 
-app.post('/auth/register', async (req, res) => {
+app.post('/auth/register', LIMITS.register, async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: 'username and password required' });
   if (username.length < 3 || username.length > 30) return res.status(400).json({ error: 'Username must be 3-30 characters' });
@@ -740,7 +779,7 @@ app.post('/auth/register', async (req, res) => {
   res.json({ token, user });
 });
 
-app.post('/auth/login', async (req, res) => {
+app.post('/auth/login', LIMITS.loginIp, LIMITS.loginUser, async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: 'username and password required' });
   const { data: user, error } = await supabase.from('users').select('*').eq('username', username).single();
@@ -762,7 +801,7 @@ app.get('/auth/me', requireAuth, async (req, res) => {
 // Add an email to an account that has none, or change it. Changing an existing
 // email needs the current password: otherwise anyone holding a stolen session
 // could point the account's resets at their own inbox and take it over.
-app.post('/auth/email', requireAuth, async (req, res) => {
+app.post('/auth/email', requireAuth, LIMITS.passwordCheck, async (req, res) => {
   const email = cleanEmail(req.body?.email);
   if (!email) return res.status(400).json({ error: 'Enter a valid email address' });
   const { data: user } = await supabase.from('users').select('id, email, password_hash').eq('id', req.user.id).single();
@@ -826,7 +865,7 @@ async function sendPasswordReset(user) {
   });
 }
 
-app.post('/auth/forgot-password', async (req, res) => {
+app.post('/auth/forgot-password', LIMITS.forgot, async (req, res) => {
   const identifier = typeof req.body?.identifier === 'string' ? req.body.identifier.trim() : '';
   if (!identifier) return res.status(400).json({ error: 'Enter your username or email' });
   res.json({ ok: true });
@@ -845,7 +884,7 @@ app.post('/auth/forgot-password', async (req, res) => {
   }
 });
 
-app.post('/auth/reset-password', async (req, res) => {
+app.post('/auth/reset-password', LIMITS.reset, async (req, res) => {
   const { token, new_password } = req.body || {};
   if (typeof token !== 'string' || !token) return res.status(400).json({ error: 'This reset link is incomplete' });
   if (typeof new_password !== 'string' || new_password.length < MIN_PASSWORD) {
@@ -891,7 +930,7 @@ app.post('/admin/users/:userId/password', requireAdmin, async (req, res) => {
 });
 
 // -- Profile --
-app.post('/auth/change-password', requireAdmin, async (req, res) => {
+app.post('/auth/change-password', requireAdmin, LIMITS.passwordCheck, async (req, res) => {
   const { current_password, new_password } = req.body;
   if (!current_password || !new_password)
     return res.status(400).json({ error: 'current_password and new_password required' });
@@ -1499,7 +1538,7 @@ app.get('/auction/:id/terms-acceptance', requireAuth, async (req, res) => {
   res.json({ accepted: !!data, ...(data || {}) });
 });
 
-app.post('/auction/:id/terms-acceptance', requireAuth, async (req, res) => {
+app.post('/auction/:id/terms-acceptance', requireAuth, LIMITS.bidding, async (req, res) => {
   const refusal = await biddingRefusal(req.user);
   if (refusal) return res.status(refusal.status).json({ error: refusal.error, code: refusal.code });
   const { fulfillment_choice } = req.body;
@@ -1764,7 +1803,27 @@ io.on('connection', (socket) => {
   // unhandled rejection exits Node. One anonymous socket.emit('place_bid') took
   // the whole server down. The payload is always an object here, and a handler
   // that throws is logged, never fatal.
+  // Per-connection rate limits too (review #5): [events, per ms, error event, message].
+  const SOCKET_LIMITS = {
+    send_chat: [5, 10e3, 'chat_error', 'You are sending messages too quickly.'],
+    place_bid: [10, 10e3, 'bid_error', 'Too many bids too quickly.'],
+    default: [30, 60e3],
+  };
+  const socketHits = {};
+  const socketExempt = RATE_LIMIT_EXEMPT_LOOPBACK && isLoopback(socket.handshake.address);
   const on = (event, handler) => socket.on(event, async (payload, ...rest) => {
+    if (!socketExempt) {
+      const [limit, windowMs, errEvent, message] = SOCKET_LIMITS[event] || SOCKET_LIMITS.default;
+      const now = Date.now();
+      const hits = (socketHits[event] || []).filter(t => now - t < windowMs);
+      if (hits.length >= limit) {
+        if (errEvent) socket.emit(errEvent, { message, code: 'rate_limited' });
+        socketHits[event] = hits;
+        return;
+      }
+      hits.push(now);
+      socketHits[event] = hits;
+    }
     try {
       await handler(payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {}, ...rest);
     } catch (e) {
@@ -3046,7 +3105,7 @@ function lotBelongsToAuction(item, auctionId) {
   return String(item.auction_id || '').toLowerCase() === String(auctionId).toLowerCase();
 }
 
-app.post('/auction/:id/items/:itemId/prebid', requireAuth, async (req, res) => {
+app.post('/auction/:id/items/:itemId/prebid', requireAuth, LIMITS.bidding, async (req, res) => {
   const max_amount = parseMaxBid(req.body?.max_amount);
   if (max_amount == null) return res.status(400).json({ error: `Max bid must be between $1 and $${MAX_BID_DOLLARS.toLocaleString('en-US')}` });
   const refusal = await biddingRefusal(req.user);
@@ -3085,7 +3144,7 @@ app.get('/auction/:id/items/:itemId/prebid', requireAuth, async (req, res) => {
   res.json(data || null);
 });
 
-app.delete('/auction/:id/items/:itemId/prebid', requireAuth, async (req, res) => {
+app.delete('/auction/:id/items/:itemId/prebid', requireAuth, LIMITS.bidding, async (req, res) => {
   await supabase.from('pre_bids').delete().eq('item_id', req.params.itemId).eq('buyer_username', req.user.username);
   const { data: all } = await supabase.from('pre_bids').select('max_amount').eq('item_id', req.params.itemId);
   const top = all && all.length ? Math.max(...all.map(b => parseFloat(b.max_amount))) : null;
@@ -3104,7 +3163,7 @@ const SOFT_CLOSE_MINUTES = 2;
 // follows the normal increment tiers.
 const OPENING_BID_MIN = 1;
 
-app.post('/auction/:id/items/:itemId/bid', requireAuth, async (req, res) => {
+app.post('/auction/:id/items/:itemId/bid', requireAuth, LIMITS.bidding, async (req, res) => {
   const max_amount = parseMaxBid(req.body?.max_amount);
   if (max_amount == null) return res.status(400).json({ error: `Max bid must be between $1 and $${MAX_BID_DOLLARS.toLocaleString('en-US')}` });
   const refusal = await biddingRefusal(req.user);
@@ -3245,7 +3304,7 @@ const aiIds = normalizeBodyIds({ single: ['auction_id'] });
 
 // Step 1: which photos belong to the same lot. Thumbnails only - small and
 // cheap, since this pass only needs to tell items apart, not read maker marks.
-app.post('/ai/group-photos', requireAdmin, aiJson, aiIds, async (req, res) => {
+app.post('/ai/group-photos', requireAdmin, LIMITS.ai, aiJson, aiIds, async (req, res) => {
     const thumbnails = req.body?.thumbnails;
     if (!Array.isArray(thumbnails) || !thumbnails.length) {
         return res.status(400).json({ error: 'thumbnails array is required' });
@@ -3267,7 +3326,7 @@ app.post('/ai/group-photos', requireAdmin, aiJson, aiIds, async (req, res) => {
 
 // Step 2: catalogue one confirmed group. Higher-resolution images than step 1,
 // because this pass reads labels, signatures and damage.
-app.post('/ai/analyze-lot', requireAdmin, aiJson, aiIds, async (req, res) => {
+app.post('/ai/analyze-lot', requireAdmin, LIMITS.ai, aiJson, aiIds, async (req, res) => {
     const { images, condition } = req.body || {};
     if (!Array.isArray(images) || !images.length) {
         return res.status(400).json({ error: 'images array is required' });
@@ -3283,7 +3342,7 @@ app.post('/ai/analyze-lot', requireAdmin, aiJson, aiIds, async (req, res) => {
 
 // Step 2b: host corrected a wrong title and wants the body rewritten to match.
 // Text-only - no photos, so it is fast and cheap.
-app.post('/ai/regenerate-description', requireAdmin, aiIds, async (req, res) => {
+app.post('/ai/regenerate-description', requireAdmin, LIMITS.ai, aiIds, async (req, res) => {
     const { title, condition } = req.body || {};
     if (!title) return res.status(400).json({ error: 'title is required' });
     try {

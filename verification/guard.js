@@ -34,6 +34,9 @@ module.exports = function guard(file) {
     die(`.env.test points at PRODUCTION (${target}). Refusing.\nFix .env.test, or pass --yes-production if you really mean production.`);
   }
   for (const k of REQUIRED) process.env[k] = chosen[k];
+  // The local servers the suites start inherit this: rate limits (review #5) don't apply to requests from
+  // loopback, since a suite fires many logins/bids from localhost. rate-limits.js deletes it to test the limits.
+  process.env.RATE_LIMIT_EXEMPT_LOOPBACK = '1';
 
   const isProd = wantProd || (prodHost && target === prodHost);
   console.log(isProd
