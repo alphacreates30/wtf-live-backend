@@ -1,17 +1,44 @@
-// Every script in this folder writes to the REAL database (the one in .env),
-// using clearly-named throwaway rows that it deletes afterwards. It refuses to
-// run unless you say so explicitly, and prints what it is about to touch.
-const FLAG = '--yes-run-against-the-real-database';
+// Every script in this folder writes to a database, using clearly-named
+// throwaway rows that it deletes afterwards. By default that is the TEST
+// project (wtf-test, credentials in .env.test). Production (.env) is reachable
+// only with an explicit flag, and every run prints which project it is hitting.
+//
+// Loading order matters: the chosen file is loaded here, first, with override,
+// so SUPABASE_URL / SUPABASE_KEY / JWT_SECRET come from it. dotenv never
+// overwrites a key that is already set, so the suites' own later
+// `dotenv.config()` (which reads .env) and the local servers they spawn (which
+// inherit this environment) cannot switch the database back to production.
+const PROD_FLAGS = ['--yes-production', '--yes-run-against-the-real-database'];
+const REQUIRED = ['SUPABASE_URL', 'SUPABASE_KEY', 'JWT_SECRET'];
 module.exports = function guard(file) {
   const path = require('path');
-  require('dotenv').config({ path: path.resolve(__dirname, '..', '.env'), quiet: true });
-  const url = process.env.SUPABASE_URL;
-  if (!url) { console.error('SUPABASE_URL not set - run from a checkout with a .env'); process.exit(2); }
-  if (!process.argv.includes(FLAG)) {
-    console.error(`\n${path.basename(file)} writes to the REAL database at ${new URL(url).host}\n(throwaway ZZTEST_ rows, cleaned up afterwards - but it is the real database).\nRe-run with ${FLAG} if that is what you want. See verification/README.md.\n`);
-    process.exit(2);
+  const fs = require('fs');
+  const dotenv = require('dotenv');
+  const root = path.resolve(__dirname, '..');
+  const name = path.basename(file);
+  const read = f => fs.existsSync(path.join(root, f)) ? dotenv.parse(fs.readFileSync(path.join(root, f))) : null;
+  const host = u => { try { return new URL(u).host; } catch { return null; } };
+  const die = msg => { console.error('\n' + name + ': ' + msg + '\nSee verification/README.md.\n'); process.exit(2); };
+
+  const prodEnv = read('.env');
+  const prodHost = prodEnv && host(prodEnv.SUPABASE_URL);
+  const wantProd = PROD_FLAGS.some(f => process.argv.includes(f));
+  const envFile = wantProd ? '.env' : '.env.test';
+  const chosen = read(envFile);
+  if (!chosen) die(`${envFile} not found in ${root}.` + (wantProd ? '' : ' It holds the wtf-test credentials (test only).'));
+  const missing = REQUIRED.filter(k => !chosen[k]);
+  if (missing.length) die(`${envFile} is missing ${missing.join(', ')}.`);
+  const target = host(chosen.SUPABASE_URL);
+  if (!target) die(`SUPABASE_URL in ${envFile} is not a URL.`);
+  if (!wantProd && prodHost && target === prodHost) {
+    die(`.env.test points at PRODUCTION (${target}). Refusing.\nFix .env.test, or pass --yes-production if you really mean production.`);
   }
-  console.log(`Target database: ${new URL(url).host}\n`);
+  for (const k of REQUIRED) process.env[k] = chosen[k];
+
+  const isProd = wantProd || (prodHost && target === prodHost);
+  console.log(isProd
+    ? `Target database: ${target}  ** PRODUCTION ** (throwaway ZZTEST_ rows, cleaned up afterwards)\n`
+    : `Target database: ${target}  (test project, from .env.test)\n`);
 };
 
 // Source the suites patch and match markers against. Normalised to LF once,

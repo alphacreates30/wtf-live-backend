@@ -52,31 +52,60 @@ routes below.
 > source through `guard.readSource()` / `guard.sourceAt()`, which normalise `\r\n` to `\n`, so a CRLF
 > checkout can't produce a false "marker not found" any more.
 
-> ## ⚠ These run against the REAL database
+> ## Which database: wtf-test by default (2026-09-28)
 >
-> They use the Supabase project in your `.env`, not a test copy. Each creates
-> clearly-named throwaway rows (`ZZTEST_…` auctions, lots, orders, a throwaway
-> buyer) and deletes them afterwards, and each ends by printing
-> `leftover throwaway rows: 0`. But it is still the real database: real
-> `insert`s and `delete`s, on the same project production uses.
->
-> So they refuse to run unless you pass the flag, and they print the database
-> host first:
+> The suites run against **wtf-test**, a separate Supabase project with
+> production's schema, functions, grants and `item-images` bucket but none of its
+> data. No flag needed:
 >
 > ```
-> node verification/terms-gate.js --yes-run-against-the-real-database
+> node verification/terms-gate.js
+> # Target database: <ref>.supabase.co  (test project, from .env.test)
 > ```
 >
-> Do not wire these into CI or a pre-commit hook. If one crashes mid-run, look
-> for leftover `ZZTEST_` rows (`select * from auctions where title like 'ZZTEST_%'`).
+> `guard.js` loads `SUPABASE_URL`, `SUPABASE_KEY` and `JWT_SECRET` from
+> **`.env.test`** before anything else. dotenv never overwrites a key that's already
+> set, so the suite's own later `.env` load and the local servers it spawns keep
+> the test values. The guard refuses to run if `.env.test` is missing, lacks one
+> of those three keys, or points at the same host as `.env` (production).
+> **`.env.test` holds test credentials only** (wtf-test service-role key, a
+> test-only `JWT_SECRET`, pooler URLs). It is git-ignored (`.env.*`). Never put
+> production values in it.
+>
+> **Production, deliberately.** Pass `--yes-production` (the old
+> `--yes-run-against-the-real-database` still works and means the same). The
+> guard then loads `.env` and prints `** PRODUCTION **` next to the host. This
+> should almost never be needed now. Non-draft `ZZTEST_` auctions show on the
+> public homepage while they exist.
+>
+> Either way each suite creates clearly-named throwaway rows (`ZZTEST_…`
+> auctions, lots, orders, throwaway buyers), deletes them afterwards and ends by
+> printing `leftover throwaway rows: 0`. Do not wire these into CI or a
+> pre-commit hook. If one crashes mid-run, look for leftover `ZZTEST_` rows
+> (`select * from auctions where title like 'ZZTEST_%'`).
+>
+> **wtf-test pauses when idle.** Free Supabase projects pause after about a week
+> without activity. If a suite can't connect (timeouts, `ECONNRESET`,
+> `fetch failed`), unpause wtf-test in the Supabase dashboard first, then re-run.
+>
+> **Keeping wtf-test in step.** A migration applied to production must also be
+> applied to wtf-test (test first is better). The 2026-09-28 copy was a
+> `pg_dump --schema-only -n public` of production, then a catalog diff of both
+> (tables, columns and types, constraints, FK on-delete rules, indexes, function
+> bodies, table/function/sequence grants, RLS, default ACLs, extensions,
+> buckets): 0 differences. `pg_dump` doesn't emit revokes against Supabase's
+> default privileges, so the `anon`/`authenticated` EXECUTE revokes on
+> `delete_auction_cascade` and `update_standard_leader_max` had to be applied to
+> wtf-test by hand. Check those after any re-copy.
 
 They start local copies of the server on ports 3231-3234, 3241-3242, 3251-3252,
 3261-3262, 3271-3272, 3281-3285, 3291-3293, 3301-3312, 3321-3322, 3331-3332, 3341-3342 and 3351-3352 with the background jobs (`setInterval`) stubbed out, so nothing
 auto-closes or charges. They write temporary `server.tmp-*.js` / `run.tmp-*.js`
 files next to `server.js` and delete them on exit (both are git-ignored).
 
-**Credentials:** none are stored here. Everything is read from `.env`
-(`SUPABASE_URL`, `SUPABASE_KEY`, `JWT_SECRET`), which stays untracked. Tokens
+**Credentials:** none are stored here. `SUPABASE_URL`, `SUPABASE_KEY` and
+`JWT_SECRET` come from `.env.test` (or `.env` with `--yes-production`); other
+keys still come from `.env`. Both files stay untracked. Tokens
 are minted in-process with `JWT_SECRET` and expire in minutes. `id-normalisation.js`
 also needs `../wtf-live-frontend` checked out next to this repo (for
 `socket.io-client`).
@@ -146,7 +175,12 @@ always red teaches people to ignore red.
   so both now build that fixture themselves (2026-09-24). Suites still borrow
   the `zztest_paid_ok` buyer read-only; if that user is ever cleaned up,
   `charge-auto-vs-manual`, `orders-item-unique`, `paid-stays-paid` and
-  `undercharge-race` will fail at setup.
+  `undercharge-race` will fail at setup. **On wtf-test that user does not exist
+  yet (2026-09-28):** it needs a `users` row plus an approved `profiles` row
+  with a saved Stripe *test-mode* customer and card. None of the four sends
+  anything to Stripe (each fakes it or blanks the key), but `paid-stays-paid`
+  refuses to start without both ids set. Until it exists, those four fail at
+  setup on wtf-test.
 - **Low priority, open:** `pre_bids.buyer_user_id` (and the other user-id
   columns: `orders`/`invoices.buyer_user_id`, `profiles.user_id`,
   `auction_terms_acceptances.user_id`) are TEXT with no foreign key to `users`.

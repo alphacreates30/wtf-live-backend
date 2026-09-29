@@ -4,3 +4,4 @@ node_modules/
 server.local.log
 server.tmp-*.js
 run.tmp-*.js
+.env.*
