@@ -1,7 +1,7 @@
--- STEP q (security review #14). ON HOLD for production (2026-09-29): production has case-duplicate test accounts
--- bidder305TEST / Bidder305TEST, so the check below would stop it. Albert: delete both - run migration r FIRST, then this.
--- Applied and verified on wtf-test 2026-09-29. Until q is on production, the server's own case-insensitive check
--- at registration still refuses new case-duplicates; only a direct database insert could make one.
+-- APPLIED on production 2026-09-29 by Cowork. Albert first deleted the two case-duplicate June test accounts
+-- bidder305TEST / Bidder305TEST (no profile, bids, pre-bids, orders or invoices) in the same transaction, then this
+-- ran. Verified: 0 leftovers, users_username_lower_key present, 28 users. DO NOT RUN AGAIN (it is idempotent).
+-- Was: STEP q (security review #14). Applied and verified on wtf-test 2026-09-29.
 --
 -- Usernames were unique only case-sensitively, so 'WhatTheFind' and 'WHATTHEFIND' could register next to the admin's
 -- 'whatthefind' and impersonate the host in chat and bids. The server now stores new names lowercase (a-z 0-9 _ only)

@@ -1,4 +1,6 @@
--- STEP r. DELETES ROWS. NOT YET APPLIED ON PRODUCTION - for Albert/Cowork to run in the Supabase SQL editor.
+-- NOT USED - DO NOT RUN. Superseded 2026-09-29: Albert deleted bidder305TEST / Bidder305TEST directly, in the same
+-- transaction as migration q (both accounts had no profile, bids, pre-bids, orders or invoices). Kept as a record.
+-- Was: STEP r. DELETES ROWS.
 -- Albert, 2026-09-29: delete both case-duplicate test accounts, bidder305TEST and Bidder305TEST, so migration q
 -- (unique lower(username)) can run. Tested on wtf-test with look-alike fixtures (see the commit).
 --

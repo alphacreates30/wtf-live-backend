@@ -174,9 +174,9 @@ addresses. Production never sets it, and Railway traffic never arrives from loop
 - `CORS_EXTRA_ORIGINS` (optional): extra browser origins, comma-separated (e.g. a Vercel preview URL).
 - Migration `2026-09-29p-rls-lockdown.sql`: **applied on production 2026-09-29** (Cowork; all checks 0). Its
   sequence check is now guarded with CASE, after it threw "saml_providers_pkey is not a sequence" there.
-- Migration `2026-09-29q-username-unique-lower.sql`: applied on wtf-test; **on hold for production**, which has
-  the case-duplicate test accounts bidder305TEST / Bidder305TEST. Albert: delete both - migration
-  `2026-09-29r-DELETE-case-duplicate-test-accounts.sql` first (gated: stops on any order/invoice), then q.
+- Migration `2026-09-29q-username-unique-lower.sql`: **applied on production 2026-09-29** (Cowork), after Albert
+  deleted the two case-duplicate June test accounts in the same transaction (migration r was not needed).
+  Verified: 0 leftovers, `users_username_lower_key` present, 28 users. Security Advisor: 0 errors.
 
 ## Not covered
 
