@@ -1,5 +1,7 @@
--- STEP t (A5, "Delete my account"). NOT YET APPLIED ON PRODUCTION - for Albert/Cowork to run in the Supabase SQL editor.
--- Applied and verified on wtf-test 2026-09-30.
+-- APPLIED on production 2026-09-30 by Cowork (Supabase SQL editor). Pre-check: all 39 columns the functions use exist
+-- on production. After: users.deleted_at present; account_deletions + reserved_usernames RLS on (2/2); both functions
+-- service_role-only (2/2); /auctions still serves. DO NOT RUN AGAIN (it is idempotent, but there is no need).
+-- Was: STEP t (A5, "Delete my account"). Applied and verified on wtf-test 2026-09-30.
 --
 -- Anonymise, don't erase: a buyer's personal details go, sale records stay (DELETE_ACCOUNT_BRIEF.md).
 --   users.deleted_at                    when the account was deleted (null = active)
@@ -12,7 +14,8 @@
 -- Both functions: search_path pinned, every table public.<x>, EXECUTE for service_role only (like migrations p/s).
 -- Stripe (cards, customer) is handled by the backend BEFORE it calls delete_account; if Stripe fails, it stops.
 --
--- Until this is applied, the backend's delete route answers 503 "not available yet" and registration works as before.
+-- Before this was applied, the backend's delete route answered 503 "not available yet"; it checks on every request
+-- (nothing cached), so it works as soon as PostgREST sees the functions - no restart.
 
 begin;
 

@@ -177,7 +177,7 @@ process (`local-server.js` options `env`, `preload`, `patch`), so nothing leaves
 | `email-log-privacy.js` | #21 | Buyers' email addresses in two log lines. Now redacted. | `e4e4f8f` |
 
 **A5 "Delete my account"** (wtf-handoff `DELETE_ACCOUNT_BRIEF.md`, 2026-09-30). Needs migration
-`2026-09-30t-delete-account.sql`, which is applied on wtf-test; for production, see below.
+`2026-09-30t-delete-account.sql`, applied on wtf-test and production.
 
 | Suite | Proves |
 |---|---|
@@ -199,8 +199,9 @@ addresses. Production never sets it, and Railway traffic never arrives from loop
 - Migration `2026-09-29q-username-unique-lower.sql`: **applied on production 2026-09-29** (Cowork), after Albert
   deleted the two case-duplicate June test accounts in the same transaction (migration r was not needed).
   Verified: 0 leftovers, `users_username_lower_key` present, 28 users. Security Advisor: 0 errors.
-- Migration `2026-09-30t-delete-account.sql` (A5): applied on wtf-test with every suite green; **not yet on
-  production**. Until it is, "Delete my account" answers "not available yet" and everything else works.
+- Migration `2026-09-30t-delete-account.sql` (A5): **applied on production 2026-09-30** (Cowork, SQL editor; all 39
+  columns the functions use checked first; after: `users.deleted_at`, both tables RLS on, both functions
+  service_role-only). "Delete my account" is on: the route checks on every request, no restart needed.
 - Migration `2026-09-29s-function-search-path.sql` (review #27, the Advisor's 5 "function search path mutable"
   warnings): **applied on production 2026-09-29** (Cowork; bodies matched exactly beforehand; after: 5/5 pinned,
   grants unchanged). Security Advisor: 0 errors, 0 warnings. Suite: `function-search-path.js`
