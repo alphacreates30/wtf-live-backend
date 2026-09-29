@@ -1758,9 +1758,23 @@ io.on('connection', (socket) => {
     next();
   });
 
+  // Every event handler goes through this (security review #4). A client can
+  // send any event with any payload - or none: the handlers destructure their
+  // payload, so an event with no payload threw inside an async handler, and an
+  // unhandled rejection exits Node. One anonymous socket.emit('place_bid') took
+  // the whole server down. The payload is always an object here, and a handler
+  // that throws is logged, never fatal.
+  const on = (event, handler) => socket.on(event, async (payload, ...rest) => {
+    try {
+      await handler(payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {}, ...rest);
+    } catch (e) {
+      console.error(`socket ${event} failed:`, e.message);
+    }
+  });
+
   console.log(`- User connected: ${socket.id}`);
 
-  socket.on('join_auction', async ({ auctionId, token } = {}) => {
+  on('join_auction', async ({ auctionId, token } = {}) => {
     // Support legacy string-only calls
     if (typeof auctionId === 'string' && !token) { /* auctionId already set */ }
 
@@ -1829,7 +1843,7 @@ io.on('connection', (socket) => {
   // and no atomic row lock; and live auctions never charge (createOrderOnWin
   // is only wired into autoCloseStandardItems, not the live socket path).
   // Don't re-enable without fixing both.
-  socket.on('place_bid', async ({ auctionId, amount, token }) => {
+  on('place_bid', async ({ auctionId, amount, token }) => {
     const user = await verifySocketToken(token);
     if (!user) { socket.emit('bid_error', { message: 'You must be logged in to bid' }); return; }
 
@@ -1855,7 +1869,7 @@ io.on('connection', (socket) => {
     console.log(`- -  ${user.username} bid $${amount} on auction ${auctionId}`);
   });
 
-  socket.on('send_chat', async ({ auctionId, text, token }) => {
+  on('send_chat', async ({ auctionId, text, token }) => {
     const user = await verifySocketToken(token);
     if (!user) { socket.emit('chat_error', { message: 'You must be logged in to chat' }); return; }
     if (!text || !text.trim()) return;
@@ -1875,7 +1889,7 @@ io.on('connection', (socket) => {
   });
 
   // -- Admin: block user mid-auction --
-    socket.on('block_user', async ({ targetUserId, targetUsername, auctionId, token }) => {
+    on('block_user', async ({ targetUserId, targetUsername, auctionId, token }) => {
     const admin = await verifySocketToken(token);
     if (!admin || admin.username !== ADMIN_USERNAME) {
       socket.emit('host_error', { message: 'Admin only' }); return;
@@ -1917,7 +1931,7 @@ io.on('connection', (socket) => {
     console.log(`- Admin blocked user ${targetUsername} (${resolvedUserId}) from auction ${auctionId}`);
   });
 
-  socket.on('start_auction', async ({ auctionId, token }) => {
+  on('start_auction', async ({ auctionId, token }) => {
     const user = await verifySocketToken(token);
     if (!user) return socket.emit('host_error', { message: 'Unauthorized' });
     const { data: auction } = await supabase.from('auctions').select('host_username, status, ends_at, mode').eq('id', auctionId).single();
@@ -1930,7 +1944,7 @@ io.on('connection', (socket) => {
     console.log(`- Host ${user.username} started auction ${auctionId}`);
   });
 
-  socket.on('end_auction', async ({ auctionId, token }) => {
+  on('end_auction', async ({ auctionId, token }) => {
     const user = await verifySocketToken(token);
     if (!user) return socket.emit('host_error', { message: 'Unauthorized' });
     const { data: auction } = await supabase.from('auctions').select('host_username, leading_bidder, current_bid, mode').eq('id', auctionId).single();
@@ -1943,7 +1957,7 @@ io.on('connection', (socket) => {
     console.log(`- Host ${user.username} ended auction ${auctionId} early`);
   });
 
-  socket.on('extend_auction', async ({ auctionId, extraSeconds, token }) => {
+  on('extend_auction', async ({ auctionId, extraSeconds, token }) => {
     const user = await verifySocketToken(token);
     if (!user) return socket.emit('host_error', { message: 'Unauthorized' });
     const { data: auction } = await supabase.from('auctions').select('host_username, ends_at, status, mode').eq('id', auctionId).single();
@@ -1959,7 +1973,7 @@ io.on('connection', (socket) => {
   });
 
 
-  socket.on('next_item', async ({ auctionId, token, timerSeconds = 60 }) => {
+  on('next_item', async ({ auctionId, token, timerSeconds = 60 }) => {
     const user = await verifySocketToken(token);
     if (!user || user.username !== ADMIN_USERNAME) return socket.emit('host_error', { message: 'Admin only' });
     if (!(await isLiveModeAuction(auctionId))) return socket.emit('host_error', { message: LIVE_ONLY });
@@ -3657,6 +3671,10 @@ async function autoCloseStandardItems() {
 setInterval(autoCloseStandardItems, 30000)
 autoCloseStandardItems()
 
+
+// Backstop for #4: a rejected promise nobody awaited is logged, not fatal.
+// (Uncaught synchronous exceptions still exit - that state can't be trusted.)
+process.on('unhandledRejection', e => console.error('Unhandled rejection:', e && e.stack || e));
 
 server.listen(PORT, async () => {
   console.log(`WhatTheFind Live server running on port ${PORT}`);
