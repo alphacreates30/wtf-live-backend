@@ -177,6 +177,9 @@ addresses. Production never sets it, and Railway traffic never arrives from loop
 - Migration `2026-09-29q-username-unique-lower.sql`: **applied on production 2026-09-29** (Cowork), after Albert
   deleted the two case-duplicate June test accounts in the same transaction (migration r was not needed).
   Verified: 0 leftovers, `users_username_lower_key` present, 28 users. Security Advisor: 0 errors.
+- Migration `2026-09-29s-function-search-path.sql` (review #27, the Advisor's 5 "function search path mutable"
+  warnings): applied on wtf-test with every suite green; **not yet on production**. Suite: `function-search-path.js`
+  (BEFORE: records the controls, including a real shadowing through a caller's temp tables, and exits 2).
 
 ## Not covered
 
