@@ -2987,7 +2987,25 @@ app.post('/admin/orders/label', requireAdmin, normalizeBodyIds({ list: ['order_i
 
   if (!SHIPPO_API_KEY) return res.status(500).json({ error: 'SHIPPO_API_KEY not configured' });
 
-  const chargeResult = await chargeShipping(order_ids, amount_cents);
+  // Charge what Shippo says the rate costs, re-read now - never an amount the
+  // browser sent (security review #20). The client's amount_cents is only a
+  // cross-check: if it no longer matches (a stale or mistyped quote), nothing
+  // is charged and the host gets a fresh quote.
+  if (typeof rate_id !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(rate_id)) return res.status(400).json({ error: 'Invalid rate_id' });
+  let rateDetails;
+  try { rateDetails = await shippoFetch('GET', `/rates/${rate_id}/`); } catch (e) {
+    console.error('Shippo rate lookup failed:', e.message);
+    return res.status(502).json({ error: 'Could not confirm the shipping rate with Shippo. Try again.' });
+  }
+  const rateCents = Math.round(parseFloat(rateDetails?.amount) * 100);
+  if (rateDetails?.object_id !== rate_id || String(rateDetails?.currency || '').toUpperCase() !== 'USD' || !(rateCents > 0)) {
+    return res.status(400).json({ error: 'That shipping rate is not valid any more. Get a new quote.' });
+  }
+  if (rateCents !== amount_cents) {
+    return res.status(409).json({ error: `The rate is now ${formatMoney(rateCents)}, not ${formatMoney(amount_cents)}. Get a new quote.` });
+  }
+
+  const chargeResult = await chargeShipping(order_ids, rateCents);
   if (!chargeResult.success) {
     return res.status(402).json({ error: 'Shipping charge failed', detail: chargeResult.error });
   }
@@ -2999,7 +3017,6 @@ app.post('/admin/orders/label', requireAdmin, normalizeBodyIds({ list: ['order_i
     // 2026-09-14, see the tracking_carrier note below), so the rate itself
     // is re-read from Shippo the same way the original single-request flow
     // read it off the /shipments/ response.
-    const rateDetails = await shippoFetch('GET', `/rates/${rate_id}/`);
     const transaction = await shippoFetch('POST', '/transactions/', {
       rate: rate_id,
       label_file_type: 'PDF',
@@ -3012,7 +3029,7 @@ app.post('/admin/orders/label', requireAdmin, normalizeBodyIds({ list: ['order_i
       // it needs a human, not a silent retry with a possibly-stale rate.
       await sendAdminEmail(
         `Shipping charged but label purchase FAILED - order(s) ${order_ids.join(', ')}`,
-        `Charged ${formatMoney(amount_cents)} (payment_intent ${chargeResult.payment_intent_id}) but Shippo label purchase failed.\nOrder(s): ${order_ids.join(', ')}\nDetail: ${JSON.stringify(transaction.messages)}`
+        `Charged ${formatMoney(rateCents)} (payment_intent ${chargeResult.payment_intent_id}) but Shippo label purchase failed.\nOrder(s): ${order_ids.join(', ')}\nDetail: ${JSON.stringify(transaction.messages)}`
       );
       return res.status(500).json({
         error: 'Buyer was charged but label purchase failed - needs manual follow-up',
@@ -3046,13 +3063,13 @@ app.post('/admin/orders/label', requireAdmin, normalizeBodyIds({ list: ['order_i
     res.json({
       label_url: transaction.label_url,
       tracking_number: transaction.tracking_number,
-      shipping_cost_cents: amount_cents,
+      shipping_cost_cents: rateCents,
     });
   } catch (e) {
     console.error('Shippo error:', e.message);
     await sendAdminEmail(
       `Shipping charged but label purchase FAILED - order(s) ${order_ids.join(', ')}`,
-      `Charged ${formatMoney(amount_cents)} (payment_intent ${chargeResult.payment_intent_id}) but Shippo label purchase threw.\nOrder(s): ${order_ids.join(', ')}\nError: ${e.message}`
+      `Charged ${formatMoney(rateCents)} (payment_intent ${chargeResult.payment_intent_id}) but Shippo label purchase threw.\nOrder(s): ${order_ids.join(', ')}\nError: ${e.message}`
     );
     res.status(500).json({ error: 'Buyer was charged but label purchase failed - needs manual follow-up', detail: e.message });
   }
