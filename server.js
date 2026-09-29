@@ -799,6 +799,7 @@ const RESERVED_USERNAMES = new Set(['admin', 'administrator', 'host', 'support',
 function usernameProblem(name) {
   if (!USERNAME_RE.test(name)) return 'Usernames are 3-30 characters: lowercase letters, numbers and _ only';
   if (name.replace(/_/g, '').includes('whatthefind') || RESERVED_USERNAMES.has(name.replace(/_/g, ''))) return "That username isn't available";
+  if (name.startsWith('deleted_')) return "That username isn't available";   // the placeholder for deleted accounts (A5)
   return null;
 }
 const likeExact = v => v.replace(/[\\%_]/g, c => '\\' + c);   // ilike with no wildcards = case-insensitive equality
@@ -812,6 +813,12 @@ app.post('/auth/register', LIMITS.register, async (req, res) => {
   const { data: taken, error: takenErr } = await supabase.from('users').select('id').ilike('username', likeExact(username)).limit(1);
   if (takenErr) return res.status(500).json({ error: 'Registration failed' });
   if (taken.length) return res.status(409).json({ error: 'Username already taken' });
+  // A deleted account's old username is held for 30 days (A5), stored only as a hash. Before migration t exists the
+  // table doesn't, and registration carries on as before.
+  const { data: held, error: heldErr } = await supabase.from('reserved_usernames').select('reserved_until')
+    .eq('username_hash', sha256(username)).gt('reserved_until', new Date().toISOString()).limit(1);
+  if (heldErr && !['42P01', 'PGRST205'].includes(heldErr.code)) return dbFailure(req, res, heldErr);
+  if (held?.length) return res.status(409).json({ error: "That username isn't available" });
   if (password.length < MIN_PASSWORD) return res.status(400).json({ error: `Password must be at least ${MIN_PASSWORD} characters` });
   const email = cleanEmail(req.body.email);
   if (!email) return res.status(400).json({ error: 'A valid email is required', detail: "It's how you reset your password if you forget it." });
@@ -875,6 +882,81 @@ app.post('/auth/email', requireAuth, LIMITS.passwordCheck, async (req, res) => {
   const { error } = await supabase.from('users').update({ email }).eq('id', user.id);
   if (error) return res.status(500).json({ error: 'Could not save your email' });
   res.json({ email });
+});
+
+// ---- Delete my account (A5, DELETE_ACCOUNT_BRIEF.md) ----
+// Anonymise, don't erase: personal details go, sale records stay. The database
+// work is one transaction in delete_account() (migration t); Stripe is done
+// first, and if it fails nothing changes. Refused while the buyer still has
+// something in progress, with what to do instead.
+const DELETION_BLOCKERS = {
+  leading_open_lot: "You're the highest bidder on a lot that's still open. Bids are binding, so wait until it closes.",
+  max_bid_open_lot: "You have a max bid on a lot that's still open. Wait until it closes.",
+  unpaid_invoice: "You have a payment that hasn't gone through. Update your card on your profile, or reply to the payment email, so it can be settled first.",
+  order_not_shipped: "An item you won hasn't shipped or been collected yet, and we still need your address for it. Try again once it's on its way or collected.",
+};
+const blockersToMessages = codes => codes.map(c => DELETION_BLOCKERS[c] || c);
+// Before migration t exists, the functions/column don't: the route says so instead of failing.
+const notMigrated = e => ['PGRST202', '42883', '42703', 'PGRST204'].includes(e?.code);
+
+app.post('/account/delete', requireAuth, LIMITS.loginIp, LIMITS.passwordCheck, async (req, res) => {
+  if (req.user.username === ADMIN_USERNAME) return res.status(403).json({ error: "The host account can't be deleted" });
+  const { password, confirm } = req.body || {};
+  if (confirm !== 'DELETE') return res.status(400).json({ error: 'Type DELETE to confirm' });
+  if (typeof password !== 'string' || !password) return res.status(400).json({ error: 'Enter your password' });
+
+  const { data: user, error: uErr } = await supabase.from('users').select('id, username, email, password_hash').eq('id', req.user.id).maybeSingle();
+  if (uErr) return dbFailure(req, res, uErr);
+  if (!user) return res.status(401).json({ error: 'Account not found' });
+  if (!(await bcrypt.compare(password, user.password_hash))) return res.status(401).json({ error: 'That password is not right' });
+
+  const { data: blockers, error: bErr } = await supabase.rpc('account_deletion_blockers', { p_user_id: user.id });
+  if (bErr) {
+    if (notMigrated(bErr)) return res.status(503).json({ error: 'Account deletion is not available yet. Please contact us.' });
+    return dbFailure(req, res, bErr);
+  }
+  if (blockers?.length) return res.status(409).json({ error: "Your account can't be deleted yet", reasons: blockersToMessages(blockers), codes: blockers });
+
+  const { data: profile, error: pErr } = await supabase.from('profiles').select('email, stripe_customer_id').eq('user_id', String(user.id)).maybeSingle();
+  if (pErr) return dbFailure(req, res, pErr);
+  const emailOnFile = user.email || profile?.email || null;
+
+  // Stripe first: saved cards detached, the customer deleted. If this fails, stop - nothing has changed.
+  const customerId = profile?.stripe_customer_id;
+  if (customerId) {
+    if (!stripe) return res.status(503).json({ error: "We couldn't remove your saved card right now, so nothing was deleted. Please try again later." });
+    try {
+      const methods = await stripe.paymentMethods.list({ customer: customerId, type: 'card', limit: 100 });
+      for (const m of methods.data || []) await stripe.paymentMethods.detach(m.id);
+      await stripe.customers.del(customerId);
+    } catch (e) {
+      if (e?.code !== 'resource_missing') {   // already gone at Stripe: nothing left to remove
+        console.error('account delete: Stripe cleanup failed for user', user.id, e?.code || '', e?.message);
+        return res.status(502).json({ error: "We couldn't remove your saved card right now, so nothing was deleted. Please try again later." });
+      }
+    }
+  }
+
+  const { data: newName, error: dErr } = await supabase.rpc('delete_account', { p_user_id: user.id });
+  if (dErr) {
+    const m = /account_not_deletable:(\S+)/.exec(dErr.message || '');
+    if (m) { const codes = m[1].split(','); return res.status(409).json({ error: "Your account can't be deleted yet", reasons: blockersToMessages(codes), codes }); }
+    if (notMigrated(dErr)) return res.status(503).json({ error: 'Account deletion is not available yet. Please contact us.' });
+    return dbFailure(req, res, dErr);
+  }
+  notePasswordChanged(user.id, new Date().toISOString());   // this instance drops every session at once
+  console.log(`Account deleted: ${user.id} -> ${newName}`);
+
+  // Confirmation to the address that was on file (read before the wipe; sent once the deletion has committed, so it
+  // never announces a deletion that didn't happen). A failed send doesn't undo anything.
+  if (emailOnFile) {
+    await sendEmail({
+      from: BUYER_FROM, to: emailOnFile, subject: 'Your WhatTheFind account has been deleted', kind: 'account_deleted',
+      text: 'Your WhatTheFind account has been deleted, as you asked.\n\nYour name, contact details, address and saved card have been removed, and your username no longer appears on any bid or message. Records of past purchases (items, amounts, dates and the shipping address used) are kept for accounting and tax, as the privacy policy explains.\n\nIf you didn\'t ask for this, reply to this email.',
+      html: emailHtml('Your account has been deleted', '<p>Your WhatTheFind account has been deleted, as you asked.</p><p>Your name, contact details, address and saved card have been removed, and your username no longer appears on any bid or message. Records of past purchases (items, amounts, dates and the shipping address used) are kept for accounting and tax, as the privacy policy explains.</p><p>If you didn\'t ask for this, reply to this email.</p>'),
+    });
+  }
+  res.json({ deleted: true });
 });
 
 // ---- Forgotten password ----
@@ -978,6 +1060,10 @@ app.post('/admin/users/:userId/password', requireAdmin, async (req, res) => {
   if (typeof new_password !== 'string' || new_password.length < MIN_PASSWORD) {
     return res.status(400).json({ error: `Password must be at least ${MIN_PASSWORD} characters` });
   }
+  // A deleted account (A5) must stay unusable: no temporary password brings it back.
+  const { data: target, error: tErr } = await supabase.from('users').select('deleted_at').eq('id', req.params.userId).maybeSingle();
+  if (tErr && !notMigrated(tErr)) return dbFailure(req, res, tErr);
+  if (target?.deleted_at) return res.status(409).json({ error: 'This account was deleted and cannot be changed' });
   const password_hash = await bcrypt.hash(new_password, 10);
   const password_changed_at = new Date().toISOString();
   const { data, error } = await supabase.from('users')
@@ -1266,13 +1352,25 @@ app.get('/admin/buyers', requireAdmin, async (req, res) => {
     .select('*')
     .order('created_at', { ascending: false });
   if (error) return dbFailure(req, res, error);
-  res.json(data);
+  // Deleted accounts (A5) show as "Deleted account": their profile fields are already empty; this adds the flag.
+  const ids = (data || []).map(p => p.user_id).filter(id => canonicalUuid(id));
+  let deleted = new Set();
+  if (ids.length) {
+    const { data: gone, error: gErr } = await supabase.from('users').select('id').in('id', ids).not('deleted_at', 'is', null);
+    if (gErr && !notMigrated(gErr)) return dbFailure(req, res, gErr);
+    deleted = new Set((gone || []).map(u => String(u.id)));
+  }
+  res.json((data || []).map(p => deleted.has(String(p.user_id)) ? { ...p, deleted: true } : p));
 });
 
 app.patch('/admin/buyers/:userId', requireAdmin, async (req, res) => {
   const { status } = req.body;
   const validStatuses = ['pending', 'approved', 'rejected', 'blocked'];
   if (!validStatuses.includes(status)) return res.status(400).json({ error: 'Invalid status' });
+  // A deleted account can't be brought back (A5).
+  const { data: target, error: tErr } = await supabase.from('users').select('deleted_at').eq('id', req.params.userId).maybeSingle();
+  if (tErr && !notMigrated(tErr)) return dbFailure(req, res, tErr);
+  if (target?.deleted_at) return res.status(409).json({ error: 'This account was deleted and cannot be changed' });
 
   const { data, error } = await supabase
     .from('profiles')
