@@ -1,5 +1,7 @@
--- STEP s (security review #27). NOT YET APPLIED ON PRODUCTION - for Albert/Cowork to run in the Supabase SQL editor.
--- Applied and verified on wtf-test 2026-09-29 (every verification suite green with it in place).
+-- APPLIED on production 2026-09-29 by Cowork. Pre-check: the 5 live function bodies matched this file's bodies
+-- exactly (md5 with CR and 'public.' stripped). After: 5/5 search_path pinned, 0 anon/authenticated EXECUTE,
+-- 0 service_role missing. Security Advisor: 0 errors, 0 warnings. /auctions still serves. DO NOT RUN AGAIN.
+-- Was: STEP s (security review #27). Applied and verified on wtf-test 2026-09-29 (every suite green with it).
 --
 -- Clears the Security Advisor's 5 "Function search path mutable" warnings: place_bid, place_standard_bid,
 -- get_expired_standard_items, delete_auction_cascade, update_standard_leader_max. Their tables were looked up
