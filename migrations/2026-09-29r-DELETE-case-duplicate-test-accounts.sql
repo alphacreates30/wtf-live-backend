@@ -1,5 +1,8 @@
--- NOT USED - DO NOT RUN. Superseded 2026-09-29: Albert deleted bidder305TEST / Bidder305TEST directly, in the same
--- transaction as migration q (both accounts had no profile, bids, pre-bids, orders or invoices). Kept as a record.
+-- NOT APPLIED - SUPERSEDED - DO NOT RUN. Kept for reference only.
+-- 2026-09-29: Albert deleted bidder305TEST / Bidder305TEST directly on production, in the same transaction as
+-- migration q. Cowork verified beforehand: no profile, bids, pre-bids, orders or invoices; afterwards: 0 terms
+-- acceptances, chat, bids or pre-bids pointing at them, 0 orphaned profiles. q applied (users_username_lower_key
+-- present, 28 users). Security Advisor on production: 0 errors.
 -- Was: STEP r. DELETES ROWS.
 -- Albert, 2026-09-29: delete both case-duplicate test accounts, bidder305TEST and Bidder305TEST, so migration q
 -- (unique lower(username)) can run. Tested on wtf-test with look-alike fixtures (see the commit).
