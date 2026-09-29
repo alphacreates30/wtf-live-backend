@@ -1709,12 +1709,25 @@ app.patch('/auction/:id/fulfillment-choice', requireAuth, async (req, res) => {
   res.json({ accepted: true, ...data });
 });
 
+// LiveKit room token (security review #18). It was issued to any logged-in
+// account for any auction - drafts and standard auctions included - with
+// canPublishData for everyone. Now: live-mode auctions only (the only ones with
+// video), not drafts unless you're the admin, only the host or an approved
+// buyer, and only the host may publish (video or data).
 app.get('/auction/:id/token', requireAuth, async (req, res) => {
-  const { data: auction } = await supabase.from('auctions').select('host_username').eq('id', req.params.id).single();
-  if (!auction) return res.status(404).json({ error: 'Auction not found' });
+  const { data: auction, error } = await supabase.from('auctions').select('host_username, status, mode').eq('id', req.params.id).maybeSingle();
+  if (error) return dbFailure(req, res, error);
+  const isAdmin = req.user.username === ADMIN_USERNAME;
+  if (!auction || auction.mode !== 'live' || (auction.status === 'draft' && !isAdmin)) return res.status(404).json({ error: 'Auction not found' });
   const isHost = auction.host_username === req.user.username;
+  if (!isHost && !isAdmin) {
+    const { data: profile, error: pErr } = await supabase.from('profiles').select('status').eq('user_id', String(req.user.id)).maybeSingle();
+    if (pErr) return dbFailure(req, res, pErr);
+    if (!profile || profile.status !== 'approved') return res.status(403).json({ error: 'Your account must be approved to join the live stream' });
+  }
+  if (!process.env.LIVEKIT_API_KEY || !process.env.LIVEKIT_API_SECRET) return res.status(503).json({ error: 'Live video is not configured' });
   const at = new AccessToken(process.env.LIVEKIT_API_KEY, process.env.LIVEKIT_API_SECRET, { identity: req.user.username, ttl: '4h' });
-  at.addGrant({ roomJoin: true, room: 'auction-' + req.params.id, canPublish: isHost, canSubscribe: true, canPublishData: true });
+  at.addGrant({ roomJoin: true, room: 'auction-' + req.params.id, canPublish: isHost, canSubscribe: true, canPublishData: isHost });
   res.json({ token: await at.toJwt(), room: 'auction-' + req.params.id, url: process.env.LIVEKIT_URL, isHost });
 });
 
