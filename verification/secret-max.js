@@ -73,6 +73,11 @@ async function fixtures(label) {
   };
   const SL = await lot(S, 'open');
   const VL = await lot(V, 'pending');
+  // Bidders must be approved with a saved card (review #3): placeholder ids, nothing reaches Stripe.
+  for (const u of [L, C]) {
+    const p = await s.from('profiles').insert({ user_id: u.id, full_name: 'ZZTEST secretmax', email: 'zztest_secretmax@example.invalid', phone: '0', address_line1: '1 ZZ St', city: 'X', state: 'CA', zip: '94000', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_secretmax', stripe_payment_method_id: 'pm_ZZFIXTURE_secretmax' });
+    if (p.error) throw new Error('profile: ' + JSON.stringify(p.error));
+  }
   for (const u of [L, C]) for (const a of [S, V]) {
     const t = await s.from('auction_terms_acceptances').insert({ auction_id: a, user_id: u.id, accepted_at: new Date().toISOString(), buyers_premium_pct: 15, fulfillment_mode: 'shipping', fulfillment_choice: 'shipping', terms_version: '1' });
     if (t.error) throw new Error('acceptance: ' + JSON.stringify(t.error));
@@ -178,10 +183,12 @@ async function cleanup() {
     servers.forEach(x => x.cleanup());
     await cleanup();
     await s.from('auction_terms_acceptances').delete().in('user_id', [L.id, C.id]);
+    await s.from('profiles').delete().in('user_id', [L.id, C.id]);
     const left = (await s.from('auctions').select('id').like('title', 'ZZTEST_secretmax%')).data.length
       + (await s.from('pre_bids').select('id').in('buyer_username', [L.username, C.username])).data.length
       + (await s.from('bids').select('id').in('username', [L.username, C.username])).data.length
-      + (await s.from('auction_terms_acceptances').select('user_id').in('user_id', [L.id, C.id])).data.length;
+      + (await s.from('auction_terms_acceptances').select('user_id').in('user_id', [L.id, C.id])).data.length
+      + (await s.from('profiles').select('id').in('user_id', [L.id, C.id])).data.length;
     console.log('\nleftover throwaway rows:', left);
     if (left) fails++;
   }

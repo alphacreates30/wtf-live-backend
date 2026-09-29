@@ -1500,6 +1500,8 @@ app.get('/auction/:id/terms-acceptance', requireAuth, async (req, res) => {
 });
 
 app.post('/auction/:id/terms-acceptance', requireAuth, async (req, res) => {
+  const refusal = await biddingRefusal(req.user);
+  if (refusal) return res.status(refusal.status).json({ error: refusal.error, code: refusal.code });
   const { fulfillment_choice } = req.body;
   const { data: auction, error: auctionErr } = await supabase
     .from('auctions')
@@ -2997,6 +2999,32 @@ app.delete('/auction/:id/items/:itemId', requireAdmin, async (req, res) => {
   res.json({ success: true });
 });
 
+// A bid or pre-bid is a promise to pay, and a winner who can't be charged loses
+// the lot for everyone. So only an approved, unblocked buyer with a saved card
+// may accept terms, pre-bid or bid (security review #3: accounts with no
+// profile, pending, rejected and even blocked could all take the lead). The
+// admin/host is exempt, as on the socket path. Fails closed on a lookup error.
+async function biddingRefusal(user) {
+  if (user.username === ADMIN_USERNAME) return null;
+  const { data: p, error } = await supabase.from('profiles')
+    .select('status, stripe_payment_method_id').eq('user_id', String(user.id)).maybeSingle();
+  if (error) return { status: 503, error: 'Could not check your account. Try again in a moment.' };
+  if (!p) return { status: 403, code: 'no_profile', error: 'Complete your buyer profile before bidding' };
+  if (p.status === 'blocked') return { status: 403, code: 'blocked', error: 'This account cannot bid' };
+  if (p.status !== 'approved') return { status: 403, code: 'not_approved', error: 'Your account must be approved before you can bid' };
+  if (!p.stripe_payment_method_id) return { status: 403, code: 'no_card', error: 'Add a payment card before bidding' };
+  return null;
+}
+
+// A max bid is a real number of dollars, at most MAX_BID_DOLLARS, whole cents.
+// Stops a troll parking an unbeatable $99,999,999 max on every lot (#3).
+const MAX_BID_DOLLARS = 100000;
+function parseMaxBid(v) {
+  const n = typeof v === 'number' ? v : (typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN);
+  if (!Number.isFinite(n) || n < 1 || n > MAX_BID_DOLLARS) return null;
+  return Math.round(n * 100) / 100;
+}
+
 // auction_items.auction_id is uuid (migration 2026-09-24i) and req params are
 // canonical lowercase (app.param), so a plain === would do; the lowercasing is
 // kept as a harmless belt-and-braces from when the column was text.
@@ -3005,8 +3033,10 @@ function lotBelongsToAuction(item, auctionId) {
 }
 
 app.post('/auction/:id/items/:itemId/prebid', requireAuth, async (req, res) => {
-  const { max_amount } = req.body;
-  if (!max_amount || max_amount < 1) return res.status(400).json({ error: 'max_amount required' });
+  const max_amount = parseMaxBid(req.body?.max_amount);
+  if (max_amount == null) return res.status(400).json({ error: `Max bid must be between $1 and $${MAX_BID_DOLLARS.toLocaleString('en-US')}` });
+  const refusal = await biddingRefusal(req.user);
+  if (refusal) return res.status(refusal.status).json({ error: refusal.error, code: refusal.code });
   const { data: auctionRow } = await supabase.from('auctions').select('status').eq('id', req.params.id).single();
   if (!auctionRow) return res.status(404).json({ error: 'Auction not found' });
   if (auctionRow.status === 'draft') return res.status(400).json({ error: 'Auction is not published yet' });
@@ -3061,8 +3091,10 @@ const SOFT_CLOSE_MINUTES = 2;
 const OPENING_BID_MIN = 1;
 
 app.post('/auction/:id/items/:itemId/bid', requireAuth, async (req, res) => {
-  const { max_amount } = req.body;
-  if (!max_amount || max_amount < 1) return res.status(400).json({ error: 'max_amount required' });
+  const max_amount = parseMaxBid(req.body?.max_amount);
+  if (max_amount == null) return res.status(400).json({ error: `Max bid must be between $1 and $${MAX_BID_DOLLARS.toLocaleString('en-US')}` });
+  const refusal = await biddingRefusal(req.user);
+  if (refusal) return res.status(refusal.status).json({ error: refusal.error, code: refusal.code });
 
   const { data: auctionRow } = await supabase.from('auctions').select('status').eq('id', req.params.id).single();
   if (!auctionRow) return res.status(404).json({ error: 'Auction not found' });

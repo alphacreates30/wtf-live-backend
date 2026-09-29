@@ -65,7 +65,7 @@ const socketTry = (port, event, payload, waitFor) => new Promise(resolve => {
     const DRAFT = await mkAuction('draft', 'draft');
     const pendingLot = await mkItem(LIVE, 'ZZTEST idnorm pending lot', 'pending');
     const lotForDraft = await mkItem(DRAFT, 'ZZTEST idnorm draft lot', 'pending');
-    const pr = await s.from('profiles').insert({ user_id: U, full_name: 'ZZTEST idnorm', email: 'zztest_idnorm@example.invalid', phone: '5555550100', address_line1: '1 Test St', city: 'Testville', state: 'CA', zip: '94000', status: 'approved' });
+    const pr = await s.from('profiles').insert({ user_id: U, full_name: 'ZZTEST idnorm', email: 'zztest_idnorm@example.invalid', phone: '5555550100', address_line1: '1 Test St', city: 'Testville', state: 'CA', zip: '94000', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_idnorm', stripe_payment_method_id: 'pm_ZZFIXTURE_idnorm' });
     if (pr.error) throw new Error(JSON.stringify(pr.error));
     const tr = await s.from('auction_terms_acceptances').insert({ auction_id: LIVE, user_id: U, accepted_at: new Date().toISOString(), buyers_premium_pct: 15, fulfillment_mode: 'shipping', fulfillment_choice: 'shipping', terms_version: '1' });
     if (tr.error) throw new Error(JSON.stringify(tr.error));
