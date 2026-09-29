@@ -163,6 +163,19 @@ commit before its fix. The newer suites boot their local servers through `verifi
 | `upload-reencode.js` | #13 | Uploads were stored byte-for-byte (EXIF GPS in the public bucket; SVG accepted). Now re-encoded: no metadata, orientation applied, JPEG/PNG/WebP only, 2400px max. | `1e24469` |
 | `username-rules.js` | #14 | Host lookalikes registered. Now lowercase `a-z 0-9 _`, no `whatthefind`/staff names, unique by case (migration `q`). | `8d21f1e` |
 
+Low findings, fixed 2026-09-29. Where a suite needs Stripe, Shippo or Resend, it stubs them inside the local server
+process (`local-server.js` options `env`, `preload`, `patch`), so nothing leaves the machine:
+
+| Suite | Finding | Proves | Control pinned to |
+|---|---|---|---|
+| `login-timing.js` | #15 | A failed login for an unknown username took ~half the time of a real one (bcrypt only for real accounts). Now the same (dummy hash). | `82390f5` |
+| `db-errors.js` | #16 | With the database unreachable, public routes sent the raw error object. Now a generic message; the bid function's own messages still reach the bidder. | `be6509e` |
+| `draft-reads.js` | #17 | A draft's bids and chat were readable anonymously by id. Now 404 except for the admin. | `a99a549` |
+| `livekit-token.js` | #18 | LiveKit tokens for any account, any auction, drafts included, data-publish for all. Now live-mode only, host or approved buyer, only the host publishes. | `409db0e` |
+| `stripe-webhook-failed.js` | #19 | A late `payment_failed` event relabelled a PAID invoice/order as failed. Now only unpaid rows. | `e8711c7` |
+| `shipping-label-amount.js` | #20 | The label route charged the browser's `amount_cents`. Now Shippo's re-read rate; mismatch -> 409, nothing charged. | `18002ac` |
+| `email-log-privacy.js` | #21 | Buyers' email addresses in two log lines. Now redacted. | `e4e4f8f` |
+
 **Rate limits and the suites.** `guard.js` sets `RATE_LIMIT_EXEMPT_LOOPBACK=1`, which the suites' local servers
 inherit, because a suite fires many logins and bids from localhost. The server honours it only for loopback
 addresses. Production never sets it, and Railway traffic never arrives from loopback. `rate-limits.js` clears it.

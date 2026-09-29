@@ -49,4 +49,8 @@ module.exports = function guard(file) {
 // multi-line marker into a false "marker not found" (#49).
 const lf = s => s.replace(/\r\n/g, '\n');
 module.exports.readSource = file => lf(require('fs').readFileSync(file, 'utf8'));
-module.exports.sourceAt = (commit, cwd) => lf(require('child_process').execSync('git show ' + commit + ':server.js', { cwd, maxBuffer: 50e6 }).toString());
+// Commits before 5085a9e require 'nodemailer', which is no longer installed (review #23). Their transport was
+// created but never used, so a stand-in with the same shape lets pinned old code boot unchanged in every other way.
+const NODEMAILER_STANDIN = "({ createTransport: () => ({ sendMail: async () => ({}) }) })";
+module.exports.sourceAt = (commit, cwd) => lf(require('child_process').execSync('git show ' + commit + ':server.js', { cwd, maxBuffer: 50e6 }).toString())
+  .replace("require('nodemailer')", NODEMAILER_STANDIN);
