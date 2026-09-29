@@ -175,12 +175,14 @@ always red teaches people to ignore red.
   so both now build that fixture themselves (2026-09-24). Suites still borrow
   the `zztest_paid_ok` buyer read-only; if that user is ever cleaned up,
   `charge-auto-vs-manual`, `orders-item-unique`, `paid-stays-paid` and
-  `undercharge-race` will fail at setup. **On wtf-test that user does not exist
-  yet (2026-09-28):** it needs a `users` row plus an approved `profiles` row
-  with a saved Stripe *test-mode* customer and card. None of the four sends
-  anything to Stripe (each fakes it or blanks the key), but `paid-stays-paid`
-  refuses to start without both ids set. Until it exists, those four fail at
-  setup on wtf-test.
+  `undercharge-race` will fail at setup. **On wtf-test (created 2026-09-28)** it
+  is a `users` row (password hash `zztest-not-a-real-hash`, so it can't log in;
+  email `zztest_paid_ok@example.invalid`) plus an approved profile with
+  `payment_status` `ok` and placeholder Stripe ids `cus_ZZFIXTURE_paid_ok` /
+  `pm_ZZFIXTURE_paid_ok`. None of the four sends anything to Stripe (each fakes
+  it or blanks the key), but `paid-stays-paid` refuses to start without both ids
+  set. Don't rename those ids to `cus_ZZFAKE_…`: `scale-200-close` counts that
+  prefix as its own leftovers. It is the only user on wtf-test; don't delete it.
 - **Low priority, open:** `pre_bids.buyer_user_id` (and the other user-id
   columns: `orders`/`invoices.buyer_user_id`, `profiles.user_id`,
   `auction_terms_acceptances.user_id`) are TEXT with no foreign key to `users`.
