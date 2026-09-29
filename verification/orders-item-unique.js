@@ -102,10 +102,13 @@ async function race(port, label) {
     }
   } finally {
     servers.forEach(x => x.cleanup());
-    for (const id of made.auctions) { await s.from('orders').delete().eq('auction_id', id); }
+    // the fixture auctions are 'ended' with sold-lot orders, so the recovery sweep for unbilled orders (review #2)
+    // may have invoiced them at boot: invoices go too, or they block deleting the auction
+    for (const id of made.auctions) { await s.from('orders').delete().eq('auction_id', id); await s.from('invoices').delete().eq('auction_id', id); }
     if (made.items.length) await s.from('auction_items').delete().in('id', made.items);
     for (const id of made.auctions) { await s.rpc('delete_auction_cascade', { p_auction_id: id }); }
     const left = (await s.from('auctions').select('id').like('title', 'ZZTEST_itemuniq_%')).data.length + (await s.from('orders').select('id').like('item_title', 'ZZTEST_itemuniq %')).data.length;
+    if (left) fails++;
     console.log('\nleftover throwaway rows:', left);
   }
   if (process.exitCode === 2) { console.log('\n(phase: BEFORE the migration - reproduction only)'); process.exit(2); }

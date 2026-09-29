@@ -75,7 +75,7 @@ async function fixtures(label) {
   const VL = await lot(V, 'pending');
   // Bidders must be approved with a saved card (review #3): placeholder ids, nothing reaches Stripe.
   for (const u of [L, C]) {
-    const p = await s.from('profiles').insert({ user_id: u.id, full_name: 'ZZTEST secretmax', email: 'zztest_secretmax@example.invalid', phone: '0', address_line1: '1 ZZ St', city: 'X', state: 'CA', zip: '94000', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_secretmax', stripe_payment_method_id: 'pm_ZZFIXTURE_secretmax' });
+    const p = await s.from('profiles').upsert({ user_id: u.id, full_name: 'ZZTEST secretmax', email: 'zztest_secretmax@example.invalid', phone: '0', address_line1: '1 ZZ St', city: 'X', state: 'CA', zip: '94000', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_secretmax', stripe_payment_method_id: 'pm_ZZFIXTURE_secretmax' }, { onConflict: 'user_id' });
     if (p.error) throw new Error('profile: ' + JSON.stringify(p.error));
   }
   for (const u of [L, C]) for (const a of [S, V]) {

@@ -62,6 +62,9 @@ const prebids = async id => (await s.from('pre_bids').select('id,auction_id,item
     const itemA2 = await mkItem(A, 'ZZTEST A pending lot', 'pending');
     const p = await s.from('profiles').insert({ user_id: U, full_name: 'ZZTEST termsgate', email: 'zztest_termsgate@example.invalid', phone: '5555550100', address_line1: '1 Test St', city: 'Testville', state: 'CA', zip: '94000', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_termsgate', stripe_payment_method_id: 'pm_ZZFIXTURE_termsgate' });
     if (p.error) throw new Error('profile: ' + JSON.stringify(p.error));
+    // the challenger bids too, so it needs the same standing (review #3); placeholder card ids
+    const p2 = await s.from('profiles').insert({ user_id: U2, full_name: 'ZZTEST termsgate 2', email: 'zztest_termsgate2@example.invalid', phone: '5555550100', address_line1: '1 Test St', city: 'Testville', state: 'CA', zip: '94000', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_termsgate2', stripe_payment_method_id: 'pm_ZZFIXTURE_termsgate2' });
+    if (p2.error) throw new Error('profile 2: ' + JSON.stringify(p2.error));
     // The buyer accepted terms on auction A ONLY (15% premium, shipping). Never on B (25%, both).
     const t = await s.from('auction_terms_acceptances').insert({ auction_id: A, user_id: U, accepted_at: new Date().toISOString(), buyers_premium_pct: 15, fulfillment_mode: 'shipping', fulfillment_choice: 'shipping', terms_version: '1' });
     if (t.error) throw new Error('acceptance: ' + JSON.stringify(t.error));
@@ -135,14 +138,14 @@ const prebids = async id => (await s.from('pre_bids').select('id,auction_id,item
     await s.from('pre_bids').delete().in('buyer_user_id', [U, U2]);
     await s.from('bids').delete().in('auction_id', ids.auctions);
     await s.from('auction_terms_acceptances').delete().in('user_id', [U, U2]);
-    await s.from('profiles').delete().eq('user_id', U);
+    await s.from('profiles').delete().in('user_id', [U, U2]);
     if (ids.items.length) await s.from('auction_items').delete().in('id', ids.items);
     if (ids.auctions.length) await s.from('auctions').delete().in('id', ids.auctions);
     const left = (await s.from('auctions').select('id').like('title', 'ZZTEST_termsgate%')).data.length
       + (await s.from('auction_items').select('id').like('title', 'ZZTEST %lot')).data.length
       + (await s.from('pre_bids').select('id').in('buyer_user_id', [U, U2])).data.length
       + (await s.from('auction_terms_acceptances').select('user_id').in('user_id', [U, U2])).data.length
-      + (await s.from('profiles').select('id').eq('user_id', U)).data.length;
+      + (await s.from('profiles').select('id').in('user_id', [U, U2])).data.length;
     console.log('\nleftover throwaway rows:', left);
   }
   if (!fails && !leaderMaxMigrated) { console.log('\nALL PASS except the leader-resubmit check, skipped: apply migrations/2026-09-27n and re-run'); process.exit(2); }

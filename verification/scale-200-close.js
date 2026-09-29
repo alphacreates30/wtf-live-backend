@@ -56,7 +56,9 @@ function patchedServer(fixId, tag) {
   rep("if (draftAuctionIds.has(item.auction_id)) continue", "if (false) continue");
   // the fixture stays 'draft' until the job ends it, so 'draft' here plays the role of production's status='live' filter:
   // once the job marks it 'ended' it is NOT revisited (dropping the status filter entirely made the job re-charge it every tick)
-  rep(".eq('mode', 'standard')\n      .eq('status', 'live')\n    if (!liveAuctions?.length) return", ".eq('id', '" + fixId + "')\n      .eq('status', 'draft')\n    if (!liveAuctions?.length) return");
+  rep(".eq('mode', 'standard')\n      .eq('status', 'live')\n\n    for (const auction of liveAuctions || [])", ".eq('id', '" + fixId + "')\n      .eq('status', 'draft')\n\n    for (const auction of liveAuctions || [])");
+  // the recovery sweep for unbilled orders (review #2) looks at every ended auction - not part of this measurement
+  rep("await invoiceStrandedOrders()", "/* recovery sweep off: isolated to the fixture */");
   // 3. instrumentation: tick boundaries + a count of Supabase HTTP requests, written to a per-process log
   rep("async function autoCloseStandardItems() {", "async function __realTick() {");
   rep("setInterval(autoCloseStandardItems, 30000)\nautoCloseStandardItems()",
