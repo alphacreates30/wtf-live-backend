@@ -15,6 +15,8 @@
 // ---------------------------------------------------------------------------
 
 const Anthropic = require('@anthropic-ai/sdk');
+// Spelling/possessive cleanup of what the model writes, and the review screen's "Needs a look" reasons (C2).
+const { cleanLot, reviewFlags } = require('./ai_cleanup');
 
 const MODEL = 'claude-sonnet-5';
 
@@ -111,7 +113,7 @@ JSON object, no markdown fences and no commentary, with exactly these fields:
 
 {
   "title": "the lot title - see TITLE RULES below",
-  "description": "2-4 sentences of plain text (no HTML, no bullet points) describing what the lot is, what stands out about it, and anything a bidder would want to know. Factual and specific. Do not invent provenance, do not estimate value, and do not restate the condition grade - condition is handled separately.",
+  "description": "2-4 sentences of plain text (no HTML, no bullet points): what the lot is; the notable details you can see in the photos (sculpt, paint, accessories, markings, packaging); and, as the last sentence, the condition you can SEE, in plain words (e.g. 'The box shows shelf wear on two corners.' or 'The paint is clean with no visible chips.'). Never the host's condition grade word itself. See NEVER INVENT FACTS below.",
   "category": "a short category, e.g. Furniture, Jewelry, Fine Art, Glassware, Tools, Toys, Books, Textiles, Electronics, Collectibles",
   "item_type": "short generic type, e.g. 'Cast Iron Skillet'",
   "brand": "maker, manufacturer, artist or marque if identifiable, else empty string",
@@ -129,15 +131,32 @@ Be honest. If you cannot identify a maker or pattern, leave the field empty
 rather than guessing. Bidders rely on this being accurate, and an invented
 attribution is far worse than an absent one.
 
+NEVER INVENT FACTS. Do not state a grade, an edition size or number, a
+production year or date, provenance, rarity, a value, or a size or scale (inches,
+1:6, 1:4) unless it is readable in the photos (a stamp, label, sticker, ruler or
+printed box text). Nothing in a photo shows how big an object is by itself: if
+no marking or reference object gives the size, leave it out of both the title
+and the description. Read markings
+carefully: a copyright stamp on a base often names the maker and the year - use
+exactly what it says. If you are not sure of a maker or character, either say so
+plainly ("appears to be") or leave it out. A lot with little to say gets fewer
+words, never padding or guesses.
+
+WRITE CLEANLY. Spell maker and brand names exactly as the maker does (e.g.
+Sideshow Collectibles, not "Slideshow"; McFarlane Toys; NECA; Hot Toys).
+Use correct punctuation and possessives: "Frankenstein's Monster", "The
+Bride of Frankenstein", "children's". Plain, factual sentences; no hype.
+
 FLAWS MATTER MORE HERE THAN ANYWHERE ELSE. These lots are usually collected in
 person, and an undisclosed chip becomes an argument at pickup. Report every
 flaw you can actually see. Do not soften them and do not speculate about
 damage you cannot see.
 
 TITLE RULES:
-1. Front-load what a bidder searches for: Maker/Brand, then Item Type, then the
-   single most identifying attribute (pattern, character, model, era), then
-   secondary attributes (material, colour, size).
+1. Maker + item + character/subject + size, scale or edition when visible, e.g.
+   "Sideshow Collectibles Frankenstein's Monster 1:4 Statue" or
+   "Aurora Wolf Man Model Kit, Built and Painted". Leave out any part you
+   cannot see or read; never guess a scale, size or edition.
 2. Keep it under 80 characters. Use the space for real, accurate attributes -
    do not pad.
 3. If the lot contains multiple pieces, lead with the count, e.g.
@@ -157,7 +176,7 @@ no markdown fences and no commentary:
 
 {
   "title": "the corrected title, lightly cleaned up if needed - never change what item it identifies",
-  "description": "2-4 sentences of plain text describing what the lot actually is, based on the corrected identification. No HTML, no bullets, no condition grade, no value estimate.",
+  "description": "2-4 sentences of plain text describing what the lot actually is, based on the corrected identification. No HTML, no bullets, no condition grade, no value estimate. Spell maker names exactly and use correct possessives (Frankenstein's Monster).",
   "category": "short category",
   "item_type": "short generic type",
   "brand": "maker if known from the title or your knowledge, else empty string",
@@ -168,8 +187,10 @@ no markdown fences and no commentary:
 }
 
 Be honest: if you do not actually recognize this item from the title alone,
-leave fields sparse rather than inventing plausible detail. Never contradict
-the corrected title - it reflects what the host has confirmed the lot is.`;
+leave fields sparse rather than inventing plausible detail. Never state a
+grade, edition number, date, provenance or value you were not given. Never
+contradict the corrected title - it reflects what the host has confirmed the
+lot is.`;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -325,7 +346,9 @@ async function analyzeLot(images, condition = '', track) {
 
   const response = await client().messages.create({
     model: MODEL,
-    max_tokens: 1500,
+    // Thinking counts toward this cap. At 1500 a lot whose marks took some reading (a base stamp) ran out mid-JSON
+    // (seen 2026-09-30); only tokens actually used are billed, so the headroom is free on ordinary lots.
+    max_tokens: 4000,
     system: cacheableSystem(ANALYSIS_SYSTEM_PROMPT),
     messages: [{ role: 'user', content }],
   }, {
@@ -338,8 +361,10 @@ async function analyzeLot(images, condition = '', track) {
 
   const raw = textOf(response);
   try {
-    const parsed = extractJson(raw);
+    // Cleanup pass (maker spellings, possessives), then why a human should look at it, if anything.
+    const parsed = cleanLot(extractJson(raw));
     parsed.raw_text = raw;
+    parsed.needs_look = reviewFlags(parsed);
     return parsed;
   } catch (e) {
     // Return a usable shell so the host can fix it by hand rather than losing
@@ -349,7 +374,7 @@ async function analyzeLot(images, condition = '', track) {
       title: '', description: raw.slice(0, 500), category: '', item_type: '',
       brand: '', model_or_style: '', material: '', color: '', dimensions: '',
       notable_features: [], visible_flaws: [], estimated_value_usd: '',
-      confidence: 'low', raw_text: raw, parse_failed: true,
+      confidence: 'low', raw_text: raw, parse_failed: true, needs_look: reviewFlags({ parse_failed: true }),
     };
   }
 }
@@ -366,7 +391,7 @@ async function regenerateDescription(correctedTitle, condition = '', track) {
 
   const response = await client().messages.create({
     model: MODEL,
-    max_tokens: 1200,
+    max_tokens: 3000,   // as above: thinking counts toward it
     system: cacheableSystem(CORRECTION_SYSTEM_PROMPT),
     messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
   });
@@ -374,8 +399,9 @@ async function regenerateDescription(correctedTitle, condition = '', track) {
 
   const raw = textOf(response);
   try {
-    const parsed = extractJson(raw);
+    const parsed = cleanLot(extractJson(raw));
     parsed.raw_text = raw;
+    parsed.needs_look = reviewFlags(parsed);
     return parsed;
   } catch (e) {
     console.error('Regeneration parse failed:', e.message);

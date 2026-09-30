@@ -246,6 +246,13 @@ everything works, the public simply sees no pickup town and a buyer's own bids s
 | `pickup-address.js` | Anonymous, a losing bidder and a shipping winner never get the street (38 responses/socket states incl. terms, orders, bids); the public sees `pickup_town`. The pickup winner gets it on their order page and in their win email (Resend stubbed to a file); the shipping winner's email has the shipping wording; the loser gets none. Admin settings: town set/trimmed/80-char limit, buyers 403; publishing pickup needs a town. Pinned `905066d`: `/auction/:id` gave the street to anyone. Exits 2 without migration y. |
 | `lot-page.js`, `secret-max.js`, `lot-page-frontend.js` | Updated for the rules above (own bids only; the town column; no sample bid list). |
 
+**C2 + C3** (wtf-handoff `SMALL_FIXES_C2_C3_BRIEF.md`, 2026-09-30).
+
+| Suite | Proves |
+|---|---|
+| `ai-cleanup.js` | The cleanup pass over AI catalogue text (`ai_cleanup.js`): maker spellings (Slideshow -> Sideshow, NECA, McFarlane...), whole words only; possessives for known names (Frankenstein's) but not ordinary plurals (Hammers, Collectors); children's, collector's edition, "It's a". "Needs a look": under 25 words, unsure wording ("appears to be", "likely", "not clearly identifiable"), low confidence, no title, unreadable answer, any stated size or scale. The prompts carry the never-invent rules, and both AI calls go through the pass. No AI call, nothing spent. |
+| `lot-page-frontend.js` | Extended: share cards. index.html has the default card (both PNGs at their sizes); `api/share-meta.js` (it replaces `api/lot-meta.js`) gives lot and auction pages their own card for crawlers, one set of tags, escaped, the full photo not the thumbnail (cover, else the first lot's); drafts, unknown pages and bad input get exactly the default page. |
+
 **Rate limits and the suites.** `guard.js` sets `RATE_LIMIT_EXEMPT_LOOPBACK=1`, which the suites' local servers
 inherit, because a suite fires many logins and bids from localhost. The server honours it only for loopback
 addresses. Production never sets it, and Railway traffic never arrives from loopback. `rate-limits.js` clears it.
