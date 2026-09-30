@@ -1,5 +1,6 @@
 -- STEP y: hide bidders and the pickup address (wtf-handoff PRIVACY_BIDDERS_PICKUP_BRIEF.md, B6 + B7).
--- NOT YET APPLIED on production. Applied and verified on wtf-test 2026-09-30. Runs AFTER migration x (it redefines
+-- APPLIED on production by Cowork 2026-09-30 (SQL editor, after x; byte-identical to this file; pickup_town,
+-- max_amount present, function body matches). Applied and verified on wtf-test 2026-09-30. Runs AFTER migration x (it redefines
 -- place_standard_bid again, keeping x's leader_username). Idempotent.
 --
 --   auctions.pickup_town   the town the public sees ("Miami, FL"). The street address (pickup_address) now goes only

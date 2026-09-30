@@ -205,7 +205,7 @@ uploads work and every `thumb_url` is null, so the site shows full photos as bef
 | `upload-reencode.js`, `home.js` | Updated: clean up thumbnails and mapping rows too; a homepage lot is ten fields (plus `thumb_url`). |
 
 **Watch list + reminders (F3)** (wtf-handoff `WATCH_LIST_BRIEF.md`, 2026-09-30). Needs migration
-`2026-09-30w-watch-list.sql` (applied on wtf-test; **not yet on production**). Contracts in `API.md`.
+`2026-09-30w-watch-list.sql` (applied on wtf-test and on production). Contracts in `API.md`.
 
 | Suite | Proves |
 |---|---|
@@ -225,7 +225,7 @@ are built in the browser for the admin; nothing is sent or stored.
 **Lot page (F2)** (wtf-handoff `LOT_PAGE_BRIEF.md`, 2026-09-30). `GET /lots/:id`, `/lots/by-number/:slug/:n`,
 `/lots/:id/me`, `/lots/:id/bids`, `/lots/:id/related` (`lot_page.js`); increments, premium, slugs and the pickup town
 in `lot_rules.js` (the bid route and orders use the same functions). Needs migration `2026-09-30x-bid-history-leader.sql`
-(applied on wtf-test; **not yet on production**; before it the history attributes each row to the bidder who
+(applied on wtf-test and on production by Cowork 2026-09-30; before it the history attributes each row to the bidder who
 submitted it, everything else works).
 
 | Suite | Proves |
@@ -237,7 +237,7 @@ submitted it, everything else works).
 
 **Hide bidders and the pickup address (B6 + B7)** (wtf-handoff `PRIVACY_BIDDERS_PICKUP_BRIEF.md`, 2026-09-30). One
 allow-list for public auction and lot rows (`public_view.js`) on every REST route and socket event. Needs migration
-`2026-09-30y-pickup-town-own-bid-max.sql` (after x; applied on wtf-test; **not yet on production**; before it
+`2026-09-30y-pickup-town-own-bid-max.sql` (after x; applied on wtf-test and on production by Cowork 2026-09-30; before it
 everything works, the public simply sees no pickup town and a buyer's own bids show prices instead of their max).
 
 | Suite | Proves |

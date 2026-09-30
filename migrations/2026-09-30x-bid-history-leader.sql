@@ -1,5 +1,6 @@
 -- STEP x: anonymised bid history on the lot page (F2, wtf-handoff LOT_PAGE_BRIEF.md section 4).
--- NOT YET APPLIED on production. Applied and verified on wtf-test 2026-09-30 (verification/lot-page.js green).
+-- APPLIED on production by Cowork 2026-09-30 (SQL editor; byte-identical to this file; amount numeric, leader_username
+-- present, function body matches). Applied and verified on wtf-test 2026-09-30 (verification/lot-page.js green).
 -- Idempotent. Runs after migration s (it redefines place_standard_bid with the same pinned search_path).
 --
 -- Why: every place_standard_bid call writes one `bids` row (that is what bid_count counts), but the row's
