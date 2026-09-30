@@ -1,4 +1,5 @@
-// A5 "Delete my account" (DELETE_ACCOUNT_BRIEF.md): a clean deletion, end to end.
+// A5 "Delete my account" (DELETE_ACCOUNT_BRIEF.md): a clean deletion, end to end. Since F3 (migration w) also: the
+// buyer's watches, follows, reminder settings and unsent reminders go in the same transaction; other buyers' stay.
 // Personal fields empty; old session rejected; login impossible; Stripe cards detached and customer deleted;
 // orders/invoices intact with totals unchanged; username replaced everywhere; old username blocked for 30 days (only
 // a hash kept); audit row; confirmation email to the address that was on file; the buyer's data in no API response
@@ -49,6 +50,8 @@ const call = (url, method, p, tok, body) => fetch(url + p, { method, headers: { 
 
 // D's history: a finished sale (paid invoice, delivered order with its shipping address), bids, a max bid and the
 // lead on a now-closed lot, chat, an outbid-log row, a reset link, a terms acceptance. E is another buyer.
+// Since migration w (F3): D and E each watch the lot and have reminder settings; D follows the auction and has one
+// sent and one unsent reminder in the outbox.
 async function history(D, E) {
   const a = die(await s.from('auctions').insert({ title: 'ZZTEST_del sold', description: 'x', status: 'ended', mode: 'standard', fulfillment_mode: 'shipping', host_username: 'whatthefind', leading_bidder: D.username, current_bid: 10 }).select().single());
   made.auctions.push(a.id);
@@ -60,12 +63,24 @@ async function history(D, E) {
   die(await s.from('password_resets').insert({ user_id: D.id, token_hash: 'zz_' + D.id, expires_at: new Date(Date.now() + 36e5).toISOString() }).select().single());
   die(await s.from('auction_terms_acceptances').insert({ auction_id: a.id, user_id: String(D.id), buyers_premium_pct: 15, fulfillment_mode: 'shipping', fulfillment_choice: 'shipping', terms_version: '1' }).select().single());
   const inv = die(await s.from('invoices').insert({ auction_id: a.id, buyer_user_id: String(D.id), buyer_username: D.username, total_cents: 1150, payment_status: 'paid', payment_intent_id: 'pi_ZZTEST_del' }).select().single());
+  if (HAS_W) {
+    die(await s.from('lot_watches').insert([{ user_id: D.id, item_id: lot.id }, { user_id: E.id, item_id: lot.id }]).select());
+    die(await s.from('auction_follows').insert({ user_id: D.id, auction_id: a.id }).select());
+    // One row per insert: a multi-row insert sends null (not the default) for columns a row leaves out.
+    die(await s.from('notification_prefs').insert({ user_id: D.id, auction_open: false }).select());
+    die(await s.from('notification_prefs').insert({ user_id: E.id, lot_closing: false }).select());
+    // channel 'push': the email sender (which runs once as the local server boots) never picks it up, so it stays unsent.
+    die(await s.from('notifications').insert({ user_id: D.id, kind: 'lot_closing', payload: { item_id: lot.id }, channel: 'push' }).select());
+    die(await s.from('notifications').insert({ user_id: D.id, kind: 'auction_open', payload: { auction_id: a.id }, sent_at: new Date().toISOString() }).select());
+  }
   const ord = die(await s.from('orders').insert({ auction_id: a.id, item_id: lot.id, invoice_id: inv.id, buyer_username: D.username, buyer_user_id: String(D.id), item_title: 'ZZTEST_del order', final_bid: 10, hammer_cents: 1000, premium_cents: 150, total_cents: 1150, status: 'delivered', payment_status: 'paid', payment_intent_id: 'pi_ZZTEST_del', ship_name: D.prof.full_name, ship_address1: D.prof.address_line1, ship_city: 'Secretville', ship_state: 'CA', ship_zip: '94999' }).select().single());
   return { a: a.id, lot: lot.id, inv: inv.id, ord: ord.id };
 }
 
+let HAS_W = false;
 (async () => {
   let srv;
+  HAS_W = !(await s.from('lot_watches').select('item_id').limit(1)).error;
   try {
     for (const f of [CALLS, MAIL]) { try { fs.unlinkSync(f); } catch {} }
     const D = await buyer('d'), E = await buyer('e');
@@ -85,6 +100,14 @@ async function history(D, E) {
     const p = die(await s.from('profiles').select('*').eq('user_id', String(D.id)).single());
     ok(!p.full_name && !p.phone && !p.address_line1 && !p.address_line2 && !p.city && !p.state && !p.zip && p.email === null && !p.stripe_customer_id && !p.stripe_payment_method_id && p.status === 'blocked', `profile: every personal field empty, no card, status '${p.status}' (can't bid)`);
     ok(!(await s.from('password_resets').select('id').eq('user_id', D.id)).data.length && !(await s.from('outbid_email_log').select('item_id').eq('username', D.username)).data.length, 'reset links and outbid-log rows removed');
+    if (HAS_W) {
+      const q = (t, col, id) => s.from(t).select(col).eq('user_id', id);
+      const [dw, df, dp, dn, ew, ep] = await Promise.all([q('lot_watches', 'item_id', D.id), q('auction_follows', 'auction_id', D.id), q('notification_prefs', 'user_id', D.id),
+        q('notifications', 'kind, sent_at', D.id), q('lot_watches', 'item_id', E.id), q('notification_prefs', 'lot_closing', E.id)]);
+      ok(!dw.data.length && !df.data.length && !dp.data.length, 'watch list (F3): D\'s watches, follows and reminder settings removed');
+      ok(dn.data.length === 1 && dn.data[0].sent_at, 'watch list (F3): D\'s unsent reminder removed; the one already sent stays as history');
+      ok(ew.data.length === 1 && ep.data.length === 1 && ep.data[0].lot_closing === false, 'watch list (F3): E\'s watch and settings untouched');
+    } else console.log('NOTE migration w not on this database: watch-list checks skipped');
     const calls = lines(CALLS);
     ok(calls.join('|') === [`list ${D.prof.stripe_customer_id}`, 'detach pm_ZZFAKE_1', 'detach pm_ZZFAKE_2', `del ${D.prof.stripe_customer_id}`].join('|'), `Stripe: both saved cards detached, then the customer deleted (${calls.length} calls)`);
 
@@ -150,6 +173,7 @@ async function history(D, E) {
     for (const id of made.auctions) { await s.from('orders').delete().eq('auction_id', id); await s.from('invoices').delete().eq('auction_id', id); await s.rpc('delete_auction_cascade', { p_auction_id: id }); }
     await s.from('account_deletions').delete().in('user_id', made.users);
     await s.from('password_resets').delete().in('user_id', made.users);
+    if (HAS_W) for (const t of ['notifications', 'notification_prefs', 'auction_follows', 'lot_watches']) await s.from(t).delete().in('user_id', made.users);
     await s.from('profiles').delete().in('user_id', made.users.map(String));
     await s.from('users').delete().in('id', made.users);
     await s.from('reserved_usernames').delete().in('username_hash', ['d', 'e'].map(l => sha(`zzdel_${l}_${tag}`)));

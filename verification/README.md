@@ -204,6 +204,17 @@ uploads work and every `thumb_url` is null, so the site shows full photos as bef
 | `thumbnails.js` | Upload: full photo + WebP thumbnail beside it, 480 wide, aspect kept, orientation applied, small photos not enlarged, PNG gets a WebP thumbnail, no EXIF/GPS in either file, mapping row written. Before migration v (server patched to a missing table): upload still works, `thumb_url` null, no orphan file. API: `thumb_url` on /home lots, featured images (`{ url, thumb_url }`), upcoming, /search, standard-status, items, /auctions; null with `image_url` unchanged when there's no thumbnail (fallback); the lot gallery stays full size. Backfill: `--dry-run` changes nothing; a raw GPS photo and a sideways-tagged gallery photo get clean, upright thumbnails; the full photo is never changed; external links skipped; a missing file reported and exit 1; /home picks the new thumbnail up with no restart; re-runs skip finished photos. Exits 2 without migration v. |
 | `upload-reencode.js`, `home.js` | Updated: clean up thumbnails and mapping rows too; a homepage lot is ten fields (plus `thumb_url`). |
 
+**Watch list + reminders (F3)** (wtf-handoff `WATCH_LIST_BRIEF.md`, 2026-09-30). Needs migration
+`2026-09-30w-watch-list.sql` (applied on wtf-test; **not yet on production**). Contracts in `API.md`.
+
+| Suite | Proves |
+|---|---|
+| `watch-list.js` | API: watch/unwatch/follow/unfollow, idempotent; drafts 404, closed lots and ended auctions refused, bad ids 400, no login 401; following an open auction marks its "open" reminder done; the 500 limit (3 on a patched server); 429 after 60 changes a minute. Privacy: `/me/watching` is the caller's own with no leader, max or other buyer; /home, /search and the auction reads carry no watch fields; admin counts per lot and auction, buyers 403. Preferences. Reminders on a fake clock (a test-only route on the local server; Resend stubbed to a file): one email per buyer per run; every watched lot closing within the hour, each listed once even when it is also in a followed auction's top lots; status winning / outbid / no bid; premium; closed lots skipped (also one that closed after being queued); sent once (re-run, soft-close extension); "opens" + "closes tomorrow" + a lot reminder merged into one email; each preference respected; logged in `email_send_log`; List-Unsubscribe headers; unsubscribe with no login (GET changes nothing, tampered token 400, POST switches all off, nothing sent after). Exits 2 without migration w. |
+| `account-delete.js` | Extended: the deleted buyer's watches, follows, reminder settings and unsent reminders go; a sent one stays as history; another buyer's are untouched. |
+
+`scripts/send-test-reminder.js` sends ONE real reminder to the host's own address from wtf-test data (needs
+`RESEND_API_KEY` and `ADMIN_EMAIL` in `.env`); `--to-file out.html` writes it to a file instead.
+
 **Rate limits and the suites.** `guard.js` sets `RATE_LIMIT_EXEMPT_LOOPBACK=1`, which the suites' local servers
 inherit, because a suite fires many logins and bids from localhost. The server honours it only for loopback
 addresses. Production never sets it, and Railway traffic never arrives from loopback. `rate-limits.js` clears it.

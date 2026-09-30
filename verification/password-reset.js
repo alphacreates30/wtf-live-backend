@@ -25,7 +25,8 @@ const tag = crypto.randomBytes(3).toString('hex');
 const uname = n => `zztest_pw_${tag}_${n}`;
 const shared = `zztest-${tag}@example.invalid`;
 
-const SEND_SIG = "async function sendEmail({ from, to, subject, html, text, kind = 'other' }) {";
+// The signature gained `headers` with F3 (List-Unsubscribe on reminders).
+const SEND_SIG = "async function sendEmail({ from, to, subject, html, text, kind = 'other', headers }) {";
 const files = [MAIL];
 const children = [];
 async function start(port = PORT) {

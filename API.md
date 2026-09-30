@@ -105,3 +105,46 @@ is stored beside it (`<folder>/thumbs/<name>.webp`) and recorded. Answers `{ "ur
 - `GET /auction/:id/items/standard-status` (and `/auction/:id/items`) — every lot in a standard auction, maxes and
   reserves stripped; each lot has `thumb_url` for grid cards.
 - `GET /auction/:auctionId/items/:itemId/images` — a lot's photos, full size (the lot page).
+
+## Watch list, follows and reminders (login required unless noted)
+
+Only ever the logged-in buyer's own. **No public watch counts**: `/home`, `/search` and the auction pages are the
+same for everyone and carry no watch data; a page fetches `GET /me/watching` and marks its own buttons. Needs
+migration `2026-09-30w-watch-list.sql`; before it, the write routes answer 503 and `/me/watching` answers empty
+with `"available": false`. Rate limited per buyer (60 changes a minute).
+
+- `POST /watch/:itemId` → `{ "watching": true }`. Idempotent. 404 for a lot in a draft (or unknown), 400
+  `lot_closed` for a closed lot, 400 `watch_limit` beyond 500 watched lots.
+- `DELETE /watch/:itemId` → `{ "watching": false }`.
+- `POST /follow/:auctionId` → `{ "following": true }`. Idempotent. 404 for a draft, 400 `auction_ended`.
+  Following an auction that is already open (or already inside its last 24 hours) marks that reminder done.
+- `DELETE /follow/:auctionId` → `{ "following": false }`.
+- `GET /me/watching`:
+
+```jsonc
+{
+  "lots": [ Lot + {                                   // Lot as for /home (incl. auction_title, thumb_url)
+      "auction_phase": "live" | "upcoming" | "ended",
+      "buyers_premium_pct": 15,
+      "my_status": "winning" | "outbid" | "no_bid"    // while open
+                 | "won" | "lost" | "closed"          // after it closes
+  } ],                                                // newest watch first
+  "auctions": [ { "id", "title", "blurb", "phase", "starts_at", "ends_at", "lot_count", "image_url", "thumb_url" } ],
+  "ids": { "lots": ["uuid"], "auctions": ["uuid"] }   // for marking buttons
+}
+```
+
+- `GET /me/notification-prefs` → `{ "lot_closing": true, "auction_open": true, "auction_closing": true }`
+  (all on by default). `PUT` the same shape (any subset, booleans) → the full set. Outbid emails are separate.
+- `GET /unsubscribe?token=` (no login) → `{ "ok": true, "kind": "all", "what": "…" }`: describes the link, changes
+  nothing (mail scanners open links). `POST /unsubscribe?token=` (no login) → the same, and switches those reminders
+  off. The token is in every reminder's footer link (`<site>/unsubscribe?token=…`) and its `List-Unsubscribe` /
+  `List-Unsubscribe-Post: List-Unsubscribe=One-Click` headers (which POST to this route). Tokens are signed and don't
+  expire; a bad one is 400.
+- `GET /admin/watch-counts?auction_id=` (admin only) → `{ "followers": 3, "lots": { "<item id>": 2 } }`.
+
+**Reminder emails** (the auto-close loop, every 30 s): one email per buyer per run covering everything due for them:
+watched lots closing within the hour (price with premium, the buyer's status, a Bid link), followed auctions that
+opened (3 photos, lot count, end), followed auctions whose first lot closes within 24 hours (their top 5 lots by bids,
+minus any already listed). Each reminder is sent once; a soft-close extension never re-sends; closed lots are
+skipped; each preference is respected. Outbox: `notifications` (channel `email` now; the app adds `push`).

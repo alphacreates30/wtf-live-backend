@@ -171,18 +171,21 @@ async function shouldSuppressOutbid() {
 // Resend outage can't block a charge, an auto-close tick, or a bid response.
 // kind categorizes the send for the rolling-window volume count and the outbid
 // suppression check above; pass 'outbid' only for the outbid email itself.
+// 'reminder' (watch-list reminders, F3) is held back the same way: like outbid
+// it is the kind to drop when the quota is nearly gone. Returns true when Resend
+// accepted the email, false otherwise (the reminder outbox retries on false).
 // Logs never carry a buyer's email address (security review #21): the outbid
 // suppression line used to print the recipient, and Resend's error body can
 // echo it back. Railway keeps logs; addresses stay in the database.
 const redactEmails = t => String(t ?? '').replace(/[^\s@"'<>,;:()]+@[^\s@"'<>,;:()]+\.[^\s@"'<>,;:()]+/g, '[email]');
 
-async function sendEmail({ from, to, subject, html, text, kind = 'other' }) {
-  if (!process.env.RESEND_API_KEY) return; // skip if not configured
-  if (!to) return;
+async function sendEmail({ from, to, subject, html, text, kind = 'other', headers }) {
+  if (!process.env.RESEND_API_KEY) return false; // skip if not configured
+  if (!to) return false;
 
-  if (kind === 'outbid' && await shouldSuppressOutbid()) {
-    console.error(`OUTBID EMAIL SUPPRESSED (at ${OUTBID_SUPPRESS_AT} of the ${MONTHLY_EMAIL_CAP} Resend quota, rolling ${EMAIL_WINDOW_DAYS} days): subject="${redactEmails(subject)}"`);
-    return;
+  if ((kind === 'outbid' || kind === 'reminder') && await shouldSuppressOutbid()) {
+    console.error(`${kind.toUpperCase()} EMAIL SUPPRESSED (at ${OUTBID_SUPPRESS_AT} of the ${MONTHLY_EMAIL_CAP} Resend quota, rolling ${EMAIL_WINDOW_DAYS} days): subject="${redactEmails(subject)}"`);
+    return false;
   }
 
   try {
@@ -192,20 +195,22 @@ async function sendEmail({ from, to, subject, html, text, kind = 'other' }) {
         Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ from, to, reply_to: REPLY_TO, subject, html, text }),
+      body: JSON.stringify({ from, to, reply_to: REPLY_TO, subject, html, text, ...(headers ? { headers } : {}) }),
       signal: AbortSignal.timeout(8000),
     });
     if (!res.ok) {
       console.error('Email send error:', res.status, redactEmails(await res.text()).slice(0, 300));
-      return;
+      return false;
     }
     try {
       await supabase.from('email_send_log').insert({ kind });
     } catch (logErr) {
       console.error('email_send_log insert failed:', logErr.message);
     }
+    return true;
   } catch (e) {
     console.error('Email send error:', e.message);
+    return false;
   }
 }
 
@@ -3729,6 +3734,410 @@ app.post('/signup', signupLimit, async (req, res) => {
   res.json(SIGNUP_OK);
 });
 
+// ---------------------------------------------------------------------------
+// Watch list, followed auctions and reminder emails (F3, wtf-handoff
+// WATCH_LIST_BRIEF.md, migration w). Contracts in API.md.
+//
+// Private by design: only the buyer sees their own watches and follows. There
+// are no public watch counts; the admin sees counts per lot and per auction.
+// /home, /search and the auction pages stay the same for everyone (cacheable);
+// the page asks GET /me/watching for the ids and marks its buttons itself.
+//
+// Reminders are emails now; the outbox (notifications) has a channel column so
+// the phone app can add push later without changing any of this.
+// ---------------------------------------------------------------------------
+const WATCH_MAX = 500;
+const REMINDER_KINDS = ['lot_closing', 'auction_open', 'auction_closing'];
+const REMINDER_LABELS = {
+  lot_closing: 'lots you watch closing within the hour',
+  auction_open: 'auctions you follow opening',
+  auction_closing: 'auctions you follow closing tomorrow',
+};
+// Before migration w these tables and functions don't exist.
+const watchMissing = e => !!e && ['42P01', 'PGRST205', 'PGRST202', '42883'].includes(e.code);
+const watchUnavailable = res => res.status(503).json({ error: 'Watching is not available yet. Please try again soon.', code: 'watch_unavailable' });
+LIMITS.watch = limiter({ windowMs: 60e3, limit: 60, key: perUser, message: 'Too many changes too quickly. Wait a moment and try again.' });
+
+// A lot or auction a buyer may watch/follow: published (never a draft).
+async function publicLot(itemId) {
+  const { data: lot } = await supabase.from('auction_items').select('id, auction_id, status, ends_at').eq('id', itemId).maybeSingle();
+  if (!lot) return null;
+  const { data: auction } = await supabase.from('auctions').select('id, status, starts_at').eq('id', lot.auction_id).maybeSingle();
+  if (!auction || auction.status === 'draft') return null;
+  return { lot, auction };
+}
+
+app.post('/watch/:itemId', requireAuth, LIMITS.watch, async (req, res) => {
+  const found = await publicLot(req.params.itemId);
+  if (!found) return res.status(404).json({ error: 'Lot not found' });
+  const { lot } = found;
+  if (['sold', 'unsold'].includes(lot.status) || (lot.ends_at && Date.parse(lot.ends_at) <= Date.now())) return res.status(400).json({ error: 'This lot has closed', code: 'lot_closed' });
+  const { count, error: cErr } = await supabase.from('lot_watches').select('item_id', { count: 'exact', head: true }).eq('user_id', req.user.id);
+  if (watchMissing(cErr)) return watchUnavailable(res);
+  if (cErr) return dbFailure(req, res, cErr);
+  if (count >= WATCH_MAX) {
+    const { data: already } = await supabase.from('lot_watches').select('item_id').eq('user_id', req.user.id).eq('item_id', lot.id).maybeSingle();
+    if (!already) return res.status(400).json({ error: `You can watch up to ${WATCH_MAX} lots. Remove some to add more.`, code: 'watch_limit' });
+  }
+  const { error } = await supabase.from('lot_watches').upsert({ user_id: req.user.id, item_id: lot.id }, { onConflict: 'user_id,item_id', ignoreDuplicates: true });
+  if (watchMissing(error)) return watchUnavailable(res);
+  if (error) return dbFailure(req, res, error);
+  res.json({ watching: true });
+});
+
+app.delete('/watch/:itemId', requireAuth, LIMITS.watch, async (req, res) => {
+  const { error } = await supabase.from('lot_watches').delete().eq('user_id', req.user.id).eq('item_id', req.params.itemId);
+  if (watchMissing(error)) return watchUnavailable(res);
+  if (error) return dbFailure(req, res, error);
+  res.json({ watching: false });
+});
+
+app.post('/follow/:auctionId', requireAuth, LIMITS.watch, async (req, res) => {
+  const { data: auction } = await supabase.from('auctions').select('id, status, starts_at').eq('id', req.params.auctionId).maybeSingle();
+  if (!auction || auction.status === 'draft') return res.status(404).json({ error: 'Auction not found' });
+  if (auction.status === 'ended') return res.status(400).json({ error: 'This auction has ended', code: 'auction_ended' });
+  // Following an auction that is already open (or already inside its last 24
+  // hours) marks that reminder as done: the buyer is looking at it right now.
+  const nowMs = Date.now(), nowIso = new Date(nowMs).toISOString();
+  const open = auctionPhase(auction, nowMs) === 'live';
+  let closingSoon = false;
+  if (open) {
+    const { data: first } = await supabase.from('auction_items').select('ends_at').eq('auction_id', auction.id)
+      .not('status', 'in', '("sold","unsold")').gt('ends_at', nowIso).order('ends_at', { ascending: true }).limit(1);
+    closingSoon = !!(first && first[0] && Date.parse(first[0].ends_at) - nowMs <= 24 * 3600e3);
+  }
+  const { error } = await supabase.from('auction_follows').upsert({
+    user_id: req.user.id, auction_id: auction.id,
+    open_notified_at: open ? nowIso : null, closing_notified_at: closingSoon ? nowIso : null,
+  }, { onConflict: 'user_id,auction_id', ignoreDuplicates: true });
+  if (watchMissing(error)) return watchUnavailable(res);
+  if (error) return dbFailure(req, res, error);
+  res.json({ following: true });
+});
+
+app.delete('/follow/:auctionId', requireAuth, LIMITS.watch, async (req, res) => {
+  const { error } = await supabase.from('auction_follows').delete().eq('user_id', req.user.id).eq('auction_id', req.params.auctionId);
+  if (watchMissing(error)) return watchUnavailable(res);
+  if (error) return dbFailure(req, res, error);
+  res.json({ following: false });
+});
+
+// A buyer's standing on each lot: winning / outbid / no_bid while open;
+// won / lost / closed after. From the leader's username and the buyer's own
+// bids and max bids - nothing about anyone else leaves the server.
+async function standingFor(user, lots) {
+  const ids = lots.map(l => l.id);
+  const mine = new Set();
+  if (ids.length) {
+    const [{ data: b }, { data: p }] = await Promise.all([
+      supabase.from('bids').select('item_id').in('item_id', ids).eq('username', user.username),
+      supabase.from('pre_bids').select('item_id').in('item_id', ids).eq('buyer_user_id', String(user.id)),
+    ]);
+    for (const r of [...(b || []), ...(p || [])]) mine.add(r.item_id);
+  }
+  const nowMs = Date.now();
+  return Object.fromEntries(lots.map(l => {
+    const leading = !!l.leading_bidder && l.leading_bidder === user.username && (l.bid_count || 0) > 0;
+    const open = !['sold', 'unsold'].includes(l.status) && !(l.ends_at && Date.parse(l.ends_at) <= nowMs);
+    const s = open ? (leading ? 'winning' : mine.has(l.id) ? 'outbid' : 'no_bid')
+      : (l.status === 'sold' && leading ? 'won' : mine.has(l.id) ? 'lost' : 'closed');
+    return [l.id, s];
+  }));
+}
+
+app.get('/me/watching', requireAuth, async (req, res) => {
+  const empty = { lots: [], auctions: [], ids: { lots: [], auctions: [] } };
+  const [w, f] = await Promise.all([
+    supabase.from('lot_watches').select('item_id, created_at').eq('user_id', req.user.id).order('created_at', { ascending: false }),
+    supabase.from('auction_follows').select('auction_id, created_at').eq('user_id', req.user.id).order('created_at', { ascending: false }),
+  ]);
+  if (watchMissing(w.error) || watchMissing(f.error)) return res.json({ ...empty, available: false });
+  if (w.error || f.error) return dbFailure(req, res, w.error || f.error);
+  const itemIds = (w.data || []).map(r => r.item_id), followIds = (f.data || []).map(r => r.auction_id);
+  const lotsRaw = [];
+  for (let i = 0; i < itemIds.length; i += 200) {
+    const { data, error } = await supabase.from('auction_items')
+      .select('id, auction_id, position, title, image_url, current_bid, bid_count, ends_at, status, leading_bidder').in('id', itemIds.slice(i, i + 200));
+    if (error) return dbFailure(req, res, error);
+    lotsRaw.push(...data);
+  }
+  const auctionIds = [...new Set([...lotsRaw.map(l => l.auction_id), ...followIds])];
+  const { data: auctions, error: aErr } = auctionIds.length
+    ? await supabase.from('auctions').select('id, title, description, status, starts_at, ends_at, image_url, buyers_premium_pct').in('id', auctionIds)
+    : { data: [] };
+  if (aErr) return dbFailure(req, res, aErr);
+  const byId = Object.fromEntries((auctions || []).filter(a => a.status !== 'draft').map(a => [a.id, a]));
+  const lots = lotsRaw.filter(l => byId[l.auction_id]);
+  const standing = await standingFor(req.user, lots);
+  const nowMs = Date.now();
+  const thumb = await thumbsFor([...lots.map(l => l.image_url), ...Object.values(byId).map(a => a.image_url)]);
+  const order = Object.fromEntries(itemIds.map((id, i) => [id, i]));
+  const followed = followIds.filter(id => byId[id]);
+  const counts = {};
+  if (followed.length) {
+    for (const l of await lotsOf(followed, 'auction_id')) counts[l.auction_id] = (counts[l.auction_id] || 0) + 1;
+  }
+  res.json({
+    lots: lots.sort((a, b) => order[a.id] - order[b.id]).map(l => ({
+      ...homeLot(thumb, { [l.auction_id]: byId[l.auction_id].title })(l),
+      auction_phase: auctionPhase(byId[l.auction_id], nowMs) || byId[l.auction_id].status,
+      buyers_premium_pct: byId[l.auction_id].buyers_premium_pct == null ? null : Number(byId[l.auction_id].buyers_premium_pct),
+      my_status: standing[l.id],
+    })),
+    auctions: followed.map(id => {
+      const a = byId[id];
+      return {
+        id: a.id, title: a.title, blurb: blurbOf(a.description), phase: auctionPhase(a, nowMs) || a.status,
+        starts_at: isoOrNull(a.starts_at), ends_at: isoOrNull(a.ends_at), lot_count: counts[a.id] || 0,
+        image_url: a.image_url || null, thumb_url: thumb(a.image_url),
+      };
+    }),
+    ids: { lots: lots.map(l => l.id), auctions: followed },
+  });
+});
+
+async function prefsFor(userId) {
+  const { data, error } = await supabase.from('notification_prefs').select('lot_closing, auction_open, auction_closing').eq('user_id', userId).maybeSingle();
+  if (error) return { error };
+  return { prefs: { lot_closing: data?.lot_closing ?? true, auction_open: data?.auction_open ?? true, auction_closing: data?.auction_closing ?? true } };
+}
+
+app.get('/me/notification-prefs', requireAuth, async (req, res) => {
+  const { prefs, error } = await prefsFor(req.user.id);
+  if (watchMissing(error)) return watchUnavailable(res);
+  if (error) return dbFailure(req, res, error);
+  res.json(prefs);
+});
+
+app.put('/me/notification-prefs', requireAuth, LIMITS.watch, async (req, res) => {
+  const body = req.body || {};
+  const u = {};
+  for (const k of REMINDER_KINDS) {
+    if (body[k] === undefined) continue;
+    if (typeof body[k] !== 'boolean') return res.status(400).json({ error: `${k} must be true or false` });
+    u[k] = body[k];
+  }
+  const { error } = await supabase.from('notification_prefs').upsert({ user_id: req.user.id, ...u, updated_at: new Date().toISOString() }, { onConflict: 'user_id' });
+  if (watchMissing(error)) return watchUnavailable(res);
+  if (error) return dbFailure(req, res, error);
+  const { prefs } = await prefsFor(req.user.id);
+  res.json(prefs);
+});
+
+// One-click unsubscribe. The token names the account and the kind ('all' or
+// one reminder kind), signed with a key derived from JWT_SECRET; it never
+// expires, so a link in an old email still works. GET only describes what the
+// link will do (so a mail scanner that fetches links changes nothing); POST
+// does it - the site's /unsubscribe page, and mail clients using the
+// List-Unsubscribe-Post one-click header, both POST.
+const UNSUB_KEY = crypto.createHmac('sha256', JWT_SECRET).update('wtf-unsubscribe-v1').digest();
+const b64u = b => Buffer.from(b).toString('base64url');
+function unsubscribeToken(userId, kind = 'all') {
+  const body = b64u(JSON.stringify({ u: userId, k: kind }));
+  return body + '.' + crypto.createHmac('sha256', UNSUB_KEY).update(body).digest('base64url');
+}
+function readUnsubscribeToken(token) {
+  if (typeof token !== 'string' || token.length > 400) return null;
+  const [body, sig] = token.split('.');
+  if (!body || !sig) return null;
+  const want = crypto.createHmac('sha256', UNSUB_KEY).update(body).digest();
+  let got; try { got = Buffer.from(sig, 'base64url'); } catch { return null; }
+  if (got.length !== want.length || !crypto.timingSafeEqual(got, want)) return null;
+  try {
+    const { u, k } = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+    if (!canonicalUuid(u) || !(k === 'all' || REMINDER_KINDS.includes(k))) return null;
+    return { userId: canonicalUuid(u), kind: k };
+  } catch { return null; }
+}
+const unsubscribeWhat = kind => (kind === 'all' ? 'reminder emails (watched lots and followed auctions)' : REMINDER_LABELS[kind]);
+
+app.get('/unsubscribe', (req, res) => {
+  const t = readUnsubscribeToken(req.query.token);
+  if (!t) return res.status(400).json({ error: 'This unsubscribe link is not valid.' });
+  res.json({ ok: true, kind: t.kind, what: unsubscribeWhat(t.kind) });
+});
+
+app.post('/unsubscribe', async (req, res) => {
+  const t = readUnsubscribeToken(req.query.token || req.body?.token);
+  if (!t) return res.status(400).json({ error: 'This unsubscribe link is not valid.' });
+  const off = t.kind === 'all' ? Object.fromEntries(REMINDER_KINDS.map(k => [k, false])) : { [t.kind]: false };
+  const { error } = await supabase.from('notification_prefs').upsert({ user_id: t.userId, ...off, updated_at: new Date().toISOString() }, { onConflict: 'user_id' });
+  if (watchMissing(error)) return watchUnavailable(res);
+  if (error && error.code === '23503') return res.json({ ok: true, kind: t.kind, what: unsubscribeWhat(t.kind) });   // account gone
+  if (error) return dbFailure(req, res, error);
+  res.json({ ok: true, kind: t.kind, what: unsubscribeWhat(t.kind) });
+});
+
+// The admin's view of interest: watchers per lot and followers per auction.
+app.get('/admin/watch-counts', requireAdmin, async (req, res) => {
+  const auctionId = canonicalUuid(req.query.auction_id);
+  if (!auctionId) return res.status(400).json({ error: 'Invalid auction_id' });
+  const lots = await lotsOf([auctionId], 'id');
+  const ids = lots.map(l => l.id);
+  const counts = {};
+  for (let i = 0; i < ids.length; i += 200) {
+    const { data, error } = await supabase.from('lot_watches').select('item_id').in('item_id', ids.slice(i, i + 200));
+    if (watchMissing(error)) return res.json({ available: false, followers: 0, lots: {} });
+    if (error) return dbFailure(req, res, error);
+    for (const r of data) counts[r.item_id] = (counts[r.item_id] || 0) + 1;
+  }
+  const { count, error } = await supabase.from('auction_follows').select('user_id', { count: 'exact', head: true }).eq('auction_id', auctionId);
+  if (error && !watchMissing(error)) return dbFailure(req, res, error);
+  res.json({ followers: count || 0, lots: counts });
+});
+
+// ---- Reminder emails ----
+// Runs in the auto-close loop. queue_reminders() claims what is due and writes
+// outbox rows in one transaction (each reminder once, ever); this then sends
+// ONE email per buyer per run covering all of their due reminders, and marks
+// those rows sent. A lot that closed since it was queued is left out; a lot
+// that is both in a "closing within the hour" reminder and in a followed
+// auction's top lots is listed once.
+// The business postal address for the email footer comes from config (A1 is
+// not settled yet); until it is set the footer has name + contact only.
+const BUSINESS_NAME = process.env.BUSINESS_NAME || 'What The Find';
+const BUSINESS_POSTAL_ADDRESS = process.env.BUSINESS_POSTAL_ADDRESS || '';
+const API_PUBLIC_URL = (process.env.API_PUBLIC_URL || 'https://wtf-live-backend-production.up.railway.app').replace(/\/+$/, '');
+
+function reminderFooterHtml(userId) {
+  const unsub = `${SITE_URL}/unsubscribe?token=${encodeURIComponent(unsubscribeToken(userId, 'all'))}`;
+  return `<p style="margin-top:28px;font-size:12px;color:#666;line-height:1.5;">
+    You're getting this because you watch lots or follow auctions on What The Find.
+    <a href="${SITE_URL}/notifications" style="color:#666;">Choose which reminders you get</a> or
+    <a href="${unsub}" style="color:#666;">unsubscribe from all reminders</a>.<br>
+    ${escapeHtml(BUSINESS_NAME)} &middot; ${escapeHtml(REPLY_TO)}${BUSINESS_POSTAL_ADDRESS ? ' &middot; ' + escapeHtml(BUSINESS_POSTAL_ADDRESS) : ''}
+  </p>`;
+}
+const STANDING_TEXT = { winning: "You're winning", outbid: 'Outbid', no_bid: 'No bid yet' };
+const lotLink = l => `${SITE_URL}/auction/${l.auction_id}?lot=${l.id}`;
+function reminderLotRowHtml(l, standing, pct) {
+  return `<tr>
+    <td style="padding:8px 0;border-bottom:1px solid #eee;">
+      <a href="${lotLink(l)}" style="color:#1a1a1a;font-weight:600;text-decoration:none;">Lot ${l.position + 1}: ${escapeHtml(l.title)}</a><br>
+      <span style="font-size:13px;color:#555;">${l.bid_count > 0 ? `${formatDollars(l.current_bid)} + ${pct ?? 15}% premium &middot; ` : 'No bids yet &middot; '}closes ${escapeHtml(new Date(l.ends_at).toLocaleString('en-US', { timeZone: SITE_TIMEZONE, weekday: 'short', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' }))}${standing ? ' &middot; <strong>' + STANDING_TEXT[standing] + '</strong>' : ''}</span>
+    </td>
+    <td style="padding:8px 0 8px 12px;border-bottom:1px solid #eee;text-align:right;white-space:nowrap;"><a href="${lotLink(l)}" style="background:#9E2B20;color:#fff;padding:7px 14px;border-radius:6px;text-decoration:none;font-size:13px;">Bid</a></td>
+  </tr>`;
+}
+
+async function sendReminderEmail(user, rows, nowMs) {
+  const lotIds = [...new Set(rows.filter(r => r.kind === 'lot_closing').map(r => r.payload.item_id))];
+  const openIds = [...new Set(rows.filter(r => r.kind === 'auction_open').map(r => r.payload.auction_id))];
+  const closingIds = [...new Set(rows.filter(r => r.kind === 'auction_closing').map(r => r.payload.auction_id))];
+  const auctionIds = [...new Set([...openIds, ...closingIds])];
+  const [{ data: lotsRaw }, { data: auctions }] = await Promise.all([
+    lotIds.length ? supabase.from('auction_items').select('id, auction_id, position, title, current_bid, bid_count, ends_at, status, leading_bidder').in('id', lotIds) : { data: [] },
+    auctionIds.length ? supabase.from('auctions').select('id, title, description, status, starts_at, ends_at, image_url, buyers_premium_pct').in('id', auctionIds) : { data: [] },
+  ]);
+  const isOpenLot = l => !['sold', 'unsold'].includes(l.status) && l.ends_at && Date.parse(l.ends_at) > nowMs;
+  const closingLots = (lotsRaw || []).filter(isOpenLot).sort((a, b) => Date.parse(a.ends_at) - Date.parse(b.ends_at));
+  const aById = Object.fromEntries((auctions || []).filter(a => a.status !== 'draft' && a.status !== 'ended').map(a => [a.id, a]));
+  // Top 5 lots by bids for each auction closing tomorrow, minus the lots already listed above.
+  const listed = new Set(closingLots.map(l => l.id));
+  const tops = {};
+  for (const id of closingIds.filter(id => aById[id])) {
+    const { data } = await supabase.from('auction_items').select('id, auction_id, position, title, current_bid, bid_count, ends_at, status, leading_bidder')
+      .eq('auction_id', id).not('status', 'in', '("sold","unsold")').gt('ends_at', new Date(nowMs).toISOString())
+      .order('bid_count', { ascending: false }).order('ends_at', { ascending: true }).limit(5 + listed.size);
+    tops[id] = (data || []).filter(l => !listed.has(l.id)).slice(0, 5);
+  }
+  const standing = await standingFor(user, [...closingLots, ...Object.values(tops).flat()]);
+  const pctOf = id => { const a = aById[id]; return a && a.buyers_premium_pct != null ? Number(a.buyers_premium_pct) : null; };
+  const lotAuctionPct = {};
+  if (closingLots.length) {
+    const { data } = await supabase.from('auctions').select('id, buyers_premium_pct').in('id', [...new Set(closingLots.map(l => l.auction_id))]);
+    for (const a of data || []) lotAuctionPct[a.id] = a.buyers_premium_pct == null ? null : Number(a.buyers_premium_pct);
+  }
+
+  const parts = [], subjects = [];
+  if (closingLots.length) {
+    subjects.push(closingLots.length === 1 ? `"${closingLots[0].title}" closes within the hour` : `${closingLots.length} lots you're watching close within the hour`);
+    parts.push({ title: 'Closing within the hour', body: `
+      <table role="presentation" style="width:100%;border-collapse:collapse;">${closingLots.map(l => reminderLotRowHtml(l, standing[l.id], lotAuctionPct[l.auction_id])).join('')}</table>` });
+  }
+  const photos = {};
+  const openAuctions = openIds.map(id => aById[id]).filter(Boolean);
+  for (const a of openAuctions) {
+    const { data } = await supabase.from('auction_items').select('image_url, ends_at').eq('auction_id', a.id).order('position', { ascending: true });
+    const imgs = [...new Set([a.image_url, ...(data || []).map(l => l.image_url)].filter(Boolean))].slice(0, 3);
+    const thumb = await thumbsFor(imgs);
+    const lastEnd = (data || []).map(l => l.ends_at).filter(Boolean).sort().pop();
+    photos[a.id] = { imgs: imgs.map(u => thumb(u) || u), count: (data || []).length, end: a.ends_at || lastEnd };
+    subjects.push(`${a.title} is open`);
+    parts.push({ title: `${escapeHtml(a.title)} is open`, body: `
+      <p style="margin:0 0 8px;">${photos[a.id].imgs.map(src => `<img src="${src}" width="160" alt="" style="width:160px;height:120px;object-fit:cover;border-radius:6px;margin:0 6px 6px 0;">`).join('')}</p>
+      <p style="margin:0 0 6px;color:#444;">${escapeHtml(blurbOf(a.description))}</p>
+      <p style="margin:0 0 12px;font-size:14px;">${photos[a.id].count} lots${photos[a.id].end ? ' &middot; ends ' + escapeHtml(new Date(photos[a.id].end).toLocaleString('en-US', { timeZone: SITE_TIMEZONE, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' })) : ''}</p>
+      <p><a href="${SITE_URL}/auction/${a.id}" style="background:#1a1a1a;color:#fff;padding:9px 16px;border-radius:6px;text-decoration:none;">Browse lots</a></p>` });
+  }
+  for (const id of closingIds) {
+    const a = aById[id];
+    if (!a) continue;
+    subjects.push(`${a.title} closes tomorrow`);
+    parts.push({ title: `${escapeHtml(a.title)}: closing tomorrow`, body: `
+      ${tops[id].length ? `<p style="margin:0 0 4px;color:#444;">The most bid-on lots right now:</p>
+      <table role="presentation" style="width:100%;border-collapse:collapse;">${tops[id].map(l => reminderLotRowHtml(l, standing[l.id], pctOf(id))).join('')}</table>` : ''}
+      <p style="margin-top:10px;"><a href="${SITE_URL}/auction/${a.id}" style="color:#1a1a1a;">See every lot</a></p>` });
+  }
+  if (!parts.length) return { skipped: 'nothing still open to remind about' };
+
+  const subject = subjects.length === 1 ? subjects[0] : `${subjects[0]} (and ${subjects.length - 1} more)`;
+  const body = parts.length === 1 ? parts[0].body
+    : parts.map(p => `<h3 style="margin:22px 0 6px;font-size:16px;">${p.title}</h3>${p.body}`).join('');
+  const html = emailHtml(parts.length === 1 ? parts[0].title : 'Your reminders from What The Find', body + reminderFooterHtml(user.id));
+  const oneClick = `${API_PUBLIC_URL}/unsubscribe?token=${encodeURIComponent(unsubscribeToken(user.id, 'all'))}`;
+  const sent = await sendEmail({
+    from: BUYER_FROM, to: user.email, subject, html, kind: 'reminder',
+    headers: { 'List-Unsubscribe': `<${oneClick}>`, 'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click' },
+  });
+  return sent ? { sent: true } : { failed: 'email not accepted' };
+}
+
+let remindersRunning = false;
+async function runReminders(now = new Date()) {
+  if (remindersRunning) return { skipped: 'already running' };
+  remindersRunning = true;
+  const out = { queued: 0, emails: 0, failed: 0, skipped: 0 };
+  try {
+    const { data: queued, error: qErr } = await supabase.rpc('queue_reminders', { p_now: now.toISOString() });
+    if (watchMissing(qErr)) return { unavailable: true };
+    if (qErr) { console.error('queue_reminders failed:', qErr.code, qErr.message); return out; }
+    out.queued = queued || 0;
+    const { data: rows, error: cErr } = await supabase.rpc('claim_notifications', { p_channel: 'email', p_limit: 500 });
+    if (cErr) { console.error('claim_notifications failed:', cErr.code, cErr.message); return out; }
+    const byUser = new Map();
+    for (const r of rows || []) { if (!byUser.has(r.user_id)) byUser.set(r.user_id, []); byUser.get(r.user_id).push(r); }
+    for (const [userId, list] of byUser) {
+      const ids = list.map(r => r.id);
+      const done = (patch) => supabase.from('notifications').update(patch).in('id', ids);
+      try {
+        const { data: user } = await supabase.from('users').select('id, username, email, deleted_at').eq('id', userId).maybeSingle();
+        const { prefs } = await prefsFor(userId);
+        const wanted = list.filter(r => !prefs || prefs[r.kind] !== false);
+        if (!user || user.deleted_at || !user.email || !wanted.length) {
+          await done({ sent_at: new Date().toISOString(), error: !user || user.deleted_at ? 'account deleted' : !user.email ? 'no email on file' : 'reminder switched off' });
+          out.skipped++; continue;
+        }
+        const r = await sendReminderEmail(user, wanted, now.getTime());
+        if (r.sent) { await done({ sent_at: new Date().toISOString(), error: null }); out.emails++; }
+        else if (r.skipped) { await done({ sent_at: new Date().toISOString(), error: r.skipped }); out.skipped++; }
+        else { await done({ claimed_at: null, error: r.failed }); out.failed++; }
+      } catch (e) {
+        console.error('reminder email failed:', e.message);
+        await done({ claimed_at: null, error: String(e.message).slice(0, 200) });
+        out.failed++;
+      }
+    }
+    if (out.queued || out.emails || out.failed) console.log(`Reminders: ${out.queued} queued, ${out.emails} emails sent, ${out.failed} failed, ${out.skipped} skipped`);
+    return out;
+  } catch (e) {
+    console.error('runReminders error:', e.message);
+    return out;
+  } finally {
+    remindersRunning = false;
+  }
+}
+
 const PORT = process.env.PORT || 3001;
 
 // ---------------------------------------------------------------------------
@@ -4259,6 +4668,9 @@ async function autoCloseStandardItems() {
 
     // Step 3: bill any orders an earlier bug left without an invoice.
     await invoiceStrandedOrders()
+
+    // Step 4: watch-list reminders (F3). Never throws; does nothing before migration w.
+    await runReminders()
   } catch (e) {
     console.error('autoCloseStandardItems error:', e)
   } finally {
