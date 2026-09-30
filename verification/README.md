@@ -186,8 +186,8 @@ process (`local-server.js` options `env`, `preload`, `patch`), so nothing leaves
 | `account-delete-premigration.js` | The new code on a database without migration t: registration, login and admin screens work; the delete route answers 503 and changes nothing. |
 
 **Homepage refresh (F1)** (wtf-handoff `HOMEPAGE_REFRESH_BRIEF.md`, 2026-09-30). `GET /home`, `GET /search`,
-`POST /signup`; contracts in `API.md`. Sign-up needs migration `2026-09-30u-drop-signups.sql` (applied on wtf-test;
-**not yet on production**: until it is, `/signup` answers 503 and the rest of the homepage works).
+`POST /signup`; contracts in `API.md`. Sign-up needs migration `2026-09-30u-drop-signups.sql` (applied on wtf-test, and on production by Cowork 2026-09-29;
+without it `/signup` answers 503 and the rest of the homepage works).
 
 | Suite | Proves |
 |---|---|
