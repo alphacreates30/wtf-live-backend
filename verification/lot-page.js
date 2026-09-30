@@ -160,6 +160,9 @@ async function cleanup() {
     ok(L.price && L.price.current_bid === null && L.price.opening_bid === 1 && L.price.bid_count === 0 && JSON.stringify(L.price.next_bids) === '[1,2]', `before any bid: opening $1, next [1, 2] (${JSON.stringify(L.price)})`);
     ok(L.price.premium_amount === 0.15 && L.price.total_with_premium === 1.15, 'premium on the opening bid: $0.15 -> $1.15');
     ok(L.time && L.time.soft_close_minutes === 2 && L.time.ends_at === new Date(lot0.ends_at).toISOString(), 'time: ends_at and the live soft-close minutes (2)');
+    const cfg = (await call('GET', '/config')).j;
+    ok(cfg && cfg.soft_close_minutes === L.time.soft_close_minutes && JSON.stringify(Object.keys(cfg)) === '["soft_close_minutes"]',
+      `GET /config: the same soft-close setting the lot page uses (${JSON.stringify(cfg)}), nothing else`);
     ok(L.fulfilment && L.fulfilment.pickup && L.fulfilment.pickup.town === 'Miami, FL' && L.fulfilment.pickup.free === true && L.fulfilment.shipping && L.fulfilment.shipping.priced === 'after_auction' && L.fulfilment.shipping.estimate === null,
       'fulfilment: pickup town (its own column) only, shipping priced after the auction, no estimate (lots have no weight/size)');
     ok(L.nav && L.nav.prev === null && L.nav.next && L.nav.next.id === lot1.id && L.nav.next.number === 2, 'nav: first lot has no prev; next = lot 2');

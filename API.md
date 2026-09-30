@@ -98,6 +98,12 @@ Body: `{ "email": "…", "website": "" }`. `website` is a honeypot: leave the fi
 - 429 after 5 sign-ups per IP per hour.
 - 503 before migration `2026-09-30u-drop-signups.sql` is applied.
 
+## `GET /config`
+
+No login. The auction rules a page may put into words, so none are hard-coded:
+`{ "soft_close_minutes": 2 }` (a bid in a lot's last N minutes moves its end to N minutes after that bid; the same
+value as `time.soft_close_minutes` on `GET /lots/:id`). `Cache-Control: public, max-age=300`.
+
 ## `POST /upload-image` (admin)
 
 Raw image bytes (JPEG, PNG or WebP, 5 MB max). Re-encoded with no metadata, max 2400px; a ~480px WebP thumbnail

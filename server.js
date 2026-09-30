@@ -3458,6 +3458,13 @@ app.delete('/auction/:id/items/:itemId/prebid', requireAuth, LIMITS.bidding, asy
 // through so the window value lives in one place.
 const SOFT_CLOSE_MINUTES = 2;
 
+// The auction rules a page may state in words (e.g. "a late bid resets that lot's clock to 2 minutes"), so no
+// page hard-codes them. Public, same for everyone, nothing secret. Contract in API.md.
+app.get('/config', (req, res) => {
+  res.set('Cache-Control', 'public, max-age=300');
+  res.json({ soft_close_minutes: SOFT_CLOSE_MINUTES });
+});
+
 // Lots open at $0.00, so "current bid + increment" would allow a $0 opening
 // bid. This is the floor for the first bid on a lot; every bid after it
 // follows the normal increment tiers (lot_rules.js, shared with the lot page).

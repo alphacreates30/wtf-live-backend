@@ -61,6 +61,20 @@ const auctionIds = [];
     ok(botRule.source === '/a/:slug/lot/:n' && botRule.destination.startsWith('/api/lot-meta') && bots.every(u => uaRe.test(u)) && people.every(u => !uaRe.test(u)),
       'vercel.json: link crawlers on /a/:slug/lot/:n get the share-preview function; browsers (and Lighthouse) get the static page');
 
+    // START_HERE rule 9: never copy (or name) other auction houses. Site and server text, docs excluded.
+    console.log('\n== No other auction house named in the site or the server ==');
+    const HOUSES = /goldin|auction ?ninja|whatnot|ebay|heritage auctions|sotheby|christie|liveauctioneers|hibid|invaluable|catawiki/i;
+    const scan = (dir, keep) => fs.readdirSync(dir, { recursive: true }).map(f => path.join(dir, f))
+      .filter(f => keep.test(f) && !/node_modules|[\\/]dist[\\/]|[\\/]nul[\\/]|[\\/]verification[\\/]/.test(f) && fs.statSync(f).isFile())
+      .filter(f => HOUSES.test(fs.readFileSync(f, 'utf8')));
+    const named = [...scan(path.join(FE, 'src'), /\.(jsx?|md|css)$/), ...scan(path.join(FE, 'api'), /\.js$/), ...scan(path.join(FE, 'public'), /\.(html|json|webmanifest|txt|svg)$/),
+      ...['index.html'].map(f => path.join(FE, f)).filter(f => HOUSES.test(fs.readFileSync(f, 'utf8'))),
+      ...['server.js', 'ai_lots.js', 'lot_page.js', 'lot_rules.js', 'public_view.js', 'thumbs.js'].map(f => path.join(BE, f)).filter(f => HOUSES.test(fs.readFileSync(f, 'utf8')))];
+    ok(named.length === 0, `no competitor named in page, admin, email or share text ${named.length ? named.join(', ') : '(site src/api/public, server)'}`);
+    const dash = src('pages/HostDashboard.jsx');
+    ok(/api\.getConfig\(\)/.test(dash) && /to \$\{softClose\} minute/.test(dash) && !/resets that lot's clock to \d/.test(dash),
+      'the create form says the soft-close minutes from GET /config, not a number written in the page');
+
     console.log('\n== Share preview (api/lot-meta.js) ==');
     const S = (await s.from('auctions').insert({ title: 'ZZTEST_lotfe Monster <Shelf> & "Co"', description: 'x', status: 'live', mode: 'standard', fulfillment_mode: 'both', pickup_address: '123 NW 4th Street, Miami, FL 33101', buyers_premium_pct: 15, host_username: 'whatthefind', starts_at: future(-60), ends_at: future(600) }).select().single()).data;
     auctionIds.push(S.id);
