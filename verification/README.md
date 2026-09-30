@@ -253,6 +253,12 @@ everything works, the public simply sees no pickup town and a buyer's own bids s
 | `ai-cleanup.js` | The cleanup pass over AI catalogue text (`ai_cleanup.js`): maker spellings (Slideshow -> Sideshow, NECA, McFarlane...), whole words only; possessives for known names (Frankenstein's) but not ordinary plurals (Hammers, Collectors); children's, collector's edition, "It's a". "Needs a look": under 25 words, unsure wording ("appears to be", "likely", "not clearly identifiable"), low confidence, no title, unreadable answer, any stated size or scale. The prompts carry the never-invent rules, and both AI calls go through the pass. No AI call, nothing spent. |
 | `lot-page-frontend.js` | Extended: share cards. index.html has the default card (both PNGs at their sizes); `api/share-meta.js` (it replaces `api/lot-meta.js`) gives lot and auction pages their own card for crawlers, one set of tags, escaped, the full photo not the thumbnail (cover, else the first lot's); drafts, unknown pages and bad input get exactly the default page. |
 
+**Photo order on the bulk upload** (2026-09-30).
+
+| Suite | Proves |
+|---|---|
+| `upload-order.js` | `../wtf-live-frontend/src/photoOrder.js`: EXIF DateTimeOriginal (+ sub-seconds) read from the file bytes, both byte orders (sharp's little-endian, a hand-built big-endian), null (never an error) for no EXIF, PNG, junk, an unset date or a truncated file; the order is date taken, then natural file name (IMG_9 < IMG_10), then last-modified, undated photos after dated ones; moving a photo before/after another. The screen sorts with it, shows each file name, drags (touch after a 350 ms hold, Alt+arrows) and keeps a manual order through ungrouping. With the owner's Drive folder present (read-only; `UPLOAD_ORDER_PHOTOS` to point elsewhere): all 264 copies have a date taken, date order = the camera's numbering, the old last-modified order scrambled all 264. No database, no AI. |
+
 **Rate limits and the suites.** `guard.js` sets `RATE_LIMIT_EXEMPT_LOOPBACK=1`, which the suites' local servers
 inherit, because a suite fires many logins and bids from localhost. The server honours it only for loopback
 addresses. Production never sets it, and Railway traffic never arrives from loopback. `rate-limits.js` clears it.
