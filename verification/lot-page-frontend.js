@@ -119,8 +119,8 @@ const auctionIds = [];
     const keys = o => Object.keys(o).sort().join();
     ok(page && keys(page.lot) === keys(real) && ['lot', 'auction', 'price', 'time', 'fulfilment', 'nav'].every(k => keys(page.lot[k]).split(',').every(x => x === 'placeholder_label' || x in real[k])),
       'the sample lot page has the /lots/:id shape');
-    ok(page.lot.lot.title.startsWith('Sample: ') && page.lot.auction.id.startsWith('sample-') && page.lot.photos.length === 0 && page.bids.bids.length === page.lot.price.bid_count,
-      'sample lot: "Sample:" title, sample id, no photos, history matches its bid count');
+    ok(page.lot.lot.title.startsWith('Sample: ') && page.lot.auction.id.startsWith('sample-') && page.lot.photos.length === 0 && !('bids' in page),
+      'sample lot: "Sample:" title, sample id, no photos, no bid list (the public never sees one, B7)');
     ok(sample.sampleLotPage('sample-horror', 99) === null && sample.sampleLotPage('not-a-sample', 1) === null, 'no sample page for a missing lot or a real slug');
     const lotPageSrc = src('pages/LotPage.jsx');
     ok(/if \(isSample\) \{ say\('Bidding is disabled in preview'\); return \}/.test(lotPageSrc) && /if \(!preview\.active\) \{ setMissing\(true\); return \}/.test(lotPageSrc),

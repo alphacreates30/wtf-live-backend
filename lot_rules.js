@@ -65,27 +65,8 @@ function slugIdPart(slug) {
   return m ? m[1] : null;
 }
 
-// The pickup town from a free-text address ("123 NW 4th Street, Miami, FL 33101" -> "Miami, FL"). The street
-// address is only for winners; before that a buyer sees the town. Null when the address has no separate town
-// part (then the page says the address is sent to winners).
-function pickupCity(address) {
-  const parts = String(address || '').split(/[,\n]/).map(p => p.trim()).filter(Boolean);
-  if (parts.length < 2) return null;
-  const rest = parts.slice(1)
-    .map(p => p.replace(/\b\d{5}(?:-\d{4})?\b/g, '').replace(/\b(usa|united states( of america)?)\b/gi, '').trim())
-    .filter(p => p && !/^\d/.test(p) && !/^(?:#|(?:suite|ste|unit|apt|floor)\b)/i.test(p));
-  return rest.length ? rest.join(', ') : null;
-}
-
-// "Bidder A", "Bidder B", ... "Bidder Z", "Bidder AA", ...
-function bidderLabel(index) {
-  let n = index, s = '';
-  do { s = String.fromCharCode(65 + (n % 26)) + s; n = Math.floor(n / 26) - 1; } while (n >= 0);
-  return 'Bidder ' + s;
-}
-
 module.exports = {
   bidIncrement, OPENING_BID_MIN, minimumBid, nextBidAmounts,
   DEFAULT_PREMIUM_PCT, premiumCents, withPremium,
-  slugify, auctionSlug, slugIdPart, SLUG_ID_LEN, pickupCity, bidderLabel,
+  slugify, auctionSlug, slugIdPart, SLUG_ID_LEN,
 };

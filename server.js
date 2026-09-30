@@ -15,6 +15,7 @@ const sharp = require('sharp');
 const aiLots = require('./ai_lots');
 const { makeThumb, thumbPathFor } = require('./thumbs');
 const lotRules = require('./lot_rules');
+const { publicAuction, publicLot } = require('./public_view');
 
 const app = express();
 const server = http.createServer(app);
@@ -251,7 +252,25 @@ function emailHtml(heading, bodyHtml) {
 </html>`;
 }
 
-function wonChargedEmailHtml(order, last4) {
+// The pickup address (B6): only ever in a WINNER's email, and only when they chose pickup. Everyone else sees
+// the town on the site. null -> nothing added (a shipping winner keeps the shipping wording).
+async function pickupFor(auctionId) {
+  const { data } = await supabase.from('auctions').select('*').eq('id', auctionId).maybeSingle();
+  if (!data || !data.pickup_address) return null;
+  return { address: data.pickup_address, starts_at: data.pickup_starts_at, ends_at: data.pickup_ends_at };
+}
+function fmtPickupTime(iso) {
+  return iso ? new Date(iso).toLocaleString('en-US', { timeZone: SITE_TIMEZONE, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' }) : null;
+}
+function pickupBlockHtml(pickup, plural) {
+  const window = pickup.starts_at && pickup.ends_at ? `${escapeHtml(fmtPickupTime(pickup.starts_at))} to ${escapeHtml(fmtPickupTime(pickup.ends_at))}` : null;
+  return `<p style="margin:16px 0 0;"><strong>Pickup:</strong> collect your ${plural ? 'lots' : 'lot'} at <strong>${escapeHtml(pickup.address)}</strong>${window ? `, ${window}` : ''}. Lots not collected within the pickup window are forfeited.</p>`;
+}
+const nextStepHtml = (pickup, plural) => (pickup
+  ? pickupBlockHtml(pickup, plural)
+  : `<p style="margin:16px 0 0;">What happens next: the host will pack and ship your ${plural ? 'items' : 'item'}, and you'll get another email with tracking once ${plural ? 'each is' : "it's"} on its way.</p>`);
+
+function wonChargedEmailHtml(order, last4, pickup = null) {
   const premiumPct = order.hammer_cents > 0 ? Math.round((order.premium_cents / order.hammer_cents) * 100) : 0;
   const cardLine = last4 ? `<p style="margin:16px 0 0;color:#555;">Card ending in ${escapeHtml(last4)} was charged.</p>` : '';
   return emailHtml('You won it - and your card has been charged', `
@@ -262,7 +281,7 @@ function wonChargedEmailHtml(order, last4) {
       <tr><td style="padding:8px 0 0;font-weight:bold;border-top:1px solid #ddd;">Total charged</td><td style="padding:8px 0 0;text-align:right;font-weight:bold;border-top:1px solid #ddd;">${formatMoney(order.total_cents)}</td></tr>
     </table>
     ${cardLine}
-    <p style="margin:16px 0 0;">What happens next: the host will pack and ship your item, and you'll get another email with tracking once it's on its way.</p>
+    ${nextStepHtml(pickup, false)}
   `);
 }
 
@@ -293,7 +312,7 @@ function invoiceLotRows(orders) {
   }).join('');
 }
 
-function invoiceWonChargedEmailHtml(invoice, orders, last4) {
+function invoiceWonChargedEmailHtml(invoice, orders, last4, pickup = null) {
   const cardLine = last4 ? `<p style="margin:16px 0 0;color:#555;">Card ending in ${escapeHtml(last4)} was charged.</p>` : '';
   return emailHtml('You won it - and your card has been charged', `
     <p>Congratulations! You won <strong>${orders.length}</strong> lot${orders.length === 1 ? '' : 's'}:</p>
@@ -302,7 +321,7 @@ function invoiceWonChargedEmailHtml(invoice, orders, last4) {
       <tr><td style="padding:8px 0 0;font-weight:bold;border-top:1px solid #ddd;">Total charged</td><td style="padding:8px 0 0;text-align:right;font-weight:bold;border-top:1px solid #ddd;">${formatMoney(invoice.total_cents)}</td></tr>
     </table>
     ${cardLine}
-    <p style="margin:16px 0 0;">What happens next: the host will pack and ship your items, and you'll get another email with tracking once each is on its way.</p>
+    ${nextStepHtml(pickup, true)}
   `);
 }
 
@@ -385,7 +404,7 @@ async function notifyWonAndCharged(orderId, paymentIntentId) {
       from: BUYER_FROM,
       to: email,
       subject: `You won "${order.item_title}" - payment charged`,
-      html: wonChargedEmailHtml(order, last4),
+      html: wonChargedEmailHtml(order, last4, order.fulfillment_choice === 'pickup' ? await pickupFor(order.auction_id) : null),
       kind: 'won',
     });
   } catch (e) {
@@ -438,12 +457,14 @@ async function notifyInvoiceWonAndCharged(invoiceId, paymentIntentId) {
 
     const { data: orders } = await supabase
       .from('orders')
-      .select('item_title, hammer_cents, premium_cents')
+      .select('item_title, hammer_cents, premium_cents, fulfillment_choice')
       .eq('invoice_id', invoiceId);
     if (!orders?.length) return;
 
     const email = await getBuyerEmail(invoice.buyer_user_id);
     if (!email) return;
+    // One choice per buyer per auction (made before their first bid), so any order says it.
+    const pickup = orders.some(o => o.fulfillment_choice === 'pickup') ? await pickupFor(invoice.auction_id) : null;
 
     let last4 = null;
     try {
@@ -457,7 +478,7 @@ async function notifyInvoiceWonAndCharged(invoiceId, paymentIntentId) {
       from: BUYER_FROM,
       to: email,
       subject: `You won ${orders.length} lot${orders.length === 1 ? '' : 's'} - payment charged`,
-      html: invoiceWonChargedEmailHtml(invoice, orders, last4),
+      html: invoiceWonChargedEmailHtml(invoice, orders, last4, pickup),
       kind: 'won',
     });
   } catch (e) {
@@ -1449,11 +1470,14 @@ app.get('/my-bids', requireAuth, async (req, res) => {
 
   const result = (items || []).map(item => {
     const myMax = Math.max(preByItem[item.id] || 0, liveByItem[item.id] || 0)
+    // Never another bidder's name (B7): only whether it is the caller.
+    const { leading_bidder, ...lot } = item;
     return {
-      ...item,
+      ...lot,
+      leading: leading_bidder === username,
       lot_number: item.position != null ? item.position + 1 : null,
       max_bid: myMax || null,
-      won: item.leading_bidder === username,
+      won: leading_bidder === username,
       closed: item.status === 'sold' || item.status === 'unsold',
       auction: auctionMap[item.auction_id] || null,
     }
@@ -1510,7 +1534,9 @@ app.get('/my-orders', requireAuth, async (req, res) => {
   if (!orders.length) return res.json([]);
 
   const auctionIds = [...new Set(orders.map(o => o.auction_id))];
-  const { data: auctions } = await supabase.from('auctions').select('id, title, status, fulfillment_mode').in('id', auctionIds);
+  // '*' because pickup_town only exists after migration y. These are the caller's own WON orders, so a pickup
+  // order may carry the street address (B6).
+  const { data: auctions } = await supabase.from('auctions').select('*').in('id', auctionIds);
   const auctionMap = Object.fromEntries((auctions || []).map(a => [a.id, a]));
 
   res.json(orders.map(o => {
@@ -1538,6 +1564,10 @@ app.get('/my-orders', requireAuth, async (req, res) => {
       shipping_cost_cents: o.shipping_cost_cents ?? null,
       shipping_payment_status: o.shipping_payment_status || null,
       shipping_payment_error: o.shipping_payment_error || null,
+      pickup: o.fulfillment_choice === 'pickup' && auction ? {
+        address: auction.pickup_address || null, town: auction.pickup_town || null,
+        starts_at: auction.pickup_starts_at || null, ends_at: auction.pickup_ends_at || null,
+      } : null,
       created_at: o.created_at,
     };
   }));
@@ -1558,7 +1588,8 @@ app.get('/auctions', optionalAuth, async (req, res) => {
   }
   const { data, error } = await query;
   if (error) return dbFailure(req, res, error);
-  res.json(await withThumbs(data));
+  const rows = await withThumbs(data);
+  res.json(isAdmin ? rows : rows.map(publicAuction));   // B7: no leading_bidder for the public
 });
 
 app.get('/auction/:id', optionalAuth, async (req, res) => {
@@ -1569,7 +1600,8 @@ app.get('/auction/:id', optionalAuth, async (req, res) => {
   if (data.status === 'draft' && req.user?.username !== ADMIN_USERNAME) {
     return res.status(404).json({ error: 'Auction not found' });
   }
-  res.json(data);
+  // B6/B7: the public gets the pickup town, never the street address, and no bidder; the admin the full row.
+  res.json(req.user?.username === ADMIN_USERNAME ? data : publicAuction(data));
 });
 
 const FULFILLMENT_MODES = ['shipping', 'pickup', 'both'];
@@ -1578,7 +1610,7 @@ const FULFILLMENT_MODES = ['shipping', 'pickup', 'both'];
 const TERMS_VERSION = '1';
 
 app.patch('/auction/:id', requireAdmin, async (req, res) => {
-  const { title, description, category, buyers_premium_pct, fulfillment_mode, pickup_address, pickup_starts_at, pickup_ends_at } = req.body;
+  const { title, description, category, buyers_premium_pct, fulfillment_mode, pickup_address, pickup_town, pickup_starts_at, pickup_ends_at } = req.body;
   const u = {};
   if (title !== undefined) {
     if (!title) return res.status(400).json({ error: 'title cannot be empty' });
@@ -1600,6 +1632,12 @@ app.patch('/auction/:id', requireAdmin, async (req, res) => {
     u.fulfillment_mode = fulfillment_mode;
   }
   if (pickup_address !== undefined) u.pickup_address = pickup_address;
+  // What the public sees instead of the street (B6). Needs migration y: before it the column doesn't exist.
+  if (pickup_town !== undefined) {
+    const town = typeof pickup_town === 'string' ? pickup_town.trim() : '';
+    if (town.length > 80) return res.status(400).json({ error: 'pickup_town is at most 80 characters' });
+    u.pickup_town = town || null;
+  }
   if (pickup_starts_at !== undefined) {
     if (pickup_starts_at && isNaN(new Date(pickup_starts_at).getTime())) {
       return res.status(400).json({ error: 'pickup_starts_at is not a valid date' });
@@ -1612,9 +1650,16 @@ app.patch('/auction/:id', requireAdmin, async (req, res) => {
     }
     u.pickup_ends_at = pickup_ends_at || null;
   }
-  const { data, error } = await supabase.from('auctions').update(u).eq('id', req.params.id).select().single();
+  let { data, error } = await supabase.from('auctions').update(u).eq('id', req.params.id).select().single();
+  // Before migration y there is no pickup_town column: save everything else rather than block the settings,
+  // and say the town wasn't kept.
+  let townSaved = true;
+  if (error && 'pickup_town' in u && /pickup_town/.test(error.message || '')) {
+    delete u.pickup_town; townSaved = false;
+    ({ data, error } = await supabase.from('auctions').update(u).eq('id', req.params.id).select().single());
+  }
   if (error || !data) return res.status(404).json({ error: 'Auction not found' });
-  res.json(data);
+  res.json(townSaved ? data : { ...data, pickup_town_saved: false });
 });
 
 app.post('/auction', requireAdmin, async (req, res) => {
@@ -1658,7 +1703,8 @@ app.post('/auction', requireAdmin, async (req, res) => {
 // the host is ready. Requires at least one lot - publishing an empty
 // auction is almost certainly a mistake, not an intentional "coming soon".
 app.post('/auction/:id/publish', requireAdmin, async (req, res) => {
-  const { data: auction, error } = await supabase.from('auctions').select('status, starts_at, ends_at, fulfillment_mode, pickup_address, pickup_starts_at, pickup_ends_at').eq('id', req.params.id).single();
+  // '*': pickup_town only exists after migration y; required once it does.
+  const { data: auction, error } = await supabase.from('auctions').select('*').eq('id', req.params.id).single();
   if (error || !auction) return res.status(404).json({ error: 'Auction not found' });
   if (auction.status !== 'draft') return res.status(400).json({ error: 'Auction is not a draft' });
 
@@ -1672,6 +1718,9 @@ app.post('/auction/:id/publish', requireAdmin, async (req, res) => {
   if (auction.fulfillment_mode === 'pickup' || auction.fulfillment_mode === 'both') {
     if (!auction.pickup_address || !auction.pickup_starts_at || !auction.pickup_ends_at) {
       return res.status(400).json({ error: 'Add a pickup address and pickup window before publishing' });
+    }
+    if ('pickup_town' in auction && !auction.pickup_town) {
+      return res.status(400).json({ error: 'Add the pickup town (what bidders see before winning) before publishing' });
     }
     if (auction.ends_at && new Date(auction.pickup_ends_at) <= new Date(auction.ends_at)) {
       return res.status(400).json({ error: 'Pickup window must end after the auction closes' });
@@ -1880,10 +1929,16 @@ async function hideDraftFromNonAdmin(req, res, next) {
   next();
 }
 
+// B7: nobody but the admin sees who bid. Everyone else gets the count.
 app.get('/auction/:id/bids', optionalAuth, hideDraftFromNonAdmin, async (req, res) => {
-  const { data, error } = await supabase.from('bids').select('*').eq('auction_id', req.params.id).order('created_at', { ascending: false }).limit(50);
+  if (req.user?.username === ADMIN_USERNAME) {
+    const { data, error } = await supabase.from('bids').select('*').eq('auction_id', req.params.id).order('created_at', { ascending: false }).limit(50);
+    if (error) return dbFailure(req, res, error);
+    return res.json(data);
+  }
+  const { count, error } = await supabase.from('bids').select('id', { count: 'exact', head: true }).eq('auction_id', req.params.id);
   if (error) return dbFailure(req, res, error);
-  res.json(data);
+  res.json({ bid_count: count || 0 });
 });
 
 app.get('/auction/:id/chat', optionalAuth, hideDraftFromNonAdmin, async (req, res) => {
@@ -1911,7 +1966,7 @@ function startAuctionTimer(auctionId, endsAt) {
       delete auctionTimers[auctionId];
       const { data: auction } = await supabase.from('auctions').update({ status: 'ended' }).eq('id', auctionId).eq('status', 'live').eq('mode', 'live').select().single();
       if (auction) {
-        io.to(auctionId).emit('auction_ended', { auctionId, winner: auction.leading_bidder, final_bid: auction.current_bid });
+        await emitPerViewer(auctionId, 'auction_ended', u => ({ auctionId, final_bid: auction.current_bid, you_won: !!u && u === auction.leading_bidder }));
         await createOrderOnWin(auctionId, auction.leading_bidder, auction.current_bid);
         console.log(`- Auction ${auctionId} ended - winner: ${auction.leading_bidder} at $${auction.current_bid}`);
       }
@@ -1963,6 +2018,12 @@ const LIVE_ONLY = 'This is not a live auction.';
 async function isLiveModeAuction(auctionId) {
   const { data } = await supabase.from('auctions').select('mode').eq('id', auctionId).maybeSingle();
   return data?.mode === 'live';
+}
+
+// B7: room-wide events carry no bidder identity. Where a viewer needs to know about THEMSELVES (leading, won),
+// each socket in the room gets its own copy with `you_*` set from its own login.
+async function emitPerViewer(room, event, payloadFor) {
+  for (const s of await io.in(room).fetchSockets()) s.emit(event, payloadFor(s.data?.username || null));
 }
 
 io.on('connection', (socket) => {
@@ -2042,6 +2103,7 @@ io.on('connection', (socket) => {
     if (user) {
       socket.userId = String(user.id);
       socket.username = user.username;
+      socket.data.username = user.username;   // read by emitPerViewer (fetchSockets returns data, not props)
 
       // Track socket by userId for force-disconnect
       if (!userSockets[socket.userId]) userSockets[socket.userId] = new Set();
@@ -2072,13 +2134,17 @@ io.on('connection', (socket) => {
     viewers[auctionId].add(socket.id);
     io.to(auctionId).emit('viewer_count', viewers[auctionId].size);
 
+    const isAdmin = user?.username === ADMIN_USERNAME;
     if (auction) {
-      socket.emit('auction_state', auction);
+      socket.emit('auction_state', isAdmin ? auction : { ...publicAuction(auction), you_lead: !!user && auction.leading_bidder === user.username });
       if (auction.mode === 'live' && auction.status === 'live' && auction.ends_at) startAuctionTimer(auctionId, auction.ends_at);
     }
 
-    const { data: bids } = await supabase.from('bids').select('*').eq('auction_id', auctionId).order('created_at', { ascending: false }).limit(20);
-    if (bids) socket.emit('bid_history', bids);
+    // Who bid what: the admin only (B7).
+    if (isAdmin) {
+      const { data: bids } = await supabase.from('bids').select('*').eq('auction_id', auctionId).order('created_at', { ascending: false }).limit(20);
+      if (bids) socket.emit('bid_history', bids);
+    }
 
     const { data: chatHistory } = await supabase.from('chat_messages').select('*').eq('auction_id', auctionId).eq('flagged', false).order('created_at', { ascending: true }).limit(50);
     if (chatHistory) socket.emit('chat_history', chatHistory);
@@ -2109,7 +2175,8 @@ io.on('connection', (socket) => {
     const { data, error } = await supabase.rpc('place_bid', { p_auction_id: auctionId, p_username: user.username, p_amount: amount });
     if (error || !data.success) { socket.emit('bid_error', { message: (data && data.error) || 'Failed to place bid' }); return; }
 
-    io.to(auctionId).emit('new_bid', data.bid);
+    const bid = data.bid || {};
+    await emitPerViewer(auctionId, 'new_bid', u => ({ auction_id: auctionId, amount: bid.amount, created_at: bid.created_at, you_lead: u === user.username }));
     // Snipe protection: last-second bid adds 5s
     if (itemTimers[auctionId] && itemTimers[auctionId].remaining > 0 && itemTimers[auctionId].remaining <= 5) {
       startItemTimer(auctionId, 5);
@@ -2214,7 +2281,7 @@ io.on('connection', (socket) => {
     if (auctionTimers[auctionId]) { clearInterval(auctionTimers[auctionId]); delete auctionTimers[auctionId]; }
     await supabase.from('auctions').update({ status: 'ended' }).eq('id', auctionId);
     await createOrderOnWin(auctionId, auction.leading_bidder, auction.current_bid);
-    io.to(auctionId).emit('auction_ended', { auctionId, winner: auction.leading_bidder, final_bid: auction.current_bid });
+    await emitPerViewer(auctionId, 'auction_ended', u => ({ auctionId, final_bid: auction.current_bid, you_won: !!u && u === auction.leading_bidder }));
     console.log(`- Host ${user.username} ended auction ${auctionId} early`);
   });
 
@@ -2250,7 +2317,7 @@ io.on('connection', (socket) => {
     const ts = timerSeconds || 60;
   startItemTimer(auctionId, ts);
   io.to(auctionId).emit('item_timer_tick', { seconds: ts });
-  io.to(auctionId).emit('item_activated', { item: hideLotMax(activeItem), pre_bid_count: preBids ? preBids.length : 0, timer_seconds: ts });
+  await emitPerViewer(auctionId, 'item_activated', u => ({ item: publicLot(activeItem), you_lead: !!u && u === activeItem?.leading_bidder, pre_bid_count: preBids ? preBids.length : 0, timer_seconds: ts }));
   });
 
   socket.on('disconnect', () => {
@@ -3238,21 +3305,15 @@ app.post('/webhook/shippo', async (req, res) => {
 
 // AUCTION ITEMS AND PRE-BIDS
 
-// auction_items.top_pre_bid is the highest max on the lot - on a standard lot,
-// the leader's secret proxy ceiling. Anyone who can read it can bid a rival up
-// to exactly their limit, so it only ever leaves the server for the host/admin.
-// Every lot row sent to anyone else (REST, bid responses, socket broadcasts)
-// goes through this. A buyer's own max comes from GET .../prebid and /my-bids.
-// reserve_price goes the same way (security review #8): the terms call reserves
-// "undisclosed", and a bidder who can read one bids exactly to it or walks away.
+// Lot rows for anyone but the admin/host go through publicLot (public_view.js), an ALLOW-list: no max
+// (top_pre_bid: a rival could bid exactly to it), no reserve (security review #8), and since B7 no bidder
+// identity at all (leading_bidder). A buyer's own standing and max come from their own authenticated calls
+// (/auction/:id/my-standing, /lots/:id/me, /my-bids), never from the public row.
 function canSeeLotMaxes(user, auction) {
   return !!user && (user.username === ADMIN_USERNAME || (!!auction && user.username === auction.host_username));
 }
-function hideLotMax(item) {
-  if (!item) return item;
-  const { top_pre_bid, reserve_price, ...rest } = item;
-  return rest;
-}
+// The bidder's own answer after a bid: the public lot plus where THEY stand (never who else leads).
+const bidResult = (row, username) => ({ ...publicLot(row), your_status: row && row.leading_bidder === username ? 'winning' : 'outbid' });
 
 app.get('/auction/:id/items', optionalAuth, async (req, res) => {
   const { data: auction } = await supabase.from('auctions').select('status, host_username').eq('id', req.params.id).single();
@@ -3262,7 +3323,7 @@ app.get('/auction/:id/items', optionalAuth, async (req, res) => {
   const { data, error } = await supabase
     .from('auction_items').select('*').eq('auction_id', req.params.id).order('position', { ascending: true });
   if (error) return dbFailure(req, res, error);
-  res.json(await withThumbs(canSeeLotMaxes(req.user, auction) ? data : data.map(hideLotMax)));
+  res.json(await withThumbs(canSeeLotMaxes(req.user, auction) ? data : data.map(publicLot)));
 });
 
 app.post('/auction/:id/items', requireAdmin, async (req, res) => {
@@ -3455,7 +3516,7 @@ app.post('/auction/:id/items/:itemId/bid', requireAuth, LIMITS.bidding, async (r
       p_max_amount: max_amount
     });
     if (maxErr) console.error('update_standard_leader_max failed:', maxErr.code, maxErr.message);
-    if (rows && rows.length) return res.json({ ...hideLotMax(rows[0]), extended: false, max_only: true });
+    if (rows && rows.length) return res.json({ ...bidResult(rows[0], req.user.username), extended: false, max_only: true });
   }
 
   const { data, error } = await supabase.rpc('place_standard_bid', {
@@ -3484,14 +3545,28 @@ app.post('/auction/:id/items/:itemId/bid', requireAuth, LIMITS.bidding, async (r
     io.to(req.params.id).emit('item_extended', { item_id: req.params.itemId, ends_at: data.ends_at });
     console.log(`Soft close: lot ${req.params.itemId} extended to ${data.ends_at}`);
   }
-  // data is the lot row after the proxy battle: top_pre_bid is the leader's
-  // max, which a losing challenger must not get back.
-  res.json({ ...hideLotMax(data), extended });
+  // data is the lot row after the proxy battle: the leader's max and name, which a losing challenger must not
+  // get back. They get the public lot and whether THEY lead.
+  res.json({ ...bidResult(data, req.user.username), extended });
 
   // Fire-and-forget: this notifies whoever *lost* the lead, a different user
   // than the one who just bid, so it must never delay this response.
   notifyOutbidIfNeeded(req.params.itemId, bidItem.leading_bidder)
     .catch(e => console.error('notifyOutbidIfNeeded error:', e.message));
+});
+
+// The caller's own standing per lot (B7): the public lot rows name nobody, so the room asks this instead of
+// comparing leading_bidder with its own name. Never anyone else's.
+app.get('/auction/:id/my-standing', requireAuth, async (req, res) => {
+  const { data: auction } = await supabase.from('auctions').select('status').eq('id', req.params.id).maybeSingle();
+  if (!auction || (auction.status === 'draft' && req.user.username !== ADMIN_USERNAME)) return res.status(404).json({ error: 'Auction not found' });
+  try {
+    const lots = await lotsOf([req.params.id], 'id, status, ends_at, bid_count, leading_bidder');
+    res.set('Cache-Control', 'no-store');
+    res.json({ lots: lots.length ? await standingFor(req.user, lots) : {} });
+  } catch (e) {
+    dbFailure(req, res, e);
+  }
 });
 
 app.get('/auction/:id/items/standard-status', optionalAuth, async (req, res) => {
@@ -3501,7 +3576,7 @@ app.get('/auction/:id/items/standard-status', optionalAuth, async (req, res) => 
   }
   const { data, error } = await supabase.from('auction_items').select('*').eq('auction_id', req.params.id).order('position', { ascending: true });
   if (error) return res.status(500).json({ error: 'Failed to load items' });
-  res.json(await withThumbs(canSeeLotMaxes(req.user, auction) ? data : data.map(hideLotMax)));
+  res.json(await withThumbs(canSeeLotMaxes(req.user, auction) ? data : data.map(publicLot)));
 });
 
 // ---------------------------------------------------------------------------
@@ -3757,7 +3832,7 @@ const watchUnavailable = res => res.status(503).json({ error: 'Watching is not a
 LIMITS.watch = limiter({ windowMs: 60e3, limit: 60, key: perUser, message: 'Too many changes too quickly. Wait a moment and try again.' });
 
 // A lot or auction a buyer may watch/follow: published (never a draft).
-async function publicLot(itemId) {
+async function watchableLot(itemId) {
   const { data: lot } = await supabase.from('auction_items').select('id, auction_id, status, ends_at').eq('id', itemId).maybeSingle();
   if (!lot) return null;
   const { data: auction } = await supabase.from('auctions').select('id, status, starts_at').eq('id', lot.auction_id).maybeSingle();
@@ -3766,7 +3841,7 @@ async function publicLot(itemId) {
 }
 
 app.post('/watch/:itemId', requireAuth, LIMITS.watch, async (req, res) => {
-  const found = await publicLot(req.params.itemId);
+  const found = await watchableLot(req.params.itemId);
   if (!found) return res.status(404).json({ error: 'Lot not found' });
   const { lot } = found;
   if (['sold', 'unsold'].includes(lot.status) || (lot.ends_at && Date.parse(lot.ends_at) <= Date.now())) return res.status(400).json({ error: 'This lot has closed', code: 'lot_closed' });
@@ -3896,7 +3971,7 @@ app.get('/me/watching', requireAuth, async (req, res) => {
 
 // The lot page: GET /lots/:itemId (+ /me, /bids, /related, /by-number). lot_page.js; contracts in API.md.
 require('./lot_page')(app, {
-  supabase, requireAuth, optionalAuth, dbFailure, thumbsFor, homeLot, premiumMap, blurbOf, auctionPhase, isoOrNull,
+  supabase, requireAuth, dbFailure, ADMIN_USERNAME, thumbsFor, homeLot, premiumMap, blurbOf, auctionPhase, isoOrNull,
   standingFor, SOFT_CLOSE_MINUTES, CONTACT_EMAIL: REPLY_TO,
 });
 

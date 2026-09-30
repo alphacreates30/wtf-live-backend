@@ -48,7 +48,8 @@ async function mkAuction(label, status) {
     b = await get(newSrv.url, `/auction/${draft}/bids`, ADMIN); c = await get(newSrv.url, `/auction/${draft}/chat`, ADMIN);
     ok(b.s === 200 && b.j.length === 1 && c.s === 200 && c.j.length === 1, 'NEW: the admin still reads a draft\'s bids and chat');
     b = await get(newSrv.url, `/auction/${live}/bids`); c = await get(newSrv.url, `/auction/${live}/chat`);
-    ok(b.s === 200 && b.j.length === 1 && c.s === 200 && c.j.length === 1, 'NEW: a live auction\'s bids and chat are still public');
+    // Since B7 the public gets the bid COUNT of a live auction, never the rows (who bid). Chat stays public.
+    ok(b.s === 200 && b.j.bid_count === 1 && !Array.isArray(b.j) && c.s === 200 && c.j.length === 1, 'NEW: a live auction\'s bid count (not the rows, B7) and chat are still public');
     // Homepage (2026-09-30): the draft's lot never reaches /home or /search, for anyone; the live one's does.
     for (const [who, t] of [['anonymous', null], ['a logged-in buyer', BUYER], ['the admin', ADMIN]]) {
       const h = await get(newSrv.url, '/home', t), q = await get(newSrv.url, '/search?q=draftreads', t);
@@ -57,7 +58,7 @@ async function mkAuction(label, status) {
         `NEW: ${who} -> /home and /search show the live auction's lot, nothing of the draft`);
     }
     b = await get(newSrv.url, `/auction/${crypto.randomUUID()}/bids`);
-    ok(b.s === 200 && Array.isArray(b.j) && b.j.length === 0, 'NEW: an unknown auction id still answers an empty list (as before)');
+    ok(b.s === 200 && b.j.bid_count === 0, 'NEW: an unknown auction id answers a zero count');
   } finally {
     servers.forEach(x => x.stop());
     for (const id of made) await s.rpc('delete_auction_cascade', { p_auction_id: id });

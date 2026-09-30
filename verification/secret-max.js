@@ -195,7 +195,8 @@ async function cleanup() {
     const mine = (now.controls.leaderMyBids || []).find(i => Number(i.max_bid) === STD_MAX);
     ok(!!mine, `NEW L's /my-bids still shows their OWN max on the standard lot (${mine && mine.max_bid})`);
     const lb = now.controls.lotBids;
-    ok(lb.anonymous && lb.anonymous.bids.length === 2 && lb.C && lb.C.bids.length === 2, 'NEW /lots/SL/bids carries both bids (so its no-max checks above mean something)');
+    // Since B7 there is no public list (401) and a buyer sees only their own bids: C's one bid, at C's own max.
+    ok(lb.anonymous && !lb.anonymous.bids && lb.C && lb.C.bids.length === 1 && lb.C.bids[0].amount === 5, "NEW /lots/SL/bids: none for anonymous, only C's own bid for C (so the no-max checks above mean something)");
     for (const [who, body] of [['anonymous', lb.anonymous], ['C', lb.C], ['anonymous lot page', now.controls.lotPage]]) {
       const text = JSON.stringify(body);
       ok(!text.includes(L.username) && !text.includes(C.username) && !text.includes('"username"'), `NEW ${who}: no username on the lot page or in its history`);

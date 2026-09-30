@@ -1,9 +1,10 @@
 // The lot page (wtf-handoff LOT_PAGE_BRIEF.md): one public read with everything a buyer needs to bid, the
-// buyer's own standing in a separate authenticated read (so the public one can be cached), anonymised bid
-// history, and related lots. Contracts in API.md. The website and the planned app both read these.
+// buyer's own standing and own bids in separate authenticated reads (so the public one can be cached), and
+// related lots. Contracts in API.md. The website and the planned app both read these.
 //
-// Public rules as everywhere else: drafts are 404; never top_pre_bid, reserve_price, a leading bidder, a
-// username or anyone's max; the pickup street address stays with winners (only the town is shown).
+// Public rules as everywhere else (PRIVACY_BIDDERS_PICKUP_BRIEF.md): drafts are 404; bidders are never
+// identified - no username, no leader, no per-bid list, no max, no reserve; the public sees the current bid and
+// the bid count. The pickup street address stays with winners: the public gets pickup_town.
 const rules = require('./lot_rules');
 
 const RELATED_MORE_MAX = 8;
@@ -17,11 +18,12 @@ const STOP = new Set(('the and for with from this that into over under set lot l
   'good very fair mint near pair lot sample').split(' '));
 
 module.exports = function registerLotPage(app, d) {
-  const { supabase, requireAuth, optionalAuth, dbFailure, thumbsFor, homeLot, premiumMap, blurbOf, auctionPhase,
+  const { supabase, requireAuth, dbFailure, ADMIN_USERNAME, thumbsFor, homeLot, premiumMap, blurbOf, auctionPhase,
     isoOrNull, standingFor, SOFT_CLOSE_MINUTES, CONTACT_EMAIL } = d;
 
   const LOT_COLUMNS = 'id, auction_id, position, title, description, condition, image_url, starting_bid, current_bid, bid_count, ends_at, status';
-  const AUCTION_COLUMNS = 'id, title, description, category, status, starts_at, ends_at, buyers_premium_pct, fulfillment_mode, pickup_address, pickup_starts_at, pickup_ends_at';
+  // '*': pickup_town only exists after migration y. Only the fields picked into lotBody ever leave the server.
+  const AUCTION_COLUMNS = '*';
 
   // Slug -> auction id. Auctions are few; a short cache of (id, status) is enough to match the id part.
   let slugCache = { at: 0, rows: null };
@@ -129,7 +131,7 @@ module.exports = function registerLotPage(app, d) {
       fulfilment: {
         pickup: pickup ? {
           free: true,
-          city: rules.pickupCity(auction.pickup_address),
+          town: auction.pickup_town || null,     // never pickup_address (B6)
           starts_at: isoOrNull(auction.pickup_starts_at), ends_at: isoOrNull(auction.pickup_ends_at),
         } : null,
         // No lot has weight or size data (parcels are weighed at packing), so there is no price to show:
@@ -194,30 +196,39 @@ module.exports = function registerLotPage(app, d) {
     }
   });
 
-  // Anonymised history: every bid that moved the price, newest first. Bidders are "Bidder A", "Bidder B"...
-  // in the order they first led this lot (the same letters for everyone), and "You" for the caller's own.
-  // Never a username, never a max: each amount is the price that bid set, which is public as the current bid.
-  app.get('/lots/:itemId/bids', optionalAuth, async (req, res) => {
+  // Bids on this lot, login only (B7: the public sees the count on the lot, never a list). A buyer gets only
+  // THEIR OWN bids: what they bid (their max, after migration y; before it, the price the bid produced) and when.
+  // The admin gets everything: who submitted each bid, who held the lead at that price (migration x) and each max.
+  app.get('/lots/:itemId/bids', requireAuth, async (req, res) => {
     try {
       const found = await loadLot(req.params.itemId);
       if (!found) return res.status(404).json({ error: 'Lot not found' });
-      let q = await supabase.from('bids').select('amount, created_at, username, leader_username')
-        .eq('item_id', found.lot.id).order('created_at', { ascending: true }).order('id', { ascending: true }).limit(HISTORY_MAX);
-      // Before migration x there is no leader_username column: fall back to the submitter.
-      if (q.error && (q.error.code === '42703' || /leader_username/.test(q.error.message || ''))) {
-        q = await supabase.from('bids').select('amount, created_at, username')
-          .eq('item_id', found.lot.id).order('created_at', { ascending: true }).order('id', { ascending: true }).limit(HISTORY_MAX);
+      const isAdmin = req.user.username === ADMIN_USERNAME;
+      const base = cols => {
+        let q = supabase.from('bids').select(cols).eq('item_id', found.lot.id);
+        if (!isAdmin) q = q.eq('username', req.user.username);
+        return q.order('created_at', { ascending: false }).order('id', { ascending: false }).limit(HISTORY_MAX);
+      };
+      // Newest columns first; older databases (before migrations y / x) lack them.
+      let q;
+      for (const cols of ['amount, created_at, username, leader_username, max_amount', 'amount, created_at, username, leader_username', 'amount, created_at, username']) {
+        q = await base(cols);
+        if (!q.error || !(q.error.code === '42703' || /does not exist|leader_username|max_amount/.test(q.error.message || ''))) break;
       }
       if (q.error) throw q.error;
-      const letters = new Map();
-      const me = req.user?.username || null;
-      const rows = (q.data || []).map(b => {
-        const who = b.leader_username || b.username;
-        if (!letters.has(who)) letters.set(who, rules.bidderLabel(letters.size));
-        return { amount: Number(b.amount), at: isoOrNull(b.created_at), bidder: me && who === me ? 'You' : letters.get(who), you: !!me && who === me };
-      });
+      const num = v => (v == null ? null : Number(v));
       res.set('Cache-Control', 'no-store');
-      res.json({ bid_count: found.lot.bid_count || 0, bids: rows.reverse() });
+      if (isAdmin) {
+        return res.json({
+          scope: 'all', bid_count: found.lot.bid_count || 0,
+          bids: (q.data || []).map(b => ({ at: isoOrNull(b.created_at), price: num(b.amount), bidder: b.username,
+            leader: b.leader_username ?? null, max: num(b.max_amount) })),
+        });
+      }
+      res.json({
+        scope: 'own', bid_count: found.lot.bid_count || 0,
+        bids: (q.data || []).map(b => ({ at: isoOrNull(b.created_at), amount: num(b.max_amount) ?? num(b.amount), price: num(b.amount) })),
+      });
     } catch (e) {
       dbFailure(req, res, e);
     }

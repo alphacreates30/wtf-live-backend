@@ -2,11 +2,11 @@
 // /lots/:id/bids, /lots/:id/related. THROWAWAY rows only (ZZTEST_lotpage*), always cleaned up.
 //
 // Proves: the endpoint's shape; the premium line uses the invoice's own maths; the two one-tap amounts are exactly
-// what the server accepts (a cent less is refused) on every increment tier; the history is anonymised (Bidder A/B,
-// "You"), follows who actually held each price (migration x), counts every bid like bid_count, and never carries a
-// username or a max (anonymous, a buyer, the other buyer); each buyer's own status and max; related and similar
-// lots (other live auctions only, hidden below 3 matches); drafts 404 everywhere and never in a rail; the pickup
-// street address never leaves; slugs (renamed title, full uuid, unknown).
+// what the server accepts (a cent less is refused) on every increment tier; each buyer's own status and max; bids
+// (B7, PRIVACY_BIDDERS_PICKUP_BRIEF.md): no public list (401), a buyer gets ONLY their own bids (their max after
+// migration y, the price before it), the admin gets every bid with bidder, leader (migration x) and max; related
+// and similar lots (other live auctions only, hidden below 3 matches); drafts 404 everywhere and never in a rail;
+// the public pickup is the pickup_town column, never the street; slugs (renamed title, full uuid, unknown).
 const crypto = require('crypto');
 const guard = require('./guard');
 guard(__filename);
@@ -65,7 +65,7 @@ async function lots(auctionId, list) {
 
 async function fixtures() {
   const S = await auction({
-    title: 'ZZTEST_lotpage Monster Shelf', category: 'Horror figures', fulfillment_mode: 'both',
+    title: 'ZZTEST_lotpage Monster Shelf', category: 'Horror figures', fulfillment_mode: 'both', pickup_town: 'Miami, FL',
     pickup_address: STREET + ', Miami, FL 33101', pickup_starts_at: future(700), pickup_ends_at: future(700 + 7 * 1440),
   });
   const SL = await lots(S.id, [
@@ -138,11 +138,8 @@ async function cleanup() {
       'orders (and so invoices) compute the premium with the same lotRules.premiumCents');
     ok(src.includes('lotRules.minimumBid(bidItem, isLeader)'), 'the bid route judges the minimum with the same lotRules.minimumBid the one-tap amounts come from');
     ok(rules.withPremium(83.5, 15).total === 96.03 && rules.withPremium(83, 15).total === 95.45, 'e.g. $83.50 -> $96.03, $83 -> $95.45 with 15%');
-    ok(rules.pickupCity('123 NW 4th Street, Miami, FL 33101') === 'Miami, FL' && rules.pickupCity('9 Elm Rd, Suite 4, Austin, TX') === 'Austin, TX'
-      && rules.pickupCity('123 NW 4th Street') === null && rules.pickupCity('') === null, 'pickup town from the address; no town part -> null (never the street)');
     ok(rules.slugIdPart('monster-shelf-3f9a1c2e') === '3f9a1c2e' && rules.slugIdPart('nothing-here') === null && rules.auctionSlug({ id: '3F9A1C2E-0000-4000-8000-000000000000', title: "Bob's Toys & Tins!" }) === 'bobs-toys-tins-3f9a1c2e',
       'slugs: title words + first 8 of the id');
-    ok(rules.bidderLabel(0) === 'Bidder A' && rules.bidderLabel(25) === 'Bidder Z' && rules.bidderLabel(26) === 'Bidder AA', 'bidder labels A..Z, AA..');
 
     const col = await s.from('bids').select('leader_username').limit(1);
     if (col.error) { console.log('\nMigration 2026-09-30x is not applied on this database (bids.leader_username missing). Apply it on wtf-test first.'); process.exit(2); }
@@ -163,8 +160,8 @@ async function cleanup() {
     ok(L.price && L.price.current_bid === null && L.price.opening_bid === 1 && L.price.bid_count === 0 && JSON.stringify(L.price.next_bids) === '[1,2]', `before any bid: opening $1, next [1, 2] (${JSON.stringify(L.price)})`);
     ok(L.price.premium_amount === 0.15 && L.price.total_with_premium === 1.15, 'premium on the opening bid: $0.15 -> $1.15');
     ok(L.time && L.time.soft_close_minutes === 2 && L.time.ends_at === new Date(lot0.ends_at).toISOString(), 'time: ends_at and the live soft-close minutes (2)');
-    ok(L.fulfilment && L.fulfilment.pickup && L.fulfilment.pickup.city === 'Miami, FL' && L.fulfilment.pickup.free === true && L.fulfilment.shipping && L.fulfilment.shipping.priced === 'after_auction' && L.fulfilment.shipping.estimate === null,
-      'fulfilment: pickup town only, shipping priced after the auction, no estimate (lots have no weight/size)');
+    ok(L.fulfilment && L.fulfilment.pickup && L.fulfilment.pickup.town === 'Miami, FL' && L.fulfilment.pickup.free === true && L.fulfilment.shipping && L.fulfilment.shipping.priced === 'after_auction' && L.fulfilment.shipping.estimate === null,
+      'fulfilment: pickup town (its own column) only, shipping priced after the auction, no estimate (lots have no weight/size)');
     ok(L.nav && L.nav.prev === null && L.nav.next && L.nav.next.id === lot1.id && L.nav.next.number === 2, 'nav: first lot has no prev; next = lot 2');
     r = await call('GET', `/lots/${lot4.id}`);
     ok(r.j && r.j.nav.next === null && r.j.nav.prev.id === lot3.id, 'nav: last lot has no next; prev = lot 4');
@@ -228,26 +225,28 @@ async function cleanup() {
     ok(!JSON.stringify(meA).includes(String(B_MAX2)) && !JSON.stringify(meC).includes(String(B_MAX2)) && !JSON.stringify(meC).includes(String(A_MAX)), "nobody's /me carries another buyer's max");
     ok((await call('GET', `/lots/${lot0.id}/me`)).s === 401, '/me needs a login (401)');
 
-    console.log('\n== /lots/:id/bids: anonymised history ==');
-    const histAnon = (await call('GET', `/lots/${lot0.id}/bids`)).j;
-    const histA = (await call('GET', `/lots/${lot0.id}/bids`, tok(A))).j;
-    const histB = (await call('GET', `/lots/${lot0.id}/bids`, tok(B))).j;
-    const histC = (await call('GET', `/lots/${lot0.id}/bids`, tok(C))).j;
-    const view = h => h.bids.map(b => `${b.bidder} ${b.amount}`).join(' | ');
-    console.log('  anonymous:', view(histAnon)); console.log('  A:', view(histA)); console.log('  B:', view(histB));
-    ok(histAnon.bid_count === 4 && histAnon.bids.length === 4, `every bid counted like bid_count (4 rows, bid_count ${histAnon.bid_count})`);
-    ok(view(histAnon) === 'Bidder B 31.37 | Bidder A 24.41 | Bidder A 21.41 | Bidder A 1', 'newest first; each price under whoever HELD it (A held $21.41 and $24.41 although B submitted those bids)');
-    ok(view(histA) === 'Bidder B 31.37 | You 24.41 | You 21.41 | You 1' && view(histB) === 'You 31.37 | Bidder A 24.41 | Bidder A 21.41 | Bidder A 1' && view(histC) === view(histAnon),
-      'the same letters for everyone; "You" only for the caller\'s own');
-    ok(histAnon.bids[0].amount === P.current_bid, 'the newest amount is the current bid');
-    for (const [who, h] of [['anonymous', histAnon], ['A', histA], ['B', histB], ['C', histC]]) ok(leaks(h).length === 0, `${who}: no username, max or leader in the history (${leaks(h).join(', ') || 'clean'})`);
-    ok(histAnon.bids.every(b => JSON.stringify(Object.keys(b)) === '["amount","at","bidder","you"]'), 'each row is exactly amount, at, bidder, you');
-    // A row written before migration x (no leader recorded) is shown under its submitter, still anonymised.
+    console.log('\n== /lots/:id/bids: own bids only; the admin sees all ==');
+    ok((await call('GET', `/lots/${lot0.id}/bids`)).s === 401, 'no public bid list: anonymous 401 (the public sees the count on the lot)');
+    const own = async u => (await call('GET', `/lots/${lot0.id}/bids`, tok(u))).j;
+    const [hA, hB, hC] = [await own(A), await own(B), await own(C)];
+    const amounts = h => h.bids.map(b => b.amount).join(',');
+    console.log('  A:', amounts(hA), '| B:', amounts(hB), '| C:', amounts(hC));
+    ok(hA.scope === 'own' && amounts(hA) === String(A_MAX), `A sees only A's bid, as A's own max (${amounts(hA)})`);
+    ok(amounts(hB) === [B_MAX2, 23.41, B_MAX1].join(','), `B sees only B's three bids, newest first, each as B's max (${amounts(hB)})`);
+    ok(hC.bids.length === 0 && hA.bid_count === 4, "C (no bids here) sees none; bid_count is still the lot's 4");
+    ok(!JSON.stringify(hA).includes(String(B_MAX2)) && !JSON.stringify(hA).includes(B.username) && !JSON.stringify(hB).includes(String(A_MAX)) && !JSON.stringify(hB).includes(A.username),
+      "nobody's list carries the other bidder's name or max");
+    ok([hA, hB, hC].every(h => h.bids.every(b => JSON.stringify(Object.keys(b)) === '["at","amount","price"]')), "a buyer's row is exactly at, amount (their max), price");
+    const hAdmin = (await call('GET', `/lots/${lot0.id}/bids`, tok({ id: crypto.randomUUID(), username: 'whatthefind' }))).j;
+    const adminView = hAdmin.bids.map(b => `${b.bidder.slice(-1)}>${b.leader.slice(-1)} ${b.price}/${b.max}`).join(' | ');
+    console.log('  admin:', adminView);
+    ok(hAdmin.scope === 'all' && adminView === 'b>b 31.37/40.73 | b>a 24.41/23.41 | b>a 21.41/20.41 | a>a 1/30.37',
+      'the admin sees every bid: who submitted it, who held the lead at that price (migration x), its max');
+    // A row written before migrations x/y (no leader, no max) shows its price to its own bidder.
     await s.from('bids').insert({ auction_id: F.S.id, item_id: lot1.id, username: C.username, amount: 7 });
     await s.from('auction_items').update({ current_bid: 7, bid_count: 1 }).eq('id', lot1.id);
-    const legacy = (await call('GET', `/lots/${lot1.id}/bids`)).j;
-    ok(legacy.bids.length === 1 && legacy.bids[0].bidder === 'Bidder A' && leaks(legacy).length === 0, 'a pre-migration row: under its submitter, anonymised');
-    ok((await call('GET', `/lots/${lot1.id}/bids`, tok(C))).j.bids[0].bidder === 'You', '... and "You" for that submitter');
+    const legacy = (await call('GET', `/lots/${lot1.id}/bids`, tok(C))).j;
+    ok(legacy.bids.length === 1 && legacy.bids[0].amount === 7, 'a pre-migration row: its own bidder sees the price it set');
 
     console.log('\n== /lots/:id/related ==');
     const rel = (await call('GET', `/lots/${lot0.id}/related`)).j;
@@ -265,7 +264,8 @@ async function cleanup() {
 
     console.log('\n== drafts, unknown lots, slugs ==');
     for (const p of [`/lots/${F.DL[0].id}`, `/lots/${F.DL[0].id}/bids`, `/lots/${F.DL[0].id}/related`, `/lots/by-number/${rules.auctionSlug(F.D)}/1`]) {
-      const x = await call('GET', p);
+      // /bids needs a login first (401 anonymous, which says nothing about the draft); a buyer gets 404.
+      const x = await call('GET', p, p.endsWith('/bids') ? tok(A) : undefined);
       ok(x.s === 404, `draft: GET ${p.replace(F.DL[0].id, 'DL').replace(rules.auctionSlug(F.D), 'D-slug')} -> ${x.s}`);
     }
     for (const t of [tok(A), tok({ id: crypto.randomUUID(), username: 'whatthefind' })]) {

@@ -230,10 +230,21 @@ submitted it, everything else works).
 
 | Suite | Proves |
 |---|---|
-| `lot-page.js` | Shape; the premium line equals the invoice maths on every cent $0-$300 at three rates, and orders call the same function; the two one-tap amounts are exactly what the server accepts (a cent less refused) on every increment tier, cents included; proxy battles; each buyer's own status and max (`/me`), nobody else's; history: one row per bid (= `bid_count`), newest first, each price under whoever held it, "Bidder A/B" the same for everyone, "You" for the caller, no username/max/leader for anonymous, either buyer or a third; a pre-migration row falls back to its submitter; related (open lots, soonest first) and similar (other live auctions, title words, `[]` below 3); drafts 404 on every route for everyone; pickup town only; slugs (renamed title, full id, unknown). Exits 2 without migration x. |
+| `lot-page.js` | Shape; the premium line equals the invoice maths on every cent $0-$300 at three rates, and orders call the same function; the two one-tap amounts are exactly what the server accepts (a cent less refused) on every increment tier, cents included; proxy battles; each buyer's own status and max (`/me`), nobody else's; bids (since B7): no public list (401), each buyer only their own (their max), the admin every bid with bidder, leader and max; a pre-migration row shows its price; related (open lots, soonest first) and similar (other live auctions, title words, `[]` below 3); drafts 404 on every route for everyone; pickup town only; slugs (renamed title, full id, unknown). Exits 2 without migration x. |
 | `lot-page-frontend.js` | The frontend's slug equals the backend's; every lot link goes to the lot page; the room redirects `?lot=` (replace) and the old modal is gone; vercel.json sends link crawlers (not browsers or Lighthouse) to `api/lot-meta.js`, which adds the lot's title/photo/price (escaped) and nothing else, and the plain page for drafts, unknown lots and bad input; sample auctions end at 8:00 PM local and the sample lot page has the `/lots` shape. |
 | `secret-max.js` | Extended: `/lots/:id`, `/bids`, `/related` and the challenger's `/me` never carry the leader's max; the lot page and its history carry no username; the leader's own `/me` shows their own max. |
 | `preview-sample.js` | Updated: sample auctions end at 8:00 PM local (not "a lot inside the hour"); the lot page is the third file that lazy-loads the sample data. |
+
+**Hide bidders and the pickup address (B6 + B7)** (wtf-handoff `PRIVACY_BIDDERS_PICKUP_BRIEF.md`, 2026-09-30). One
+allow-list for public auction and lot rows (`public_view.js`) on every REST route and socket event. Needs migration
+`2026-09-30y-pickup-town-own-bid-max.sql` (after x; applied on wtf-test; **not yet on production**; before it
+everything works, the public simply sees no pickup town and a buyer's own bids show prices instead of their max).
+
+| Suite | Proves |
+|---|---|
+| `bidder-identity.js` | As anonymous and as a buyer who never bid, 14 public REST reads (x2), 7 of the other buyer's own reads and every socket event of a live-mode auction (state, activation, a bid, the end) are searched for both bidders' usernames and user ids, their maxes and every bidder key: none (54 payloads). The pinned commit `905066d` named them in 22 (auction rows, the bid list, lot rows, socket `new_bid`/`auction_ended`, the losing bid's answer). Each bidder sees only their own status, max and bids; sockets tell each viewer `you_lead`/`you_won` about themselves; the admin gets rows with names, the full lot history and the socket bid list. |
+| `pickup-address.js` | Anonymous, a losing bidder and a shipping winner never get the street (38 responses/socket states incl. terms, orders, bids); the public sees `pickup_town`. The pickup winner gets it on their order page and in their win email (Resend stubbed to a file); the shipping winner's email has the shipping wording; the loser gets none. Admin settings: town set/trimmed/80-char limit, buyers 403; publishing pickup needs a town. Pinned `905066d`: `/auction/:id` gave the street to anyone. Exits 2 without migration y. |
+| `lot-page.js`, `secret-max.js`, `lot-page-frontend.js` | Updated for the rules above (own bids only; the town column; no sample bid list). |
 
 **Rate limits and the suites.** `guard.js` sets `RATE_LIMIT_EXEMPT_LOOPBACK=1`, which the suites' local servers
 inherit, because a suite fires many logins and bids from localhost. The server honours it only for loopback

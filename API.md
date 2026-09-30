@@ -7,8 +7,13 @@ backend. Conventions for everything below:
 - **Money** is a number in dollars; the currency is always USD.
 - **No HTML** in any response. Descriptions are plain text.
 - **Lot number** shown to people = `position + 1`. It never changes as lots close.
-- **Never sent to the public:** another buyer's max bid (`top_pre_bid`), reserve prices, leading bidders on the
-  homepage, draft auctions or anything in them. Suites: `verification/secret-max.js`, `draft-reads.js`, `home.js`, `lot-page.js`.
+- **Never sent to the public:** anything that identifies a bidder (B7): no username, leader (`leading_bidder`),
+  `buyer_username`, `leader_username`, per-bid list, winner or "Bidder A/B"; no max (`top_pre_bid`, `max_amount`), no
+  reserve price, no pickup street address (`pickup_address`: the public gets `pickup_town`), no draft or anything in
+  one. The public sees a lot's current bid and bid count. Auction and lot rows go through ONE allow-list
+  (`public_view.js`) on every REST route and socket event; the admin/host get full rows. A buyer's own standing,
+  max and bids come only from their own authenticated calls. Suites: `verification/bidder-identity.js`,
+  `pickup-address.js`, `secret-max.js`, `draft-reads.js`, `home.js`, `lot-page.js`.
 - Errors are `{ "error": "<short sentence>" }` with a 4xx/5xx status, sometimes with a `code`.
 - **Photos** come as `image_url` (the full photo: use it on a lot's own page) and `thumb_url` (about 480px wide
   WebP, no metadata: use it for cards, rails, lists and small tiles). `thumb_url` is `null` when a photo has no
@@ -145,7 +150,7 @@ max-age=0, s-maxage=5` (browsers always revalidate; a shared cache may hold it 5
   "time": { "ends_at": "ISO", "soft_close_minutes": 2 },   // a bid inside the last N minutes moves ends_at to
                                                            //   N minutes after that bid (the live setting)
   "fulfilment": {
-    "pickup": { "free": true, "city": "Miami, FL" | null, "starts_at": "ISO" | null, "ends_at": "ISO" | null } | null,
+    "pickup": { "free": true, "town": "Miami, FL" | null, "starts_at": "ISO" | null, "ends_at": "ISO" | null } | null,
     "shipping": { "priced": "after_auction", "estimate": null, "carrier": "USPS", "country": "US" } | null
   },                                          // null = not offered by this auction. No lot has weight/size data,
                                               //   so shipping is never priced before the auction (estimate null).
@@ -160,14 +165,16 @@ The caller's own standing; never anyone else's. `no-store`.
 `{ "status": "winning" | "outbid" | "no_bid" | "won" | "lost" | "closed", "my_max": 90 | null, "min_bid": 66 | null }`.
 `min_bid` is what the caller may bid now (the leader may raise from the current price), null when not open.
 
-### `GET /lots/:id/bids` (login optional)
+### `GET /lots/:id/bids` (login)
 
-Anonymised history, newest first, `no-store`:
-`{ "bid_count": 5, "bids": [{ "amount": 66, "at": "ISO", "bidder": "Bidder B" | "You", "you": false }] }`.
-One row per bid that moved the price (exactly `bid_count` rows; a leader raising their own max adds none). Each row
-is under whoever HELD the lead at that price (migration x records it; older rows fall back to the bidder who
-submitted). Letters go by first appearance on this lot and are the same for everyone; the caller's own rows say
-"You". Never a username, never a max: every amount was the public current bid at that moment.
+There is no public bid list (B7): 401 without a login; the public sees `price.bid_count`. Newest first, `no-store`.
+
+- A buyer gets **only their own** bids: `{ "scope": "own", "bid_count": 5, "bids": [{ "at": "ISO", "amount": 90,
+  "price": 66 }] }`. `amount` is the max they entered with that bid (migration y; before it, and for older rows, the
+  price the bid produced); `price` is the lot's price right after it. A leader raising their own max adds no row
+  (their current max is `my_max` in `/lots/:id/me`).
+- The admin gets every bid: `{ "scope": "all", "bid_count": 5, "bids": [{ "at", "price", "bidder": "username",
+  "leader": "username" | null, "max": 90 | null }] }`. `leader` = who held the lead at that price (migration x).
 
 ### `GET /lots/:id/related` (no login)
 
@@ -178,10 +185,25 @@ OTHER live auctions sharing at least one title word (the auction category only b
 
 ## Existing public reads the homepage links to
 
-- `GET /auctions` — published auctions (drafts only for the admin). Each has `thumb_url` for its cover.
-- `GET /auction/:id` — one auction (404 for a draft unless admin).
-- `GET /auction/:id/items/standard-status` (and `/auction/:id/items`) — every lot in a standard auction, maxes and
-  reserves stripped; each lot has `thumb_url` for grid cards.
+- `GET /auctions` — published auctions (drafts only for the admin). Each has `thumb_url` for its cover. Public
+  auction fields: `id, title, description, image_url, thumb_url, category, starting_bid, current_bid, status,
+  starts_at, ends_at, mode, host_username, created_at, buyers_premium_pct, fulfillment_mode, pickup_town,
+  pickup_starts_at, pickup_ends_at` (the admin gets the full row, `pickup_address` included).
+- `GET /auction/:id` — one auction, the same public fields (404 for a draft unless admin).
+- `GET /auction/:id/items/standard-status` (and `/auction/:id/items`) — every lot in a standard auction. Public lot
+  fields: `id, auction_id, position, title, description, condition, image_url, thumb_url, starting_bid, current_bid,
+  bid_count, pre_bid_count, status, ends_at, created_at`; no leader, max or reserve (admin/host: full rows).
+- `GET /auction/:id/my-standing` (login) — the caller's own standing on every lot:
+  `{ "lots": { "<item id>": "winning" | "outbid" | "no_bid" | "won" | "lost" | "closed" } }`. The room's "You're
+  winning" / "You've been outbid" come from here, never from comparing a leader's name.
+- `GET /auction/:id/bids` — `{ "bid_count": 12 }` for everyone but the admin (who gets the rows).
+- `POST /auction/:id/items/:itemId/bid` — answers the public lot plus `your_status: "winning" | "outbid"` (never who
+  else leads or their max).
+- `GET /my-orders` — each order has `pickup: { address, town, starts_at, ends_at } | null`: the street address,
+  only on the caller's own won orders and only when they chose pickup (B6). The same address is in their win email.
+- Socket (live mode, gated off): `auction_state`, `item_activated`, `new_bid` and `auction_ended` carry no bidder;
+  each socket gets its own `you_lead` / `you_won`. `bid_history` goes to the admin only. Chat messages show
+  usernames by design (see OPEN_ITEMS; decide before live mode returns).
 - `GET /auction/:auctionId/items/:itemId/images` — a lot's photos, full size (the lot page now reads them from `GET /lots/:id`).
 
 ## Watch list, follows and reminders (login required unless noted)
