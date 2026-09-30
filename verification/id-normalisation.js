@@ -82,7 +82,9 @@ const socketTry = (port, event, payload, waitFor) => new Promise(resolve => {
       const nLow = await call(NEW, 'GET', p, adminTok), nUp = await call(NEW, 'GET', p.replace(X, X.toUpperCase()), adminTok), nBad = await call(NEW, 'GET', p.replace(X, 'not-a-uuid'), adminTok);
       const same = JSON.stringify(nLow.j) === JSON.stringify(nUp.j);
       const oldDiff = JSON.stringify(oLow.j) !== JSON.stringify(oUp.j);
-      ok(nLow.s === oLow.s && JSON.stringify(nLow.j) === JSON.stringify(oLow.j) && nUp.s === nLow.s && same && nBad.s === 400,
+      // Lot lists gained one field since the pinned commit (thumb_url, F1a photo thumbnails); set it aside, compare the rest.
+      const beforeF1a = j => Array.isArray(j) ? j.map(r => { if (!r || typeof r !== 'object') return r; const { thumb_url, ...rest } = r; return rest; }) : j;
+      ok(nLow.s === oLow.s && JSON.stringify(beforeF1a(nLow.j)) === JSON.stringify(oLow.j) && nUp.s === nLow.s && same && nBad.s === 400,
         `${p.replace(X, ':id').padEnd(40)} NEW lower ${nLow.s} = old lower ${oLow.s}; NEW UPPER == lower (${same}); garbage -> ${nBad.s}` + (oldDiff ? `   [old UPPER differed: ${oUp.s}, ${JSON.stringify(oUp.j).length}B vs ${JSON.stringify(oLow.j).length}B]` : ''));
     }
     const lotOfX = (await s.from('auction_items').select('id').eq('auction_id', X).limit(1)).data[0].id;
