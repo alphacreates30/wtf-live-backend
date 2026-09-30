@@ -2,7 +2,7 @@
 // pinned "before" server. Local servers on the test database; THROWAWAY rows only (ZZTEST_home*), always cleaned up.
 //
 //   /home    shape, ordering and limits of every rail; "live" includes an 'upcoming' auction whose start has passed;
-//            drafts, ended auctions, closed and past-their-end lots never appear; a lot carries exactly the nine public
+//            drafts, ended auctions, closed and past-their-end lots never appear; a lot carries exactly the ten public
 //            fields (no top_pre_bid, reserve_price or leading bidder, by key or by value); Most wanted is hidden below
 //            3 bid-on lots; the empty-site answer; the 10 s cache (server_now still fresh).
 //   /search  lot titles in live + upcoming auctions only; % and _ are literal; short/long queries.
@@ -25,7 +25,7 @@ const call = (url, path, { method = 'GET', body, headers = {} } = {}) => fetch(u
 const P = 'ZZTEST_home';
 const LEADER = 'zztest_home_leader';
 const TOP_MAX = 913.57, RESERVE = 821.39;            // distinctive: a substring search can't hit anything else
-const LOT_KEYS = ['auction_id', 'bid_count', 'current_bid', 'ends_at', 'id', 'image_url', 'position', 'status', 'title'];
+const LOT_KEYS = ['auction_id', 'bid_count', 'current_bid', 'ends_at', 'id', 'image_url', 'position', 'status', 'thumb_url', 'title'];   // thumb_url since F1a
 const min = m => new Date(Date.now() + m * 60e3).toISOString();
 const made = [];
 const lots = {};                                      // id -> fixture row, for computing the expected rails ourselves
@@ -127,8 +127,8 @@ const t = iso => Date.parse(iso);
       `premium_pct: each auction's own buyer's premium for every lot shown (A1 ${h.j.premium_pct[A1]}, A2 ${h.j.premium_pct[A2]}); nothing for the draft or ended one`);
     const f = h.j.featured || {};
     ok(f.id === A2 && f.status === 'live', `featured = the live auction ending soonest (A2), status live (${f.id === A2 ? 'A2' : f.id}, ${f.status})`);
-    ok(f.lot_count === 3 && Array.isArray(f.images) && f.images.length === 3 && new Set(f.images).size === 3 && f.images.every(u => u.startsWith('https://')),
-      `featured: lot_count 3, up to 5 distinct image URLs (${f.lot_count}, ${f.images && f.images.length})`);
+    ok(f.lot_count === 3 && Array.isArray(f.images) && f.images.length === 3 && new Set(f.images.map(i => i.url)).size === 3 && f.images.every(i => i.url.startsWith('https://') && 'thumb_url' in i),
+      `featured: lot_count 3, up to 5 distinct photos, each { url, thumb_url } (${f.lot_count}, ${f.images && f.images.length})`);
     ok(Object.keys(f).sort().join() === 'description,ends_at,id,images,lot_count,starts_at,status,title' && typeof f.description === 'string' && !/[<>]/.test(f.description),
       'featured: exactly the listed fields, plain-text description');
     const R = h.j.rails;
@@ -153,7 +153,7 @@ const t = iso => Date.parse(iso);
     let q = await call(fresh.url, '/search?q=' + encodeURIComponent(P + ' lot'));
     const got = new Set(q.j.lots.map(l => l.auction_id));
     ok(q.s === 200 && [A1, A2, A3, ...upcomingIds].every(id => got.has(id)) && !got.has(D) && !got.has(E), 'title search covers live and upcoming auctions, never the draft or the ended one');
-    ok(q.j.lots.every(l => typeof q.j.premium_pct[l.auction_id] === 'number') && !(D in q.j.premium_pct) && q.j.lots.length <= 48 && q.j.lots.every(l => Object.keys(l).sort().join() === LOT_KEYS.join()) && !JSON.stringify(q.j).includes(String(TOP_MAX)), 'search results: same nine fields plus a premium for each auction, no max, max 48');
+    ok(q.j.lots.every(l => typeof q.j.premium_pct[l.auction_id] === 'number') && !(D in q.j.premium_pct) && q.j.lots.length <= 48 && q.j.lots.every(l => Object.keys(l).sort().join() === LOT_KEYS.join()) && !JSON.stringify(q.j).includes(String(TOP_MAX)), 'search results: same fields plus a premium for each auction, no max, max 48');
     q = await call(fresh.url, '/search?q=' + encodeURIComponent('0% mint'));
     ok(q.j.lots.length === 1 && q.j.lots[0].title.endsWith('100% mint'), `'%' is literal, not a wildcard (${q.j.lots.length} match)`);
     q = await call(fresh.url, '/search?q=' + encodeURIComponent('HOME LOT A2-1'));

@@ -14,7 +14,7 @@ const s = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 let fails = 0;
 const ok = (c, m) => { console.log((c ? 'PASS ' : 'FAIL ') + m); if (!c) fails++; };
 const OLD_COMMIT = '1e24469';
-const stored = [];
+const stored = [], fullUrls = [];
 
 // A JPEG with an APP1 Exif segment carrying a GPS IFD pointer (tag 0x8825) and a readable GPS marker.
 function withGpsExif(jpeg) {
@@ -26,7 +26,13 @@ function withGpsExif(jpeg) {
 const canvas = (w, h, alpha) => sharp({ create: { width: w, height: h, channels: alpha ? 4 : 3, background: alpha ? { r: 200, g: 60, b: 40, alpha: 0.5 } : { r: 200, g: 60, b: 40 } } });
 const hasGps = b => b.includes(Buffer.from('Exif')) && b.includes(Buffer.from([0x88, 0x25]));
 const upload = (url, tok, body, type) => fetch(url + '/upload-image', { method: 'POST', headers: { Authorization: 'Bearer ' + tok, 'Content-Type': type }, body })
-  .then(async r => { const j = await r.json().catch(() => ({})); if (j.url) stored.push(j.url.split('/item-images/')[1]); return { s: r.status, j }; });
+  .then(async r => {
+    const j = await r.json().catch(() => ({}));
+    // Since F1a an upload also stores a thumbnail and an image_thumbs row: clean those up too.
+    if (j.url) { stored.push(j.url.split('/item-images/')[1]); fullUrls.push(j.url); }
+    if (j.thumb_url) stored.push(j.thumb_url.split('/item-images/')[1]);
+    return { s: r.status, j };
+  });
 const fetchStored = async u => { const r = await fetch(u); return { type: r.headers.get('content-type'), buf: Buffer.from(await r.arrayBuffer()) }; };
 
 (async () => {
@@ -78,8 +84,10 @@ const fetchStored = async u => { const r = await fetch(u); return { type: r.head
   } finally {
     servers.forEach(x => x.stop());
     if (stored.length) await s.storage.from('item-images').remove(stored);
+    if (fullUrls.length) await s.from('image_thumbs').delete().in('url', fullUrls);   // no-op before migration v
     const still = [];
-    for (const p of stored) { const r = await s.storage.from('item-images').list(p.split('/')[0], { search: p.split('/')[1] }); if (r.data && r.data.length) still.push(p); }
+    for (const p of stored) { const i = p.lastIndexOf('/'); const r = await s.storage.from('item-images').list(p.slice(0, i), { search: p.slice(i + 1) }); if (r.data && r.data.length) still.push(p); }
+    still.push(...(((await s.from('image_thumbs').select('url').in('url', fullUrls)).data) || []).map(r => r.url));
     console.log(`\nleftover throwaway rows: ${still.length} (uploaded ${stored.length} test files, all deleted)`);
     if (still.length) fails++;
   }

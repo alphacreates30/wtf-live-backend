@@ -10,6 +10,9 @@ backend. Conventions for everything below:
 - **Never sent to the public:** another buyer's max bid (`top_pre_bid`), reserve prices, leading bidders on the
   homepage, draft auctions or anything in them. Suites: `verification/secret-max.js`, `draft-reads.js`, `home.js`.
 - Errors are `{ "error": "<short sentence>" }` with a 4xx/5xx status, sometimes with a `code`.
+- **Photos** come as `image_url` (the full photo: use it on a lot's own page) and `thumb_url` (about 480px wide
+  WebP, no metadata: use it for cards, rails, lists and small tiles). `thumb_url` is `null` when a photo has no
+  thumbnail yet (older uploads before the backfill, or a link outside our storage): **fall back to `image_url`**.
 
 "Live" below means an auction whose status is `live`, or `upcoming` with `starts_at` already passed (standard
 auctions open for bidding by the clock). "Upcoming" means published and `starts_at` still in the future.
@@ -26,7 +29,8 @@ No login. One call for the whole homepage. Same answer for everyone; cached per 
     "status": "live" | "upcoming",
     "starts_at": "ISO" | null, "ends_at": "ISO" | null,
     "lot_count": 34,
-    "images": ["https://…", "…"]              // up to 5, cover image first, then lots in lot order
+    "images": [{ "url": "https://…", "thumb_url": "https://…" | null }]
+                                              // up to 5, cover image first, then lots in lot order
   } | null,
   "premium_pct": { "<auction id>": 15 },       // each live/upcoming auction's own buyer's premium (%).
                                               //   Show it beside every bid: never a bare price (BRAND.md).
@@ -37,7 +41,7 @@ No login. One call for the whole homepage. Same answer for everyone; cached per 
     "first_bid":   [Lot]                      // open lots with no bids yet, soonest ends_at first
   },
   "upcoming": [                               // not started yet, soonest first, max 6
-    { "id", "title", "description", "starts_at", "ends_at", "image_url" }
+    { "id", "title", "description", "starts_at", "ends_at", "image_url", "thumb_url" }
   ]
 }
 ```
@@ -45,7 +49,8 @@ No login. One call for the whole homepage. Same answer for everyone; cached per 
 **Lot** (homepage and search), exactly these fields:
 
 ```jsonc
-{ "id": "uuid", "auction_id": "uuid", "position": 0, "title": "…", "image_url": "https://…" | null,
+{ "id": "uuid", "auction_id": "uuid", "position": 0, "title": "…",
+  "image_url": "https://…" | null, "thumb_url": "https://…" | null,
   "current_bid": 38, "bid_count": 9, "ends_at": "ISO", "status": "open" }
 ```
 
@@ -72,9 +77,16 @@ Body: `{ "email": "…", "website": "" }`. `website` is a honeypot: leave the fi
 - 429 after 5 sign-ups per IP per hour.
 - 503 before migration `2026-09-30u-drop-signups.sql` is applied.
 
+## `POST /upload-image` (admin)
+
+Raw image bytes (JPEG, PNG or WebP, 5 MB max). Re-encoded with no metadata, max 2400px; a ~480px WebP thumbnail
+is stored beside it (`<folder>/thumbs/<name>.webp`) and recorded. Answers `{ "url": "…", "thumb_url": "…" | null }`
+(`null` only if the thumbnail step failed; the photo itself is stored either way).
+
 ## Existing public reads the homepage links to
 
-- `GET /auctions` — published auctions (drafts only for the admin).
+- `GET /auctions` — published auctions (drafts only for the admin). Each has `thumb_url` for its cover.
 - `GET /auction/:id` — one auction (404 for a draft unless admin).
-- `GET /auction/:id/items/standard-status` — every lot in a standard auction, maxes and reserves stripped.
-- `GET /auction/:auctionId/items/:itemId/images` — a lot's photos.
+- `GET /auction/:id/items/standard-status` (and `/auction/:id/items`) — every lot in a standard auction, maxes and
+  reserves stripped; each lot has `thumb_url` for grid cards.
+- `GET /auction/:auctionId/items/:itemId/images` — a lot's photos, full size (the lot page).

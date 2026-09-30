@@ -13,6 +13,7 @@ const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const helmet = require('helmet');
 const sharp = require('sharp');
 const aiLots = require('./ai_lots');
+const { makeThumb, thumbPathFor } = require('./thumbs');
 
 const app = express();
 const server = http.createServer(app);
@@ -1551,7 +1552,7 @@ app.get('/auctions', optionalAuth, async (req, res) => {
   }
   const { data, error } = await query;
   if (error) return dbFailure(req, res, error);
-  res.json(data);
+  res.json(await withThumbs(data));
 });
 
 app.get('/auction/:id', optionalAuth, async (req, res) => {
@@ -3255,7 +3256,7 @@ app.get('/auction/:id/items', optionalAuth, async (req, res) => {
   const { data, error } = await supabase
     .from('auction_items').select('*').eq('auction_id', req.params.id).order('position', { ascending: true });
   if (error) return dbFailure(req, res, error);
-  res.json(canSeeLotMaxes(req.user, auction) ? data : data.map(hideLotMax));
+  res.json(await withThumbs(canSeeLotMaxes(req.user, auction) ? data : data.map(hideLotMax)));
 });
 
 app.post('/auction/:id/items', requireAdmin, async (req, res) => {
@@ -3497,7 +3498,7 @@ app.get('/auction/:id/items/standard-status', optionalAuth, async (req, res) => 
   }
   const { data, error } = await supabase.from('auction_items').select('*').eq('auction_id', req.params.id).order('position', { ascending: true });
   if (error) return res.status(500).json({ error: 'Failed to load items' });
-  res.json(canSeeLotMaxes(req.user, auction) ? data : data.map(hideLotMax));
+  res.json(await withThumbs(canSeeLotMaxes(req.user, auction) ? data : data.map(hideLotMax)));
 });
 
 // ---------------------------------------------------------------------------
@@ -3531,8 +3532,9 @@ const isoOrNull = v => (v ? new Date(v).toISOString() : null);
 // Premium is always shown beside a bid (BRAND.md), so every lot list carries its
 // auctions' own buyer's premium - keyed by auction id, the lot shape stays as it is.
 const premiumMap = auctions => Object.fromEntries((auctions || []).map(a => [a.id, a.buyers_premium_pct == null ? null : Number(a.buyers_premium_pct)]));
-const homeLot = l => ({
-  id: l.id, auction_id: l.auction_id, position: l.position, title: l.title, image_url: l.image_url || null,
+// thumb: from thumbsFor(). thumb_url null = no thumbnail yet; show image_url.
+const homeLot = thumb => l => ({
+  id: l.id, auction_id: l.auction_id, position: l.position, title: l.title, image_url: l.image_url || null, thumb_url: thumb(l.image_url),
   current_bid: Number(l.current_bid ?? 0), bid_count: l.bid_count ?? 0, ends_at: isoOrNull(l.ends_at), status: l.status,
 });
 
@@ -3569,25 +3571,30 @@ async function buildHome() {
       .select('image_url', { count: 'exact' }).eq('auction_id', pick.id).order('position', { ascending: true });
     if (lotsErr) throw lotsErr;
     const images = [...new Set([pick.image_url, ...(lots || []).map(l => l.image_url)].filter(Boolean))].slice(0, HOME_FEATURED_IMAGES);
+    const thumb = await thumbsFor(images);
     featured = {
       id: pick.id, title: pick.title, description: pick.description || '',
       status: auctionPhase(pick, nowMs), starts_at: isoOrNull(pick.starts_at), ends_at: isoOrNull(pick.ends_at),
-      lot_count: count ?? (lots || []).length, images,
+      lot_count: count ?? (lots || []).length,
+      images: images.map(url => ({ url, thumb_url: thumb(url) })),
     };
   }
 
   const wantedLots = (wanted.data || []).length >= MOST_WANTED_MIN_LOTS ? wanted.data : [];
+  const upcomingOut = upcoming.filter(a => a.starts_at).slice(0, HOME_UPCOMING_MAX);
+  const thumb = await thumbsFor([...(ending.data || []), ...wantedLots, ...(first.data || []), ...upcomingOut].map(x => x.image_url));
+  const lot = homeLot(thumb);
   return {
     featured,
     premium_pct: premiumMap(auctions),
     rails: {
-      ending_soon: (ending.data || []).map(homeLot),
-      most_wanted: wantedLots.map(homeLot),
-      first_bid: (first.data || []).map(homeLot),
+      ending_soon: (ending.data || []).map(lot),
+      most_wanted: wantedLots.map(lot),
+      first_bid: (first.data || []).map(lot),
     },
-    upcoming: upcoming.filter(a => a.starts_at).slice(0, HOME_UPCOMING_MAX).map(a => ({
+    upcoming: upcomingOut.map(a => ({
       id: a.id, title: a.title, description: a.description || '', starts_at: isoOrNull(a.starts_at), ends_at: isoOrNull(a.ends_at),
-      image_url: a.image_url || null,
+      image_url: a.image_url || null, thumb_url: thumb(a.image_url),
     })),
   };
 }
@@ -3629,7 +3636,7 @@ app.get('/search', async (req, res) => {
     .in('auction_id', ids).ilike('title', `%${likeExact(q)}%`)
     .order('ends_at', { ascending: true, nullsFirst: false }).order('position', { ascending: true }).limit(SEARCH_MAX);
   if (lotsErr) return dbFailure(req, res, lotsErr);
-  const found = (lots || []).map(homeLot), inResults = new Set(found.map(l => l.auction_id));
+  const found = (lots || []).map(homeLot(await thumbsFor((lots || []).map(l => l.image_url)))), inResults = new Set(found.map(l => l.auction_id));
   res.json({ server_now: new Date().toISOString(), q, lots: found, premium_pct: premiumMap(open.filter(a => inResults.has(a.id))) });
 });
 
@@ -3886,6 +3893,55 @@ async function reencodeUpload(buffer) {
   return { buffer: await out.toBuffer(), contentType: type[0], ext: type[1] };
 }
 
+// Thumbnails (F1a, migration v). Cards, rails, search results and the homepage
+// collage show a small WebP instead of the full photo; the lot page keeps the
+// full one. The recipe is in thumbs.js, shared with scripts/backfill-thumbs.js.
+// Stores the thumbnail and records full URL -> thumbnail URL. Never throws: a
+// photo without a thumbnail still works everywhere (the site falls back to the
+// full photo), so a failure here is logged, not passed on to the upload.
+async function storeThumb(fullPath, fullUrl, buffer) {
+  try {
+    const thumbPath = thumbPathFor(fullPath);
+    const { error: upErr } = await supabase.storage.from('item-images')
+      .upload(thumbPath, await makeThumb(buffer), { contentType: 'image/webp', upsert: true });
+    if (upErr) { console.error('thumbnail upload failed:', upErr.message); return null; }
+    const thumbUrl = supabase.storage.from('item-images').getPublicUrl(thumbPath).data.publicUrl;
+    const { error } = await supabase.from('image_thumbs').upsert({ url: fullUrl, thumb_url: thumbUrl }, { onConflict: 'url' });
+    if (error) {
+      // Before migration v there is nowhere to record it: remove the orphan file.
+      console.error('image_thumbs insert failed:', error.code, error.message);
+      await supabase.storage.from('item-images').remove([thumbPath]);
+      return null;
+    }
+    thumbCache.set(fullUrl, thumbUrl);
+    return thumbUrl;
+  } catch (e) {
+    console.error('thumbnail failed:', e.message);
+    return null;
+  }
+}
+
+// full URL -> thumbnail URL, for everything that shows photos as cards. A URL
+// with a thumbnail never changes it, so hits are cached for the life of the
+// process; misses are asked again (the backfill may have added one since).
+const thumbCache = new Map();
+const THUMB_CACHE_MAX = 20000;
+async function thumbsFor(urls) {
+  const want = [...new Set(urls.filter(u => typeof u === 'string' && u && !thumbCache.has(u)))];
+  for (let i = 0; i < want.length; i += 200) {
+    const { data, error } = await supabase.from('image_thumbs').select('url, thumb_url').in('url', want.slice(i, i + 200));
+    if (error) { if (error.code !== '42P01' && error.code !== 'PGRST205') console.error('image_thumbs read failed:', error.code, error.message); break; }
+    for (const r of data || []) { if (thumbCache.size >= THUMB_CACHE_MAX) thumbCache.clear(); thumbCache.set(r.url, r.thumb_url); }
+  }
+  return u => (u && thumbCache.get(u)) || null;
+}
+// Adds thumb_url beside image_url on each row (null = none yet: show image_url).
+async function withThumbs(rows) {
+  if (!Array.isArray(rows)) return rows;
+  const thumb = await thumbsFor(rows.map(r => r && r.image_url));
+  return rows.map(r => (r ? { ...r, thumb_url: thumb(r.image_url) } : r));
+}
+
 app.post('/upload-image', requireAdmin, express.raw({ type: 'image/*', limit: '5mb' }), async (req, res) => {
   try {
     const buffer = req.body;
@@ -3898,7 +3954,8 @@ app.post('/upload-image', requireAdmin, express.raw({ type: 'image/*', limit: '5
       .upload(filePath, img.buffer, { contentType: img.contentType, upsert: false });
     if (upErr) { console.error('upload-image: storage upload failed:', upErr.message); return res.status(500).json({ error: 'Upload failed' }); }
     const { data: { publicUrl } } = supabase.storage.from('item-images').getPublicUrl(filePath);
-    res.json({ url: publicUrl });
+    const thumbUrl = await storeThumb(filePath, publicUrl, img.buffer);
+    res.json({ url: publicUrl, thumb_url: thumbUrl });
   } catch (err) {
     console.error('upload-image failed:', err.message);
     res.status(500).json({ error: 'Upload failed' });

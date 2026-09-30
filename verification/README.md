@@ -194,6 +194,16 @@ process (`local-server.js` options `env`, `preload`, `patch`), so nothing leaves
 | `home.js` | `/home`: shape; featured = live auction ending soonest, else next upcoming, else null; every rail's order and 12-limit computed independently from the fixtures; an `upcoming` auction past its start counts as live; sold, unsold, past-its-end, upcoming-auction, draft and ended lots never in a rail; each lot exactly the nine public fields and no max/reserve/leader by key or value; Most wanted empty below 3 bid-on lots; upcoming max 6; the empty-site answer; the 10 s cache with a fresh `server_now`. `/search`: live + upcoming only, `%` literal, short/long queries. `/signup`: one lowercased row, identical answer for new / repeat / honeypot, 400 on bad addresses, 429 after 5 per IP per hour. Before migration u: 503 asserted, exit 2. |
 | `secret-max.js`, `draft-reads.js` | Extended: `/home` and `/search` carry the bid-on lot but never the leader's max, and never a draft's lot (anonymous, buyer, admin). |
 
+**Photo thumbnails (F1a)** (2026-09-30). Every upload also stores a ~480px WebP beside the photo and records it in
+`image_thumbs` (migration `2026-09-30v-image-thumbs.sql`: applied on wtf-test; **not yet on production**; before it,
+uploads work and every `thumb_url` is null, so the site shows full photos as before). Recipe in `thumbs.js`, shared with
+`scripts/backfill-thumbs.js` for photos uploaded earlier.
+
+| Suite | Proves |
+|---|---|
+| `thumbnails.js` | Upload: full photo + WebP thumbnail beside it, 480 wide, aspect kept, orientation applied, small photos not enlarged, PNG gets a WebP thumbnail, no EXIF/GPS in either file, mapping row written. Before migration v (server patched to a missing table): upload still works, `thumb_url` null, no orphan file. API: `thumb_url` on /home lots, featured images (`{ url, thumb_url }`), upcoming, /search, standard-status, items, /auctions; null with `image_url` unchanged when there's no thumbnail (fallback); the lot gallery stays full size. Backfill: `--dry-run` changes nothing; a raw GPS photo and a sideways-tagged gallery photo get clean, upright thumbnails; the full photo is never changed; external links skipped; a missing file reported and exit 1; /home picks the new thumbnail up with no restart; re-runs skip finished photos. Exits 2 without migration v. |
+| `upload-reencode.js`, `home.js` | Updated: clean up thumbnails and mapping rows too; a homepage lot is ten fields (plus `thumb_url`). |
+
 **Rate limits and the suites.** `guard.js` sets `RATE_LIMIT_EXEMPT_LOOPBACK=1`, which the suites' local servers
 inherit, because a suite fires many logins and bids from localhost. The server honours it only for loopback
 addresses. Production never sets it, and Railway traffic never arrives from loopback. `rate-limits.js` clears it.

@@ -1,5 +1,5 @@
 -- STEP u: homepage email sign-up ("wake me when it opens"), wtf-handoff HOMEPAGE_REFRESH_BRIEF.md section 4.
--- NOT YET APPLIED on production: Cowork applies it in the Supabase SQL editor. Idempotent.
+-- APPLIED on production by Cowork 2026-09-29 (SQL editor): rls_on=true, anon/authenticated no select/insert, service_role insert, 0 rows. Idempotent.
 -- Applied and verified on wtf-test 2026-09-30 (RLS on; anon/authenticated have no privileges; verification/home.js green).
 --
 --   drop_signups   one row per email address that asked to hear when the next collection opens.
