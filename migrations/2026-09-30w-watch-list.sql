@@ -1,5 +1,6 @@
 -- STEP w: watch list, followed auctions and reminder emails (F3, wtf-handoff WATCH_LIST_BRIEF.md).
--- NOT YET APPLIED on production: Cowork applies it in the Supabase SQL editor, after migration t (it redefines
+-- APPLIED on production by Cowork 2026-09-29 (SQL editor; byte-identical to this file; 4 tables RLS on, delete_account verified).
+-- Runs after migration t (it redefines
 -- delete_account). Idempotent. Applied and verified on wtf-test 2026-09-30 (its own checks passed; verification/watch-list.js
 -- and account-delete.js green).
 --
