@@ -215,6 +215,13 @@ uploads work and every `thumb_url` is null, so the site shows full photos as bef
 `scripts/send-test-reminder.js` sends ONE real reminder to the host's own address from wtf-test data (needs
 `RESEND_API_KEY` and `ADMIN_EMAIL` in `.env`); `--to-file out.html` writes it to a file instead.
 
+**Admin preview with sample auctions** (wtf-handoff `PREVIEW_MODE_BRIEF.md`, 2026-09-30). Frontend only: the samples
+are built in the browser for the admin; nothing is sent or stored.
+
+| Suite | Proves |
+|---|---|
+| `preview-sample.js` | The frontend's sample data (`../wtf-live-frontend/src/preview/sampleData.js`): every auction and lot title starts "Sample:", ids are "sample-..." (never a uuid), no photos, 0/1/3/5 open auctions build (one lot inside the hour, unbid lots, enough bids for Most wanted, three different end days). It is only loaded with `import()` by Home and Listings, preview is active only for the admin, and the preview code makes no API call. No "Sample:" auction or lot in the database, and no sample data in /home, /search or /auctions. Writes nothing. |
+
 **Rate limits and the suites.** `guard.js` sets `RATE_LIMIT_EXEMPT_LOOPBACK=1`, which the suites' local servers
 inherit, because a suite fires many logins and bids from localhost. The server honours it only for loopback
 addresses. Production never sets it, and Railway traffic never arrives from loopback. `rate-limits.js` clears it.
