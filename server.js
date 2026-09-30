@@ -3513,7 +3513,12 @@ app.get('/auction/:id/items/standard-status', optionalAuth, async (req, res) => 
 const HOME_LOT_FIELDS = 'id, auction_id, position, title, image_url, current_bid, bid_count, ends_at, status';
 const HOME_RAIL_MAX = 12;
 const HOME_UPCOMING_MAX = 6;
-const HOME_FEATURED_IMAGES = 5;
+const OPEN_AUCTION_IMAGES = 3;          // the card collage: 1 large + 2 small
+const BLURB_MAX = 90;
+const CLOSING_SCHEDULE_DAYS = 7;
+// The site's own time zone, for grouping "Closing this week" by day. Times are
+// sent as ISO (UTC); only the day grouping needs a zone.
+const SITE_TIMEZONE = process.env.SITE_TIMEZONE || 'America/New_York';
 // "Most wanted" is only worth showing once bidding is actually happening: a
 // rail of lots with one bid each reads as an empty room. Below this many lots
 // with bids the rail is sent empty, and an empty rail is hidden.
@@ -3533,10 +3538,47 @@ const isoOrNull = v => (v ? new Date(v).toISOString() : null);
 // auctions' own buyer's premium - keyed by auction id, the lot shape stays as it is.
 const premiumMap = auctions => Object.fromEntries((auctions || []).map(a => [a.id, a.buyers_premium_pct == null ? null : Number(a.buyers_premium_pct)]));
 // thumb: from thumbsFor(). thumb_url null = no thumbnail yet; show image_url.
-const homeLot = thumb => l => ({
-  id: l.id, auction_id: l.auction_id, position: l.position, title: l.title, image_url: l.image_url || null, thumb_url: thumb(l.image_url),
+// titles: auction id -> title, so a card can say which collection a lot is in.
+const homeLot = (thumb, titles = {}) => l => ({
+  id: l.id, auction_id: l.auction_id, auction_title: titles[l.auction_id] ?? null,
+  position: l.position, title: l.title, image_url: l.image_url || null, thumb_url: thumb(l.image_url),
   current_bid: Number(l.current_bid ?? 0), bid_count: l.bid_count ?? 0, ends_at: isoOrNull(l.ends_at), status: l.status,
 });
+
+// One line for an auction card: the description's first sentence, plain text,
+// at most BLURB_MAX characters (cut at a word, with an ellipsis). The full story
+// lives on the auction's own page.
+function blurbOf(description) {
+  const text = String(description || '')
+    .replace(/<[^>]*>/g, ' ')              // any HTML
+    .replace(/[*_#>`[\]]+/g, '')            // markdown marks
+    .replace(/\s+/g, ' ')
+    .replace(/ ([,.;:!?])/g, '$1')          // a removed tag can leave "word :"
+    .trim();
+  if (!text) return '';
+  const first = (text.match(/^.+?[.!?](?=\s|$)/) || [text])[0];
+  if (first.length <= BLURB_MAX) return first;
+  const cut = first.slice(0, BLURB_MAX - 1);
+  const space = cut.lastIndexOf(' ');
+  return (space > 40 ? cut.slice(0, space) : cut).replace(/[,;:\s]+$/, '') + '…';
+}
+const siteDate = (() => {
+  const fmt = new Intl.DateTimeFormat('en-CA', { timeZone: SITE_TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit' });
+  return t => fmt.format(new Date(t));   // YYYY-MM-DD in the site's zone
+})();
+
+// Every lot row of the given auctions, few columns, paged past PostgREST's 1000.
+async function lotsOf(auctionIds, columns) {
+  const out = [];
+  if (!auctionIds.length) return out;
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await supabase.from('auction_items').select(columns)
+      .in('auction_id', auctionIds).order('auction_id').order('position').range(from, from + 999);
+    if (error) throw error;
+    out.push(...data);
+    if (data.length < 1000) return out;
+  }
+}
 
 async function buildHome() {
   const nowMs = Date.now(), now = new Date(nowMs).toISOString();
@@ -3547,6 +3589,7 @@ async function buildHome() {
   const live = [], upcoming = [];
   for (const a of auctions || []) (auctionPhase(a, nowMs) === 'live' ? live : upcoming).push(a);
   const liveIds = live.map(a => a.id);
+  const titles = Object.fromEntries((auctions || []).map(a => [a.id, a.title]));
 
   // One query per rail. auction_items is indexed on ends_at and on (auction_id, status).
   const openLots = () => supabase.from('auction_items').select(HOME_LOT_FIELDS)
@@ -3558,34 +3601,60 @@ async function buildHome() {
   ]) : [{ data: [] }, { data: [] }, { data: [] }];
   for (const r of [ending, wanted, first]) if (r.error) throw r.error;
 
-  // Featured: the live auction ending soonest (no end date sorts last), else
-  // the next to open, else nothing.
-  const byEnd = (a, b) => (a.ends_at ? Date.parse(a.ends_at) : Infinity) - (b.ends_at ? Date.parse(b.ends_at) : Infinity);
-  const byStart = (a, b) => (a.starts_at ? Date.parse(a.starts_at) : Infinity) - (b.starts_at ? Date.parse(b.starts_at) : Infinity);
-  live.sort(byEnd);
-  upcoming.sort(byStart);
-  const pick = live[0] || upcoming[0] || null;
-  let featured = null;
-  if (pick) {
-    const { data: lots, count, error: lotsErr } = await supabase.from('auction_items')
-      .select('image_url', { count: 'exact' }).eq('auction_id', pick.id).order('position', { ascending: true });
-    if (lotsErr) throw lotsErr;
-    const images = [...new Set([pick.image_url, ...(lots || []).map(l => l.image_url)].filter(Boolean))].slice(0, HOME_FEATURED_IMAGES);
-    const thumb = await thumbsFor(images);
-    featured = {
-      id: pick.id, title: pick.title, description: pick.description || '',
-      status: auctionPhase(pick, nowMs), starts_at: isoOrNull(pick.starts_at), ends_at: isoOrNull(pick.ends_at),
-      lot_count: count ?? (lots || []).length,
-      images: images.map(url => ({ url, thumb_url: thumb(url) })),
-    };
+  // Open auctions: lot counts, closing times and collage photos, from one pass
+  // over their lots (a few columns each). An open lot: not sold/unsold, not past its end.
+  const allLots = await lotsOf(liveIds, 'auction_id, position, image_url, ends_at, status');
+  const per = Object.fromEntries(liveIds.map(id => [id, { count: 0, first: null, last: null, photos: [], closes: [] }]));
+  for (const l of allLots) {
+    const p = per[l.auction_id];
+    p.count++;
+    if (l.image_url && p.photos.length <= OPEN_AUCTION_IMAGES) p.photos.push(l.image_url);
+    const t = l.ends_at ? Date.parse(l.ends_at) : NaN;
+    if (['sold', 'unsold'].includes(l.status) || !(t > nowMs)) continue;
+    if (p.first === null || t < p.first) p.first = t;
+    if (p.last === null || t > p.last) p.last = t;
+    p.closes.push(t);
   }
+  // Soonest ending first: the auction's own end, else its last open lot's.
+  const endOf = a => (a.ends_at ? Date.parse(a.ends_at) : per[a.id].last ?? Infinity);
+  live.sort((a, b) => endOf(a) - endOf(b));
+  upcoming.sort((a, b) => (a.starts_at ? Date.parse(a.starts_at) : Infinity) - (b.starts_at ? Date.parse(b.starts_at) : Infinity));
 
+  const collage = Object.fromEntries(live.map(a => [a.id, [...new Set([a.image_url, ...per[a.id].photos].filter(Boolean))].slice(0, OPEN_AUCTION_IMAGES)]));
   const wantedLots = (wanted.data || []).length >= MOST_WANTED_MIN_LOTS ? wanted.data : [];
   const upcomingOut = upcoming.filter(a => a.starts_at).slice(0, HOME_UPCOMING_MAX);
-  const thumb = await thumbsFor([...(ending.data || []), ...wantedLots, ...(first.data || []), ...upcomingOut].map(x => x.image_url));
-  const lot = homeLot(thumb);
+  const thumb = await thumbsFor([...(ending.data || []), ...wantedLots, ...(first.data || []), ...upcomingOut]
+    .map(x => x.image_url).concat(...Object.values(collage)));
+  const lot = homeLot(thumb, titles);
+
+  // "Closing this week": one entry per auction per day (in the site's zone) on
+  // which some of its lots close, for the next CLOSING_SCHEDULE_DAYS days.
+  const horizon = nowMs + CLOSING_SCHEDULE_DAYS * 86400e3;
+  const closing_schedule = [];
+  for (const a of live) {
+    const byDay = new Map();
+    for (const t of per[a.id].closes) {
+      if (t > horizon) continue;
+      const d = siteDate(t), e = byDay.get(d);
+      if (!e) byDay.set(d, { first: t, last: t }); else { e.first = Math.min(e.first, t); e.last = Math.max(e.last, t); }
+    }
+    for (const [date, e] of byDay) closing_schedule.push({ date, auction_id: a.id, title: a.title, first_close: isoOrNull(e.first), last_close: isoOrNull(e.last) });
+  }
+  closing_schedule.sort((x, y) => Date.parse(x.first_close) - Date.parse(y.first_close));
+
   return {
-    featured,
+    timezone: SITE_TIMEZONE,
+    open_auctions: live.map(a => {
+      const p = per[a.id];
+      return {
+        id: a.id, title: a.title, blurb: blurbOf(a.description), lot_count: p.count,
+        starts_at: isoOrNull(a.starts_at), ends_at: isoOrNull(a.ends_at ?? p.last),
+        first_lot_ends_at: isoOrNull(p.first), last_lot_ends_at: isoOrNull(p.last),
+        buyers_premium_pct: a.buyers_premium_pct == null ? null : Number(a.buyers_premium_pct),
+        images: collage[a.id].map(url => ({ url, thumb_url: thumb(url) })),
+      };
+    }),
+    closing_schedule,
     premium_pct: premiumMap(auctions),
     rails: {
       ending_soon: (ending.data || []).map(lot),
@@ -3593,7 +3662,8 @@ async function buildHome() {
       first_bid: (first.data || []).map(lot),
     },
     upcoming: upcomingOut.map(a => ({
-      id: a.id, title: a.title, description: a.description || '', starts_at: isoOrNull(a.starts_at), ends_at: isoOrNull(a.ends_at),
+      id: a.id, title: a.title, blurb: blurbOf(a.description),
+      starts_at: isoOrNull(a.starts_at), ends_at: isoOrNull(a.ends_at),
       image_url: a.image_url || null, thumb_url: thumb(a.image_url),
     })),
   };
@@ -3628,7 +3698,7 @@ app.get('/search', async (req, res) => {
   if (q.length < 2) return res.json({ server_now: new Date().toISOString(), q, lots: [], premium_pct: {} });
   if (q.length > 100) return res.status(400).json({ error: 'Search is too long' });
   const nowMs = Date.now();
-  const { data: auctions, error } = await supabase.from('auctions').select('id, status, starts_at, buyers_premium_pct').in('status', ['live', 'upcoming']);
+  const { data: auctions, error } = await supabase.from('auctions').select('id, title, status, starts_at, buyers_premium_pct').in('status', ['live', 'upcoming']);
   if (error) return dbFailure(req, res, error);
   const open = (auctions || []).filter(a => auctionPhase(a, nowMs)), ids = open.map(a => a.id);
   if (!ids.length) return res.json({ server_now: new Date().toISOString(), q, lots: [], premium_pct: {} });
@@ -3636,7 +3706,8 @@ app.get('/search', async (req, res) => {
     .in('auction_id', ids).ilike('title', `%${likeExact(q)}%`)
     .order('ends_at', { ascending: true, nullsFirst: false }).order('position', { ascending: true }).limit(SEARCH_MAX);
   if (lotsErr) return dbFailure(req, res, lotsErr);
-  const found = (lots || []).map(homeLot(await thumbsFor((lots || []).map(l => l.image_url)))), inResults = new Set(found.map(l => l.auction_id));
+  const titles = Object.fromEntries(open.map(a => [a.id, a.title]));
+  const found = (lots || []).map(homeLot(await thumbsFor((lots || []).map(l => l.image_url)), titles)), inResults = new Set(found.map(l => l.auction_id));
   res.json({ server_now: new Date().toISOString(), q, lots: found, premium_pct: premiumMap(open.filter(a => inResults.has(a.id))) });
 });
 

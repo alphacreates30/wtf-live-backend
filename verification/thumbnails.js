@@ -5,7 +5,7 @@
 //             full URL -> thumbnail URL, returns both. Neither file has EXIF/GPS; orientation is applied; a small
 //             photo is not enlarged; a PNG still gets a WebP thumbnail.
 //   before v  (server patched to a missing table): uploads still work, thumb_url null, no orphan thumbnail file.
-//   API       /home (rails, featured images, upcoming), /search, the auction room's lot lists and /auctions carry
+//   API       /home (rails, open auctions' images, upcoming), /search, the auction room's lot lists and /auctions carry
 //             thumb_url; a photo with no thumbnail gets thumb_url null and keeps image_url (the fallback).
 //   backfill  scripts/backfill-thumbs.js: --dry-run changes nothing; a real run makes the thumbnail for a photo
 //             stored raw (EXIF GPS + orientation tag) with no metadata and the orientation applied; skips links
@@ -122,13 +122,14 @@ const at = m => new Date(Date.now() + m * 60e3).toISOString();
 
       const h = await call(srv.url, '/home');
       const e = byPos(h.rails.ending_soon);
-      ok(Object.keys(e[0]).sort().join() === 'auction_id,bid_count,current_bid,ends_at,id,image_url,position,status,thumb_url,title', 'a /home lot is the nine public fields plus thumb_url');
+      ok(Object.keys(e[0]).sort().join() === 'auction_id,auction_title,bid_count,current_bid,ends_at,id,image_url,position,status,thumb_url,title', 'a /home lot is the public fields plus thumb_url (and auction_title)');
       ok(e[0].thumb_url === withThumbThumb && e[0].image_url === withThumb, 'lot with a thumbnail: thumb_url set, image_url still the full photo');
       ok(e[1].thumb_url === null && e[1].image_url === rawUrl && e[2].thumb_url === null && e[2].image_url === null && e[3].thumb_url === null && e[3].image_url === externalUrl,
         'no thumbnail yet / no photo / external link: thumb_url null, image_url unchanged (the site falls back to it)');
-      const fimg = (h.featured || {}).images || [];
-      ok(h.featured && h.featured.id === A && fimg[0] && fimg[0].url === withThumb && fimg[0].thumb_url === withThumbThumb && fimg.every(i => Object.keys(i).sort().join() === 'thumb_url,url'),
-        `featured.images are { url, thumb_url } (${fimg.length}; first has its thumbnail)`);
+      const oa = (h.open_auctions || []).find(x => x.id === A) || {};
+      const fimg = oa.images || [];
+      ok(oa.id === A && fimg[0] && fimg[0].url === withThumb && fimg[0].thumb_url === withThumbThumb && fimg.every(i => Object.keys(i).sort().join() === 'thumb_url,url'),
+        `open_auctions[].images are { url, thumb_url } (${fimg.length}; first has its thumbnail)`);
       const up = h.upcoming.find(a => a.id === U);
       ok(up && up.image_url === rawUrl && 'thumb_url' in up && up.thumb_url === null, 'upcoming auctions carry thumb_url too (null here: no thumbnail yet)');
       const q = await call(srv.url, '/search?q=' + encodeURIComponent('ZZTEST_thumbs lot'));

@@ -25,7 +25,7 @@ const call = (url, path, { method = 'GET', body, headers = {} } = {}) => fetch(u
 const P = 'ZZTEST_home';
 const LEADER = 'zztest_home_leader';
 const TOP_MAX = 913.57, RESERVE = 821.39;            // distinctive: a substring search can't hit anything else
-const LOT_KEYS = ['auction_id', 'bid_count', 'current_bid', 'ends_at', 'id', 'image_url', 'position', 'status', 'thumb_url', 'title'];   // thumb_url since F1a
+const LOT_KEYS = ['auction_id', 'auction_title', 'bid_count', 'current_bid', 'ends_at', 'id', 'image_url', 'position', 'status', 'thumb_url', 'title'];   // thumb_url since F1a, auction_title since Design B
 const min = m => new Date(Date.now() + m * 60e3).toISOString();
 const made = [];
 const lots = {};                                      // id -> fixture row, for computing the expected rails ourselves
@@ -72,24 +72,28 @@ const t = iso => Date.parse(iso);
       console.log(`SKIP empty-site check: wtf-test already has ${others.length} live/upcoming auction(s)`);
     } else {
       const h = await call(fresh.url, '/home');
-      ok(h.s === 200 && h.j.featured === null && h.j.upcoming.length === 0 && Object.values(h.j.rails).every(r => Array.isArray(r) && r.length === 0),
-        'empty site: featured null, every rail and upcoming empty');
+      ok(h.s === 200 && h.j.open_auctions.length === 0 && h.j.closing_schedule.length === 0 && h.j.upcoming.length === 0 && Object.values(h.j.rails).every(r => Array.isArray(r) && r.length === 0),
+        'empty site: no open auctions, no closing schedule, every rail and upcoming empty');
       ok(Math.abs(t(h.j.server_now) - Date.now()) < 5000, `empty site: server_now is the server's ISO time (${h.j.server_now})`);
       const q = await call(fresh.url, '/search?q=anything');
       ok(q.s === 200 && q.j.lots.length === 0, 'empty site: search answers an empty list');
     }
 
     // ---- Fixtures ----
-    // A1 live, ends in 5h: 15 open lots (every 4th unbid), plus a sold, an unsold, a past-its-end lot, and "100% mint".
-    const A1 = await mkAuction('A1 live', 'live', { ends_at: min(300) });
+    // Three open auctions ending on different days: A2 in 2h, A3 in 10h, A1 in 2 days.
+    // A1: 15 open lots (every 4th unbid), a sold, an unsold, a past-its-end lot, "100% mint", and a lot closing in 2 days.
+    // Its description has HTML and a long first sentence, for the one-line blurb.
+    const A1 = await mkAuction('A1 live', 'live', { ends_at: min(60 * 48 + 60),
+      description: '<p>Forty years of <b>Universal Monsters</b>: Sideshow figures, resin statues and garage kits, all kept in one basement since 1986.</p> Second sentence.' });
     await mkLots(A1, [
       ...Array.from({ length: 15 }, (_, i) => ({ name: `a1-${i}`, ends_at: min(60 + i * 5), bid_count: i % 4 === 0 ? 0 : i, current_bid: i % 4 === 0 ? 0 : i * 3 })),
       { name: 'a1-sold', status: 'sold', ends_at: min(-30), bid_count: 50, current_bid: 500 },
       { name: 'a1-unsold', status: 'unsold', ends_at: min(-30), bid_count: 0, current_bid: 0 },
       { name: 'a1-past-end', ends_at: min(-1), bid_count: 40, current_bid: 400 },
       { name: '100% mint', ends_at: min(200), bid_count: 0, current_bid: 0 },
+      { name: 'a1-late', ends_at: min(60 * 48), bid_count: 5, current_bid: 20 },
     ]);
-    // A2 live, ends in 2h (the featured one): 3 unbid lots ending in 30 min.
+    // A2 live, ends in 2h (soonest): 3 unbid lots ending in 30 min.
     const A2 = await mkAuction('A2 live', 'live', { ends_at: min(120), buyers_premium_pct: 12.5 });
     await mkLots(A2, [0, 1, 2].map(i => ({ name: `a2-${i}`, ends_at: min(30), bid_count: 0, current_bid: 0 })));
     // A3 'upcoming' but its start has passed: bidding is open, so it counts as live.
@@ -121,16 +125,38 @@ const t = iso => Date.parse(iso);
     console.log('\n== GET /home ==');
     const h = await call(fresh.url, '/home');
     ok(h.s === 200, `200 (${h.s})`);
-    ok(Object.keys(h.j).sort().join() === 'featured,premium_pct,rails,server_now,upcoming' && Object.keys(h.j.rails).sort().join() === 'ending_soon,first_bid,most_wanted',
-      'top-level shape: server_now, featured, premium_pct, rails { ending_soon, most_wanted, first_bid }, upcoming');
+    ok(Object.keys(h.j).sort().join() === 'closing_schedule,open_auctions,premium_pct,rails,server_now,timezone,upcoming' && Object.keys(h.j.rails).sort().join() === 'ending_soon,first_bid,most_wanted',
+      'top-level shape: server_now, timezone, open_auctions, closing_schedule, premium_pct, rails { ending_soon, most_wanted, first_bid }, upcoming');
     ok(all0(h.j).every(l => typeof h.j.premium_pct[l.auction_id] === 'number') && h.j.premium_pct[A2] === 12.5 && h.j.premium_pct[A1] === 15 && !(D in h.j.premium_pct) && !(E in h.j.premium_pct),
       `premium_pct: each auction's own buyer's premium for every lot shown (A1 ${h.j.premium_pct[A1]}, A2 ${h.j.premium_pct[A2]}); nothing for the draft or ended one`);
-    const f = h.j.featured || {};
-    ok(f.id === A2 && f.status === 'live', `featured = the live auction ending soonest (A2), status live (${f.id === A2 ? 'A2' : f.id}, ${f.status})`);
-    ok(f.lot_count === 3 && Array.isArray(f.images) && f.images.length === 3 && new Set(f.images.map(i => i.url)).size === 3 && f.images.every(i => i.url.startsWith('https://') && 'thumb_url' in i),
-      `featured: lot_count 3, up to 5 distinct photos, each { url, thumb_url } (${f.lot_count}, ${f.images && f.images.length})`);
-    ok(Object.keys(f).sort().join() === 'description,ends_at,id,images,lot_count,starts_at,status,title' && typeof f.description === 'string' && !/[<>]/.test(f.description),
-      'featured: exactly the listed fields, plain-text description');
+    // Open auctions, from the fixtures: soonest ending first; counts and closing times of OPEN lots.
+    const OA = h.j.open_auctions;
+    ok(JSON.stringify(OA.map(a => a.id)) === JSON.stringify([A2, A3, A1]), `open_auctions: every live auction (A3 started-but-"upcoming" too), soonest ending first (${OA.map(a => ({ [A1]: 'A1', [A2]: 'A2', [A3]: 'A3' })[a.id] || '?').join(', ')})`);
+    ok(OA.every(a => Object.keys(a).sort().join() === 'blurb,buyers_premium_pct,ends_at,first_lot_ends_at,id,images,last_lot_ends_at,lot_count,starts_at,title'),
+      'each open auction: exactly id, title, blurb, lot_count, starts_at, ends_at, first/last_lot_ends_at, buyers_premium_pct, images');
+    const oa = Object.fromEntries(OA.map(a => [a.id, a]));
+    const openOf = id => open.filter(l => l.auction_id === id).map(l => t(l.ends_at));
+    ok(oa[A1].lot_count === 20 && oa[A2].lot_count === 3 && oa[A3].lot_count === 1, `lot_count counts every lot (A1 ${oa[A1].lot_count}, A2 ${oa[A2].lot_count}, A3 ${oa[A3].lot_count})`);
+    ok([A1, A2, A3].every(id => t(oa[id].first_lot_ends_at) === Math.min(...openOf(id)) && t(oa[id].last_lot_ends_at) === Math.max(...openOf(id))),
+      'first/last_lot_ends_at: earliest and latest close among the open lots (closed and past-their-end lots ignored)');
+    ok(oa[A1].blurb === 'Forty years of Universal Monsters: Sideshow figures, resin statues and garage kits, all…' && oa[A1].blurb.length <= 90 && oa[A2].blurb.endsWith('story for A2 live.'),
+      `blurb: first sentence, plain text, max 90 characters ("${oa[A1].blurb}")`);
+    ok(oa[A2].buyers_premium_pct === 12.5 && oa[A1].buyers_premium_pct === 15, 'buyers_premium_pct: each auction\'s own');
+    ok(OA.every(a => a.images.length <= 3 && a.images.every(i => Object.keys(i).sort().join() === 'thumb_url,url' && i.url.startsWith('https://'))) && oa[A1].images.length === 3,
+      `images: at most 3 per auction, each { url, thumb_url } (A1 ${oa[A1].images.length}, A2 ${oa[A2].images.length})`);
+    // Closing schedule, computed here in the zone the server says it uses.
+    const dayOf = ms => new Intl.DateTimeFormat('en-CA', { timeZone: h.j.timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(ms));
+    const expSched = [];
+    for (const id of [A1, A2, A3]) {
+      const days = {};
+      for (const ms of openOf(id).filter(ms => ms <= Date.now() + 7 * 86400e3)) (days[dayOf(ms)] = days[dayOf(ms)] || []).push(ms);
+      for (const [date, ms] of Object.entries(days)) expSched.push(`${date}|${id}|${Math.min(...ms)}|${Math.max(...ms)}`);
+    }
+    const gotSched = h.j.closing_schedule.map(e => `${e.date}|${e.auction_id}|${t(e.first_close)}|${t(e.last_close)}`);
+    ok(h.j.timezone === 'America/New_York' && JSON.stringify([...gotSched].sort()) === JSON.stringify([...expSched].sort()) && sorted(h.j.closing_schedule, (a, b) => t(a.first_close) - t(b.first_close)),
+      `closing_schedule: one entry per auction per day its lots close (site time zone ${h.j.timezone}), soonest first (${gotSched.length} entries; A1 spans ${h.j.closing_schedule.filter(e => e.auction_id === A1).length} days)`);
+    ok(h.j.closing_schedule.every(e => Object.keys(e).sort().join() === 'auction_id,date,first_close,last_close,title' && /^\d{4}-\d{2}-\d{2}$/.test(e.date) && e.title === oa[e.auction_id].title),
+      'closing_schedule entries: exactly date (YYYY-MM-DD), auction_id, title, first_close, last_close');
     const R = h.j.rails;
     ok(JSON.stringify(R.ending_soon.map(l => l.id)) === JSON.stringify(expEnding), `ending_soon: open lots in live auctions, soonest first, max 12 (${R.ending_soon.length})`);
     ok(R.ending_soon[0] && R.ending_soon[0].auction_id === A3, 'ending_soon: a started-but-still-"upcoming" auction counts as live (its lot leads)');
@@ -138,6 +164,7 @@ const t = iso => Date.parse(iso);
     ok(JSON.stringify(R.first_bid.map(l => l.id)) === JSON.stringify(expFirst) && R.first_bid.every(l => l.bid_count === 0), `first_bid: unbid open lots, soonest first (${R.first_bid.length})`);
     ok(sorted(R.ending_soon, (a, b) => t(a.ends_at) - t(b.ends_at)) && sorted(R.most_wanted, (a, b) => b.bid_count - a.bid_count), 'rails are in order');
     const all = [...R.ending_soon, ...R.most_wanted, ...R.first_bid];
+    ok(all.every(l => l.auction_title === oa[l.auction_id].title), 'every rail lot carries its auction\'s title');
     ok(!all.some(l => excluded.includes(l.id)), 'no sold, unsold, past-its-end, upcoming-auction, draft or ended lot in any rail');
     ok(all.every(l => Object.keys(l).sort().join() === LOT_KEYS.join()), 'every lot carries exactly: ' + LOT_KEYS.join(', '));
     ok(all.every(l => typeof l.current_bid === 'number' && Number.isInteger(l.position) && !isNaN(t(l.ends_at)) && l.ends_at.endsWith('Z')), 'money is a number, position an integer, dates ISO');
@@ -187,8 +214,8 @@ const t = iso => Date.parse(iso);
     for (const id of [A1, A2, A3]) await s.rpc('delete_auction_cascade', { p_auction_id: id });
     made.splice(made.indexOf(A1), 3);
     const up = await call(fresh.url, '/home');
-    ok(up.j.featured && up.j.featured.id === upcomingIds[6] && up.j.featured.status === 'upcoming' && Object.values(up.j.rails).every(r => r.length === 0),
-      'no live auction: featured is the next to open (status upcoming), rails empty (upcoming lots never go in them)');
+    ok(up.j.open_auctions.length === 0 && up.j.closing_schedule.length === 0 && up.j.upcoming[0] && up.j.upcoming[0].id === upcomingIds[6] && Object.values(up.j.rails).every(r => r.length === 0),
+      'no live auction: no open auctions or schedule, upcoming leads with the next to open, rails empty (upcoming lots never go in them)');
 
     // ---- Sign-up ----
     console.log('\n== POST /signup ==');

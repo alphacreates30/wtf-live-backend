@@ -1,4 +1,5 @@
--- STEP v: photo thumbnails (F1a). NOT YET APPLIED on production: Cowork applies it in the Supabase SQL editor.
+-- STEP v: photo thumbnails (F1a). APPLIED on production by Cowork 2026-09-29 (SQL editor): rls_on=true,
+-- anon/authenticated no select/insert, service_role insert.
 -- Idempotent. Applied and verified on wtf-test 2026-09-30 (RLS on; anon/authenticated have no privileges;
 -- verification/thumbnails.js green; scripts/backfill-thumbs.js run there on 8 photos).
 --
