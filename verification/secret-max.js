@@ -1,4 +1,5 @@
 // Secret max bids must not leave the server. THROWAWAY rows only (ZZTEST_secretmax*), always cleaned up.
+// Extended 2026-09-30 (F2): the lot page's /lots/:id, /bids, /related and the challenger's /me.
 // OLD = PINNED to 18b79c5 (before the fix): auction_items.top_pre_bid - on a standard lot the leader's hidden proxy
 // ceiling - went out on the public items list, standard-status, the bid response a losing challenger gets back, and
 // the item_activated socket broadcast. NEW = working tree.
@@ -119,11 +120,14 @@ async function scenario(port, label) {
   const reads = [`/auction/${S}/items`, `/auction/${S}/items/standard-status`, `/auction/${S}`, `/auction/${S}/bids`,
     `/auction/${V}/items`, `/auction/${V}`, `/auction/${V}/items/standard-status`, `/auction/${V}/items/${VL}/images`, `/auctions`,
     // Homepage (2026-09-30): the rails and search send lots to everyone. Not on the pinned commit (404 there).
-    '/home', '/search?q=secretmax'];
+    '/home', '/search?q=secretmax',
+    // Lot page (F2, 2026-09-30): the lot, its anonymised history and related lots. 404 on the pinned commit.
+    `/lots/${SL}`, `/lots/${SL}/bids`, `/lots/${SL}/related`];
   for (const [who, tok] of [['anonymous', null], ['C', tokC]]) {
-    for (const p of reads) { const x = await call(port, 'GET', p, tok); seen.push([`${who}: GET ${p.replace(S, 'S').replace(V, 'V').replace(VL, 'VL')} (${x.s})`, x.j]); }
+    for (const p of reads) { const x = await call(port, 'GET', p, tok); seen.push([`${who}: GET ${p.replace(SL, 'SL').replace(S, 'S').replace(V, 'V').replace(VL, 'VL')} (${x.s})`, x.j]); }
   }
   for (const [a, lot] of [[S, SL], [V, VL]]) { const x = await call(port, 'GET', `/auction/${a}/items/${lot}/prebid`, tokC); seen.push([`C: GET own pre-bid (${x.s})`, x.j]); }
+  { const x = await call(port, 'GET', `/lots/${SL}/me`, tokC); seen.push([`C: GET /lots/SL/me (${x.s})`, x.j]); }
   { const x = await call(port, 'GET', '/my-bids', tokC); seen.push([`C: GET /my-bids (${x.s})`, x.j]); }
 
   // Socket: live-mode activation broadcasts the lot row to the whole room.
@@ -144,6 +148,10 @@ async function scenario(port, label) {
     // So the /home and /search 'no max' checks aren't vacuous: S's lot must actually be in them.
     home: (await call(port, 'GET', '/home')).j,
     search: (await call(port, 'GET', '/search?q=secretmax')).j,
+    // The lot page's history must name nobody: L and C appear only as letters (or "You" to themselves).
+    lotBids: { anonymous: (await call(port, 'GET', `/lots/${SL}/bids`)).j, C: (await call(port, 'GET', `/lots/${SL}/bids`, tokC)).j },
+    lotPage: (await call(port, 'GET', `/lots/${SL}`)).j,
+    leaderMe: (await call(port, 'GET', `/lots/${SL}/me`, tokL)).j,
   };
   return { seen, openingPrice, controls };
 }
@@ -186,6 +194,13 @@ async function cleanup() {
       `NEW /home rails and /search do carry S's bid-on lot (so their no-max checks above mean something)`);
     const mine = (now.controls.leaderMyBids || []).find(i => Number(i.max_bid) === STD_MAX);
     ok(!!mine, `NEW L's /my-bids still shows their OWN max on the standard lot (${mine && mine.max_bid})`);
+    const lb = now.controls.lotBids;
+    ok(lb.anonymous && lb.anonymous.bids.length === 2 && lb.C && lb.C.bids.length === 2, 'NEW /lots/SL/bids carries both bids (so its no-max checks above mean something)');
+    for (const [who, body] of [['anonymous', lb.anonymous], ['C', lb.C], ['anonymous lot page', now.controls.lotPage]]) {
+      const text = JSON.stringify(body);
+      ok(!text.includes(L.username) && !text.includes(C.username) && !text.includes('"username"'), `NEW ${who}: no username on the lot page or in its history`);
+    }
+    ok(now.controls.leaderMe && now.controls.leaderMe.my_max === STD_MAX && now.controls.leaderMe.status === 'winning', `NEW L's own /lots/SL/me shows their OWN max (${now.controls.leaderMe && now.controls.leaderMe.my_max})`);
     console.log(`\nNOTE live mode (gated off in v2) opens a lot at the top pre-bid max: item_activated current_bid = ${now.openingPrice} (L's pre-bid max ${PRE_MAX}). Not fixed here; see README.`);
   } finally {
     servers.forEach(x => x.cleanup());

@@ -222,6 +222,19 @@ are built in the browser for the admin; nothing is sent or stored.
 |---|---|
 | `preview-sample.js` | The frontend's sample data (`../wtf-live-frontend/src/preview/sampleData.js`): every auction and lot title starts "Sample:", ids are "sample-..." (never a uuid), no photos, 0/1/3/5 open auctions build (one lot inside the hour, unbid lots, enough bids for Most wanted, three different end days). It is only loaded with `import()` by Home and Listings, preview is active only for the admin, and the preview code makes no API call. No "Sample:" auction or lot in the database, and no sample data in /home, /search or /auctions. Writes nothing. |
 
+**Lot page (F2)** (wtf-handoff `LOT_PAGE_BRIEF.md`, 2026-09-30). `GET /lots/:id`, `/lots/by-number/:slug/:n`,
+`/lots/:id/me`, `/lots/:id/bids`, `/lots/:id/related` (`lot_page.js`); increments, premium, slugs and the pickup town
+in `lot_rules.js` (the bid route and orders use the same functions). Needs migration `2026-09-30x-bid-history-leader.sql`
+(applied on wtf-test; **not yet on production**; before it the history attributes each row to the bidder who
+submitted it, everything else works).
+
+| Suite | Proves |
+|---|---|
+| `lot-page.js` | Shape; the premium line equals the invoice maths on every cent $0-$300 at three rates, and orders call the same function; the two one-tap amounts are exactly what the server accepts (a cent less refused) on every increment tier, cents included; proxy battles; each buyer's own status and max (`/me`), nobody else's; history: one row per bid (= `bid_count`), newest first, each price under whoever held it, "Bidder A/B" the same for everyone, "You" for the caller, no username/max/leader for anonymous, either buyer or a third; a pre-migration row falls back to its submitter; related (open lots, soonest first) and similar (other live auctions, title words, `[]` below 3); drafts 404 on every route for everyone; pickup town only; slugs (renamed title, full id, unknown). Exits 2 without migration x. |
+| `lot-page-frontend.js` | The frontend's slug equals the backend's; every lot link goes to the lot page; the room redirects `?lot=` (replace) and the old modal is gone; vercel.json sends link crawlers (not browsers or Lighthouse) to `api/lot-meta.js`, which adds the lot's title/photo/price (escaped) and nothing else, and the plain page for drafts, unknown lots and bad input; sample auctions end at 8:00 PM local and the sample lot page has the `/lots` shape. |
+| `secret-max.js` | Extended: `/lots/:id`, `/bids`, `/related` and the challenger's `/me` never carry the leader's max; the lot page and its history carry no username; the leader's own `/me` shows their own max. |
+| `preview-sample.js` | Updated: sample auctions end at 8:00 PM local (not "a lot inside the hour"); the lot page is the third file that lazy-loads the sample data. |
+
 **Rate limits and the suites.** `guard.js` sets `RATE_LIMIT_EXEMPT_LOOPBACK=1`, which the suites' local servers
 inherit, because a suite fires many logins and bids from localhost. The server honours it only for loopback
 addresses. Production never sets it, and Railway traffic never arrives from loopback. `rate-limits.js` clears it.

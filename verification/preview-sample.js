@@ -35,8 +35,10 @@ const FE = path.join(BE, '..', 'wtf-live-frontend', 'src');
         `${n} open: marked sample, every title "Sample: ...", every id "sample-...", no photos (${titles.length} titles)`);
     }
     const three = mod.sampleHome(3), now = Date.now();
-    ok(three.rails.ending_soon.some(l => Date.parse(l.ends_at) - now < 3600e3) && three.rails.first_bid.length > 0 && three.rails.most_wanted.length >= 3,
-      '3 open: a lot closing within the hour, lots with no bids, enough bids for Most wanted');
+    // Since F2 (LOT_PAGE_BRIEF.md 9) sample auctions end at 8:00 PM local on their days, not at times counted from now.
+    ok(three.open_auctions.every(a => new Date(a.ends_at).getHours() === 20 && new Date(a.ends_at).getMinutes() === 0)
+      && three.rails.ending_soon.every(l => Date.parse(l.ends_at) > now) && three.rails.first_bid.length > 0 && three.rails.most_wanted.length >= 3,
+      '3 open: each ends at 8:00 PM local, every lot still open, lots with no bids, enough bids for Most wanted');
     ok(new Set(three.open_auctions.map(a => new Date(a.ends_at).toDateString())).size === 3, '3 open: ending on three different days');
     const list = mod.sampleAuctions(3);
     ok(list.length === 4 && list.every(a => a.title.startsWith('Sample: ') && a.id.startsWith('sample-') && !a.image_url), '/auctions sample: 3 open + 1 upcoming, all "Sample:"');
@@ -54,7 +56,7 @@ const FE = path.join(BE, '..', 'wtf-live-frontend', 'src');
     };
     ok(grepSrc(FE, /import\s[^;]*from\s+['"][^'"]*sampleData['"]/).length === 0, 'no file imports sampleData statically');
     const lazy = grepSrc(FE, /import\(['"][^'"]*preview\/sampleData['"]\)/);
-    ok(lazy.length === 2 && lazy.some(p => p.endsWith('Home.jsx')) && lazy.some(p => p.endsWith('Listings.jsx')), `only Home and Listings load it, with import() (${lazy.join(', ')})`);
+    ok(lazy.length === 3 && ['Home.jsx', 'Listings.jsx', 'LotPage.jsx'].every(f => lazy.some(p => p.endsWith(f))), `only Home, Listings and the lot page load it, with import() (${lazy.join(', ')})`);
     const ctx = fs.readFileSync(path.join(FE, 'preview', 'PreviewContext.jsx'), 'utf8');
     ok(/const active = isAdmin && state\.on/.test(ctx) && /localStorage\.getItem\('wtf_username'\) === 'whatthefind'/.test(ctx) && /params\.get\('preview'\) === 'sample' && isAdminNow\(\)/.test(ctx),
       'preview is active only for the admin; ?preview=sample does nothing for anyone else');

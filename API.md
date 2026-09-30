@@ -8,7 +8,7 @@ backend. Conventions for everything below:
 - **No HTML** in any response. Descriptions are plain text.
 - **Lot number** shown to people = `position + 1`. It never changes as lots close.
 - **Never sent to the public:** another buyer's max bid (`top_pre_bid`), reserve prices, leading bidders on the
-  homepage, draft auctions or anything in them. Suites: `verification/secret-max.js`, `draft-reads.js`, `home.js`.
+  homepage, draft auctions or anything in them. Suites: `verification/secret-max.js`, `draft-reads.js`, `home.js`, `lot-page.js`.
 - Errors are `{ "error": "<short sentence>" }` with a 4xx/5xx status, sometimes with a `code`.
 - **Photos** come as `image_url` (the full photo: use it on a lot's own page) and `thumb_url` (about 480px wide
   WebP, no metadata: use it for cards, rails, lists and small tiles). `thumb_url` is `null` when a photo has no
@@ -69,7 +69,8 @@ full story lives on its own page).
   "current_bid": 38, "bid_count": 9, "ends_at": "ISO", "status": "open" }
 ```
 
-"Open" = not `sold`/`unsold` and `ends_at` still in the future. Link a lot to `/auction/:auction_id?lot=:id`.
+"Open" = not `sold`/`unsold` and `ends_at` still in the future. Link a lot to its page, `/a/<auction slug>/lot/<position + 1>`
+(see "The lot page" below; the older `/auction/:auction_id?lot=:id` still works and redirects there).
 
 ## `GET /search?q=`
 
@@ -98,13 +99,90 @@ Raw image bytes (JPEG, PNG or WebP, 5 MB max). Re-encoded with no metadata, max 
 is stored beside it (`<folder>/thumbs/<name>.webp`) and recorded. Answers `{ "url": "…", "thumb_url": "…" | null }`
 (`null` only if the thumbnail step failed; the photo itself is stored either way).
 
+## The lot page (F2): `GET /lots/...`
+
+A lot's own page is **`/a/<auction slug>/lot/<n>`** (n = lot number = position + 1). The slug is the auction's title
+words plus the first 8 characters of its id (`monster-shelf-3f9a1c2e`); only the id part finds the auction, so a
+renamed auction's old links still resolve (the answer carries the current `auction.slug`: move there). A full
+auction id also works as the slug. The website builds slugs with `src/lot/slug.js`, which must match the backend's
+`lot_rules.js` (suite `lot-page-frontend.js`). The old `/auction/:id?lot=:id` link redirects to the lot page.
+
+Public rules as everywhere: drafts are 404 (for everyone, the admin included); never a max, reserve, leading
+bidder or username; the pickup street address stays with winners.
+
+### `GET /lots/:id` and `GET /lots/by-number/:slug/:n`
+
+No login, and the same answer for everyone (no token is read), so it can be cached: `Cache-Control: public,
+max-age=0, s-maxage=5` (browsers always revalidate; a shared cache may hold it 5 s). 404 unknown/draft, 400 bad id/n.
+
+```jsonc
+{
+  "server_now": "ISO",                        // count down from this
+  "lot": {
+    "id": "uuid", "number": 12, "position": 11, "title": "…",
+    "description": "plain text, may contain blank-line paragraphs", "condition": "…" | null,
+    "status": "open" | "upcoming" | "closed" | "sold" | "unsold",   // closed = time up, not settled yet
+    "ends_at": "ISO" | null,
+    "image_url": "https://…" | null, "thumb_url": "https://…" | null  // the first photo (share previews)
+  },
+  "auction": {
+    "id": "uuid", "slug": "monster-shelf-3f9a1c2e", "title": "…",
+    "story": "the description's first sentence (link to the auction for the full story)",
+    "category": "…" | null, "phase": "live" | "upcoming" | "ended",
+    "starts_at": "ISO" | null, "ends_at": "ISO" | null, "lot_count": 34, "buyers_premium_pct": 15
+  },
+  "photos": [{ "url": "full photo", "thumb_url": "~480px WebP" | null }],   // [] = show the placeholder
+  "price": {
+    "current_bid": 83.5 | null,               // null before the first bid
+    "opening_bid": 1 | null,                  // the first bid's minimum; null once there are bids
+    "bid_count": 9,                           // every bid that moved the price (proxy steps included)
+    "premium_pct": 15,
+    "premium_amount": 12.53,                  // for current_bid (else opening_bid), computed exactly as
+    "total_with_premium": 96.03,              //   orders and invoices do: integer cents, rounded half up
+    "next_bids": [85.5, 87.5]                 // the next two valid max bids for anyone not leading ([] when not
+                                              //   open). The server still judges every bid (POST .../bid).
+  },
+  "time": { "ends_at": "ISO", "soft_close_minutes": 2 },   // a bid inside the last N minutes moves ends_at to
+                                                           //   N minutes after that bid (the live setting)
+  "fulfilment": {
+    "pickup": { "free": true, "city": "Miami, FL" | null, "starts_at": "ISO" | null, "ends_at": "ISO" | null } | null,
+    "shipping": { "priced": "after_auction", "estimate": null, "carrier": "USPS", "country": "US" } | null
+  },                                          // null = not offered by this auction. No lot has weight/size data,
+                                              //   so shipping is never priced before the auction (estimate null).
+  "nav": { "prev": { "id", "number", "title" } | null, "next": { … } | null },   // null at the ends: go to the auction
+  "contact_email": "…"                        // "Questions about this lot?"
+}
+```
+
+### `GET /lots/:id/me` (login)
+
+The caller's own standing; never anyone else's. `no-store`.
+`{ "status": "winning" | "outbid" | "no_bid" | "won" | "lost" | "closed", "my_max": 90 | null, "min_bid": 66 | null }`.
+`min_bid` is what the caller may bid now (the leader may raise from the current price), null when not open.
+
+### `GET /lots/:id/bids` (login optional)
+
+Anonymised history, newest first, `no-store`:
+`{ "bid_count": 5, "bids": [{ "amount": 66, "at": "ISO", "bidder": "Bidder B" | "You", "you": false }] }`.
+One row per bid that moved the price (exactly `bid_count` rows; a leader raising their own max adds none). Each row
+is under whoever HELD the lead at that price (migration x records it; older rows fall back to the bidder who
+submitted). Letters go by first appearance on this lot and are the same for everyone; the caller's own rows say
+"You". Never a username, never a max: every amount was the public current bid at that moment.
+
+### `GET /lots/:id/related` (no login)
+
+`{ "server_now", "more_from_auction": [Lot], "similar": [Lot], "premium_pct": { "<auction id>": 15 } }`, Lot as for
+`/home`. More from this auction: up to 8 open lots, soonest ending first, this lot excluded. Similar: open lots in
+OTHER live auctions sharing at least one title word (the auction category only breaks ties), best match first, max
+12; `[]` when fewer than 3 match (hide the rail). `Cache-Control: public, max-age=15`.
+
 ## Existing public reads the homepage links to
 
 - `GET /auctions` — published auctions (drafts only for the admin). Each has `thumb_url` for its cover.
 - `GET /auction/:id` — one auction (404 for a draft unless admin).
 - `GET /auction/:id/items/standard-status` (and `/auction/:id/items`) — every lot in a standard auction, maxes and
   reserves stripped; each lot has `thumb_url` for grid cards.
-- `GET /auction/:auctionId/items/:itemId/images` — a lot's photos, full size (the lot page).
+- `GET /auction/:auctionId/items/:itemId/images` — a lot's photos, full size (the lot page now reads them from `GET /lots/:id`).
 
 ## Watch list, follows and reminders (login required unless noted)
 

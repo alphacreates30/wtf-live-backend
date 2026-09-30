@@ -14,6 +14,7 @@ const helmet = require('helmet');
 const sharp = require('sharp');
 const aiLots = require('./ai_lots');
 const { makeThumb, thumbPathFor } = require('./thumbs');
+const lotRules = require('./lot_rules');
 
 const app = express();
 const server = http.createServer(app);
@@ -2323,9 +2324,9 @@ async function createOrderOnWin(auctionId, winnerUsername, finalBid, itemId) {
 
     // Money math in integer cents only - store the computed amounts, not the
     // rate, so a later premium-rate change can't rewrite past orders.
+    // lotRules.premiumCents is also what the lot page's "with premium" line uses.
     const hammerCents = Math.round((finalBid || 0) * 100);
-    const premiumPct = auction.buyers_premium_pct ?? 15;
-    const premiumCents = Math.round(hammerCents * premiumPct / 100);
+    const premiumCents = lotRules.premiumCents(hammerCents, auction.buyers_premium_pct);
     const totalCents = hammerCents + premiumCents;
 
     // Use the actual LOT title/description when we have an item; fall back to the auction
@@ -3398,8 +3399,8 @@ const SOFT_CLOSE_MINUTES = 2;
 
 // Lots open at $0.00, so "current bid + increment" would allow a $0 opening
 // bid. This is the floor for the first bid on a lot; every bid after it
-// follows the normal increment tiers.
-const OPENING_BID_MIN = 1;
+// follows the normal increment tiers (lot_rules.js, shared with the lot page).
+const { OPENING_BID_MIN } = lotRules;
 
 app.post('/auction/:id/items/:itemId/bid', requireAuth, LIMITS.bidding, async (req, res) => {
   const max_amount = parseMaxBid(req.body?.max_amount);
@@ -3435,14 +3436,11 @@ app.post('/auction/:id/items/:itemId/bid', requireAuth, LIMITS.bidding, async (r
   if (bidItem.status === 'sold' || bidItem.status === 'unsold') return res.status(400).json({ error: 'Lot is closed' });
   if (bidItem.ends_at && new Date(bidItem.ends_at) <= new Date()) return res.status(400).json({ error: 'Lot has closed' });
 
-  const floor = Number(bidItem.current_bid ?? bidItem.starting_bid ?? 0);
-  const minInc = floor < 50 ? 1 : floor < 100 ? 2 : floor < 200 ? 5 : floor < 500 ? 10 : floor < 1000 ? 25 : 50;
   const isLeader = bidItem.leading_bidder === req.user.username;
   // Lots start at $0.00, so the opening bid can't just be the floor - it would
   // be $0. OPENING_BID_MIN is the smallest first bid on a lot with no bids yet.
-  const minBid = isLeader
-    ? floor
-    : (bidItem.bid_count > 0 ? floor + minInc : Math.max(floor, OPENING_BID_MIN));
+  // The lot page's one-tap amounts come from the same function (nextBidAmounts).
+  const minBid = lotRules.minimumBid(bidItem, isLeader);
   if (max_amount < minBid) return res.status(400).json({ error: `Min bid: $${minBid.toFixed(2)}` });
 
   // The leader resubmitting their max is not a new bid: place_standard_bid
@@ -3894,6 +3892,12 @@ app.get('/me/watching', requireAuth, async (req, res) => {
     }),
     ids: { lots: lots.map(l => l.id), auctions: followed },
   });
+});
+
+// The lot page: GET /lots/:itemId (+ /me, /bids, /related, /by-number). lot_page.js; contracts in API.md.
+require('./lot_page')(app, {
+  supabase, requireAuth, optionalAuth, dbFailure, thumbsFor, homeLot, premiumMap, blurbOf, auctionPhase, isoOrNull,
+  standingFor, SOFT_CLOSE_MINUTES, CONTACT_EMAIL: REPLY_TO,
 });
 
 async function prefsFor(userId) {
