@@ -1,0 +1,38 @@
+# Daily keep-alive and smoke check. Unauthenticated GETs only, no secrets.
+# /home reads the Supabase database, which keeps the free project from pausing
+# for inactivity. Each check is retried once after 60 seconds; if any still
+# fails, the run fails and GitHub emails the repo owner.
+name: Keep alive
+
+on:
+  schedule:
+    - cron: '0 13 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: GET backend /version, backend /home, frontend
+        shell: bash
+        run: |
+          API=https://wtf-live-backend-production.up.railway.app
+          check() {
+            local name=$1 url=$2 code
+            for attempt in 1 2; do
+              code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "$url" || true)
+              if [ "$code" = 200 ]; then echo "OK   $name ($url) HTTP $code"; return 0; fi
+              echo "FAIL $name ($url) HTTP ${code:-none}, attempt $attempt"
+              [ $attempt = 1 ] && sleep 60
+            done
+            echo "::error::$name failed twice: $url"
+            return 1
+          }
+          failed=0
+          check version "$API/version" || failed=1
+          check home    "$API/home"    || failed=1
+          check site    "https://whatthefind.live/" || failed=1
+          exit $failed
