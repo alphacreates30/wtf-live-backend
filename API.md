@@ -102,7 +102,8 @@ Body: `{ "email": "…", "website": "" }`. `website` is a honeypot: leave the fi
 
 No login. The auction rules a page may put into words, so none are hard-coded:
 `{ "soft_close_minutes": 2 }` (a bid in a lot's last N minutes moves its end to N minutes after that bid; the same
-value as `time.soft_close_minutes` on `GET /lots/:id`). `Cache-Control: public, max-age=300`.
+value as `time.soft_close_minutes` on `GET /lots/:id`). `Cache-Control: public, max-age=300`. Also `points` (G2, see
+"Points and promotions" below).
 
 ## `POST /upload-image` (admin)
 
@@ -254,3 +255,74 @@ watched lots closing within the hour (price with premium, the buyer's status, a 
 opened (3 photos, lot count, end), followed auctions whose first lot closes within 24 hours (their top 5 lots by bids,
 minus any already listed). Each reminder is sent once; a soft-close extension never re-sends; closed lots are
 skipped; each preference is respected. Outbox: `notifications` (channel `email` now; the app adds `push`).
+
+## Points and promotions (G2)
+
+Rules: wtf-handoff `POINTS_BRIEF.md`. Code: `rewards.js` (the maths and the one shared discount decision) and the
+"Buyer points + promotions" block in `server.js`. Needs migration `2026-10-15z-points.sql`. **Switched off** unless
+`POINTS_ENABLED=true` (Railway) **and** the admin switch (`points_settings.enabled`) are both on; promotions follow
+`POINTS_ENABLED` alone. While off, every buyer route below answers `{ "enabled": false }` / `[]` / 404 and no money
+changes. Only ever the logged-in buyer's own points.
+
+- `GET /config` (no login) gains `"points": { "enabled": true, "points_per_dollar": 1, "points_per_reward": 250,
+  "reward_cents": 2500 }` (or `{ "enabled": false }`), for "Earn a point for every dollar you win. Every 250 points is
+  $25 off." and the lot page's "This win earns about N points" (floor(price) × points_per_dollar).
+- `GET /me/points`:
+
+```jsonc
+{
+  "enabled": true,
+  "balance": 198, "toward_next": 198, "per_reward": 250, "rewards_ready": 0,
+  "reward_cents": 2500, "points_per_dollar": 1,
+  "saved_cents": 2875,                 // points rewards used on paid invoices (incl. the premium saved)
+  "auto_apply": true,                  // default ON: timed auctions charge automatically
+  "expires_at": "ISO" | null,          // last paid win + expiry_months; null with no points
+  "expiry_months": 12,
+  "history": [ { "kind": "earn" | "redeem" | "expire" | "reverse" | "adjust", "points": 52, "note": "…",
+                 "created_at": "ISO", "item_title": "Lot 3: …" | null } ]   // newest first, up to 100
+}
+```
+
+- `PUT /me/points/settings` `{ "auto_apply": false }` → `{ "auto_apply": false }`. 404 while points are off.
+- `GET /auction/:id/promotions` (no login) → `[ { "kind": "percent_code" | "free_shipping" | "bundle_free_shipping",
+  "percent": 20 | null, "starts_at", "ends_at", "bundle_min_lots": 3 | null } ]`: running or upcoming, this auction or
+  site-wide. **Never the code itself.** 404 for a draft.
+- `GET /checkout/code?auction_id=` → `{ "entered": { "code", "percent", "applied" } | null, "note" }`.
+- `POST /checkout/apply-code` `{ "auction_id", "code" }` → the same. One code per buyer per auction (a new one
+  replaces it). 400 not valid for this auction; 409 the auction has closed, or this buyer's invoice already exists;
+  404 promotions off / draft. Rate limited like bids.
+- `DELETE /checkout/apply-code?auction_id=` → `{ "entered": null }` (until it has been used).
+- `GET /my-orders` rows gain `invoice: { total_cents, discount_kind: "points_reward" | "promo_code" | null,
+  discount_cents, discount_premium_cents } | null`, `points_earned` (that lot) and `shipping_promo`.
+
+How a discount applies (timed auctions): when the invoice is built, **one** discount is decided, once: the points
+reward (if auto-apply is on and the balance has `points_per_reward`) or the entered code, whichever saves more (a tie
+uses the code, so the points are kept). It comes off the winning bids (never below $0), the premium is worked out on
+the lower amount (`discount_premium_cents`), and `invoices.total_cents` is lowered before the charge. A total under
+Stripe's 50c minimum goes to $0; a $0 invoice is marked paid with `payment_intent_id = 'no_charge_discount'` and no
+Stripe call. Points are earned per lot (floor of the winning bid × points_per_dollar) when the invoice is paid,
+including a $0 one. A full Stripe refund (`charge.refunded`, which the Stripe webhook must send) takes those points
+back, never below 0; a partial refund changes nothing and emails the admin. Postage: a `free_shipping` promo, or
+`bundle_free_shipping` when the buyer won 3+ lots in that auction, makes `/admin/orders/label` buy the label without
+charging the buyer (`buyer_paid_cents: 0`, `orders.shipping_promo`); the quote shows `buyer_pays_cents`.
+
+**For live shows (G1):** call `rewards.discountsForCharge({ userId, auctionId, hammerCents, premiumCents: 0, atMs })`
+for each hammer charge (per lot), record the result on the order the way `apply_invoice_discount` does for invoices
+(a per-order variant: the ledger already allows one `redeem` per `order_id`), lower the charge, and call
+`rewards.earnForOrders([order])` on success (already wired into `chargeOrder`). The live "one box per show" postage goes
+through the same label route, so the shipping promos already apply.
+
+Admin (403 for anyone else):
+- `GET /admin/points-settings` → `{ admin_enabled, env_enabled, migrated, enabled, points_per_dollar,
+  points_per_reward, reward_cents, expiry_months }`. `PUT` any of `enabled`, `points_per_dollar` (0–100),
+  `points_per_reward` (1–100000), `reward_cents` (1–100000), `expiry_months` (1–120), whole numbers.
+- `GET /admin/promotions[?auction_id=]` → promotions with `uses: { entered, applied }`. `POST` `{ kind, auction_id |
+  null, code + percent (percent_code only), starts_at, ends_at, active? }` → 201. `PATCH /admin/promotions/:id`
+  `{ active, starts_at, ends_at, auction_id }` (kind/code/percent can't change). `DELETE` → 409 once a code was used.
+- `GET /admin/points/:userId` → `/me/points` for that buyer plus `username` (history up to 1000).
+- `POST /admin/points/:userId/adjust` `{ points: ±int, note }` → `{ balance }`. 409 below 0; a note is required.
+- `GET /admin/points-summary` → `{ points_outstanding, buyers, rewards_ready, value_cents, ready_value_cents, enabled }`.
+
+Expiry: the close loop runs `runPointsHousekeeping` at most hourly: a reminder email ~30 days before
+(`points_reminders_due`, once per expiry date) and expiry after `expiry_months` with no paid win
+(`points_expire_due`). Deleting an account (A5) removes the buyer's ledger, account and entered codes.

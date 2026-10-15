@@ -161,8 +161,11 @@ async function cleanup() {
     ok(L.price.premium_amount === 0.15 && L.price.total_with_premium === 1.15, 'premium on the opening bid: $0.15 -> $1.15');
     ok(L.time && L.time.soft_close_minutes === 2 && L.time.ends_at === new Date(lot0.ends_at).toISOString(), 'time: ends_at and the live soft-close minutes (2)');
     const cfg = (await call('GET', '/config')).j;
-    ok(cfg && cfg.soft_close_minutes === L.time.soft_close_minutes && JSON.stringify(Object.keys(cfg)) === '["soft_close_minutes"]',
-      `GET /config: the same soft-close setting the lot page uses (${JSON.stringify(cfg)}), nothing else`);
+    // G2 added `points` (on/off and the public rate only; nothing per buyer).
+    const pointsOk = cfg && cfg.points && typeof cfg.points.enabled === 'boolean'
+      && Object.keys(cfg.points).every(k => ['enabled', 'points_per_dollar', 'points_per_reward', 'reward_cents'].includes(k));
+    ok(cfg && cfg.soft_close_minutes === L.time.soft_close_minutes && JSON.stringify(Object.keys(cfg)) === '["soft_close_minutes","points"]' && pointsOk,
+      `GET /config: the same soft-close setting the lot page uses, plus the public points switch (${JSON.stringify(cfg)}), nothing else`);
     ok(L.fulfilment && L.fulfilment.pickup && L.fulfilment.pickup.town === 'Miami, FL' && L.fulfilment.pickup.free === true && L.fulfilment.shipping && L.fulfilment.shipping.priced === 'after_auction' && L.fulfilment.shipping.estimate === null,
       'fulfilment: pickup town (its own column) only, shipping priced after the auction, no estimate (lots have no weight/size)');
     ok(L.nav && L.nav.prev === null && L.nav.next && L.nav.next.id === lot1.id && L.nav.next.number === 2, 'nav: first lot has no prev; next = lot 2');

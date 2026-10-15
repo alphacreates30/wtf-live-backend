@@ -16,6 +16,7 @@ const aiLots = require('./ai_lots');
 const { makeThumb, thumbPathFor } = require('./thumbs');
 const lotRules = require('./lot_rules');
 const { publicAuction, publicLot } = require('./public_view');
+const rewardsLib = require('./rewards');
 
 const app = express();
 const server = http.createServer(app);
@@ -101,6 +102,8 @@ app.use(LIMITS.api);
 // -- Clients --
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(process.env.STRIPE_SECRET_KEY) : null;
+// Buyer points + promotions (G2). Off unless POINTS_ENABLED=true and the admin switch is on; see rewards.js.
+const rewards = rewardsLib.makeRewards(supabase);
 
 // No fallback: a known default secret would let anyone forge any login,
 // including the admin account. Refuse to start instead.
@@ -312,15 +315,34 @@ function invoiceLotRows(orders) {
   }).join('');
 }
 
-function invoiceWonChargedEmailHtml(invoice, orders, last4, pickup = null) {
-  const cardLine = last4 ? `<p style="margin:16px 0 0;color:#555;">Card ending in ${escapeHtml(last4)} was charged.</p>` : '';
+// G2: the invoice's one discount, as its own line(s) above the total. Bids are never changed.
+const DISCOUNT_LABEL = { points_reward: 'Points reward', promo_code: 'Promo code' };
+function invoiceDiscountRows(invoice) {
+  if (!invoice.discount_kind || !(invoice.discount_cents > 0)) return '';
+  const row = (label, cents) => `<tr><td style="padding:4px 0;color:#555;">${label}</td><td style="padding:4px 0;text-align:right;color:#2e6b34;">&minus;${formatMoney(cents)}</td></tr>`;
+  return row(DISCOUNT_LABEL[invoice.discount_kind] || 'Discount', invoice.discount_cents)
+    + (invoice.discount_premium_cents > 0 ? row('Premium on that amount', invoice.discount_premium_cents) : '');
+}
+// "You earned 52 points: 198 / 250", plus a ready reward when there is one.
+function pointsLineHtml(points) {
+  if (!points || !(points.earned > 0)) return '';
+  const ready = points.rewards_ready > 0
+    ? ` You have a ${formatMoney(points.reward_cents)} reward ready${points.rewards_ready > 1 ? ` (${points.rewards_ready} in all)` : ''}.` : '';
+  return `<p style="margin:16px 0 0;color:#555;">You earned <strong>${points.earned} points</strong>: ${points.toward_next} / ${points.per_reward}.${ready}</p>`;
+}
+
+function invoiceWonChargedEmailHtml(invoice, orders, last4, pickup = null, points = null) {
+  const cardLine = last4 ? `<p style="margin:16px 0 0;color:#555;">Card ending in ${escapeHtml(last4)} was charged.</p>`
+    : invoice.total_cents === 0 ? '<p style="margin:16px 0 0;color:#555;">Nothing to pay: your discount covered it.</p>' : '';
   return emailHtml('You won it - and your card has been charged', `
     <p>Congratulations! You won <strong>${orders.length}</strong> lot${orders.length === 1 ? '' : 's'}:</p>
     <table style="width:100%;border-collapse:collapse;margin:16px 0;">
       ${invoiceLotRows(orders)}
+      ${invoiceDiscountRows(invoice)}
       <tr><td style="padding:8px 0 0;font-weight:bold;border-top:1px solid #ddd;">Total charged</td><td style="padding:8px 0 0;text-align:right;font-weight:bold;border-top:1px solid #ddd;">${formatMoney(invoice.total_cents)}</td></tr>
     </table>
     ${cardLine}
+    ${pointsLineHtml(points)}
     ${nextStepHtml(pickup, true)}
   `);
 }
@@ -330,6 +352,7 @@ function invoicePaymentFailedEmailHtml(invoice, orders, reason) {
     <p>You won <strong>${orders.length}</strong> lot${orders.length === 1 ? '' : 's'}, but we were unable to charge the card on file.</p>
     <table style="width:100%;border-collapse:collapse;margin:16px 0;">
       ${invoiceLotRows(orders)}
+      ${invoiceDiscountRows(invoice)}
       <tr><td style="padding:8px 0 0;font-weight:bold;border-top:1px solid #ddd;">Total due</td><td style="padding:8px 0 0;text-align:right;font-weight:bold;border-top:1px solid #ddd;">${formatMoney(invoice.total_cents)}</td></tr>
     </table>
     <p style="margin:16px 0 0;color:#555;">Reason: ${escapeHtml(reason)}</p>
@@ -457,11 +480,14 @@ async function notifyInvoiceWonAndCharged(invoiceId, paymentIntentId) {
 
     const { data: orders } = await supabase
       .from('orders')
-      .select('item_title, hammer_cents, premium_cents, fulfillment_choice')
+      .select('id, item_title, hammer_cents, premium_cents, fulfillment_choice')
       .eq('invoice_id', invoiceId);
     if (!orders?.length) return;
 
     const email = await getBuyerEmail(invoice.buyer_user_id);
+    // G2: what this win earned and the balance now (null with points off).
+    let points = null;
+    try { points = await rewards.summaryFor(invoice.buyer_user_id, orders.map(o => o.id)); } catch { /* never block the email */ }
     if (!email) return;
     // One choice per buyer per auction (made before their first bid), so any order says it.
     const pickup = orders.some(o => o.fulfillment_choice === 'pickup') ? await pickupFor(invoice.auction_id) : null;
@@ -478,7 +504,7 @@ async function notifyInvoiceWonAndCharged(invoiceId, paymentIntentId) {
       from: BUYER_FROM,
       to: email,
       subject: `You won ${orders.length} lot${orders.length === 1 ? '' : 's'} - payment charged`,
-      html: invoiceWonChargedEmailHtml(invoice, orders, last4, pickup),
+      html: invoiceWonChargedEmailHtml(invoice, orders, last4, pickup, points),
       kind: 'won',
     });
   } catch (e) {
@@ -1370,6 +1396,37 @@ app.post('/webhook/stripe', async (req, res) => {
     }
   }
 
+  // G2: a refund takes back the points those lots earned (never below 0; points already spent are not clawed back,
+  // the admin is told). Refunds are made in the Stripe dashboard; the webhook endpoint must include charge.refunded.
+  // A partial refund can't say which lots it covers, so it changes no points and asks the admin to adjust by hand.
+  if (event.type === 'charge.refunded') {
+    try {
+      const ch = event.data.object;
+      const piId = typeof ch.payment_intent === 'string' ? ch.payment_intent : ch.payment_intent?.id;
+      if (piId) {
+        const { data: orders } = await supabase.from('orders').select('id, buyer_username').eq('payment_intent_id', piId);
+        if (orders?.length) {
+          if (ch.refunded || ch.amount_refunded >= ch.amount) {
+            const reversed = await rewards.reverseForOrders(orders.map(o => o.id), 'Refunded');
+            const short = reversed.filter(r => r.shortfall > 0);
+            if (short.length) {
+              await sendAdminEmail(`Points: refund after the reward was used - ${orders[0].buyer_username}`,
+                `A refunded payment (${piId}) had earned points that were already spent.\n` +
+                short.map(r => `Order ${r.order_id}: ${r.shortfall} points not taken back`).join('\n') +
+                `\nNothing more happens automatically. Adjust in Admin > Points if needed.`);
+            }
+          } else {
+            await sendAdminEmail(`Points: partial refund - ${orders[0].buyer_username}`,
+              `Payment ${piId} was partly refunded (${formatMoney(ch.amount_refunded)} of ${formatMoney(ch.amount)}).\n` +
+              `Points were not changed. If the refund covers whole lots, adjust the buyer's points in Admin > Points.`);
+          }
+        }
+      }
+    } catch (e) {
+      console.error('charge.refunded points handling failed:', e.message);
+    }
+  }
+
   res.json({ received: true });
 });
 
@@ -1538,8 +1595,29 @@ app.get('/my-orders', requireAuth, async (req, res) => {
   // order may carry the street address (B6).
   const { data: auctions } = await supabase.from('auctions').select('*').in('id', auctionIds);
   const auctionMap = Object.fromEntries((auctions || []).map(a => [a.id, a]));
+  // G2: each invoice's discount line (points reward or promo code) and the points each lot earned. Both are the
+  // caller's own rows; before migration z (or with nothing to show) the fields are null.
+  const invoiceIds = [...new Set(orders.map(o => o.invoice_id).filter(Boolean))];
+  const invoiceMap = {};
+  if (invoiceIds.length) {
+    const { data: invs, error: invErr } = await supabase.from('invoices')
+      .select('id, total_cents, discount_kind, discount_cents, discount_premium_cents').in('id', invoiceIds).eq('buyer_user_id', String(req.user.id));
+    if (!invErr) for (const v of invs || []) invoiceMap[v.id] = v;
+  }
+  const earnedMap = {};
+  {
+    const { data: earned, error: eErr } = await supabase.from('points_ledger').select('order_id, points')
+      .eq('user_id', req.user.id).eq('kind', 'earn').in('order_id', orders.map(o => o.id));
+    if (!eErr) for (const r of earned || []) earnedMap[r.order_id] = r.points;
+  }
+  const promoMap = {};
+  if (orders.some(o => o.shipping_payment_status === 'paid' && o.shipping_cost_cents === 0)) {
+    const { data: sp, error: spErr } = await supabase.from('orders').select('id, shipping_promo').in('id', orders.map(o => o.id)).not('shipping_promo', 'is', null);
+    if (!spErr) for (const r of sp || []) promoMap[r.id] = r.shipping_promo;
+  }
 
   res.json(orders.map(o => {
+    const inv = o.invoice_id ? invoiceMap[o.invoice_id] : null;
     const auction = auctionMap[o.auction_id];
     return {
       id: o.id,
@@ -1564,6 +1642,10 @@ app.get('/my-orders', requireAuth, async (req, res) => {
       shipping_cost_cents: o.shipping_cost_cents ?? null,
       shipping_payment_status: o.shipping_payment_status || null,
       shipping_payment_error: o.shipping_payment_error || null,
+      invoice: inv ? { total_cents: inv.total_cents, discount_kind: inv.discount_kind || null,
+        discount_cents: inv.discount_cents || 0, discount_premium_cents: inv.discount_premium_cents || 0 } : null,
+      points_earned: earnedMap[o.id] ?? null,
+      shipping_promo: promoMap[o.id] || null,
       pickup: o.fulfillment_choice === 'pickup' && auction ? {
         address: auction.pickup_address || null, town: auction.pickup_town || null,
         starts_at: auction.pickup_starts_at || null, ends_at: auction.pickup_ends_at || null,
@@ -2541,6 +2623,7 @@ async function chargeOrder(orderId) {
     await supabase.from('orders')
       .update({ payment_intent_id: paymentIntent.id, payment_status: 'paid', payment_error: null })
       .eq('id', orderId);
+    await rewards.earnForOrders([order]);   // G2 (live shows): points for the paid lot; never throws
     await notifyWonAndCharged(orderId, paymentIntent.id);
     return { success: true, payment_intent_id: paymentIntent.id };
   } catch (e) {
@@ -2613,6 +2696,18 @@ async function chargeInvoice(invoiceId, { auto = false } = {}) {
     // reflecting the invoice's state for UI that reads it directly.
     await supabase.from('orders').update({ payment_status: 'charging' }).eq('invoice_id', invoiceId);
 
+    // G2: a discount (points reward or % code) can bring an invoice to $0. Nothing to charge: it is paid, with a
+    // marker instead of a Stripe PaymentIntent (applyInvoiceDiscount never leaves a total between 1c and Stripe's 50c).
+    if ((claimed.total_cents || 0) === 0 && claimed.discount_kind) {
+      const marker = 'no_charge_discount';
+      await supabase.from('invoices').update({ payment_intent_id: marker, payment_status: 'paid', payment_error: null }).eq('id', invoiceId);
+      await supabase.from('orders').update({ payment_intent_id: marker, payment_status: 'paid', payment_error: null }).eq('invoice_id', invoiceId);
+      const { data: paidOrders } = await supabase.from('orders').select('id, buyer_user_id, hammer_cents').eq('invoice_id', invoiceId);
+      await rewards.earnForOrders(paidOrders);
+      await notifyWonAfterCharge(invoiceId, null);
+      return { success: true, payment_intent_id: marker };
+    }
+
     const { data: profile } = await supabase
       .from('profiles')
       .select('stripe_customer_id, stripe_payment_method_id')
@@ -2656,6 +2751,9 @@ async function chargeInvoice(invoiceId, { auto = false } = {}) {
     await supabase.from('orders')
       .update({ payment_intent_id: paymentIntent.id, payment_status: 'paid', payment_error: null })
       .eq('invoice_id', invoiceId);
+    // G2: points for each paid lot, before the won email (which shows them). earnForOrders never throws.
+    const { data: paidOrders } = await supabase.from('orders').select('id, buyer_user_id, hammer_cents').eq('invoice_id', invoiceId);
+    await rewards.earnForOrders(paidOrders);
     await notifyWonAfterCharge(invoiceId, paymentIntent.id);
     return { success: true, payment_intent_id: paymentIntent.id };
   } catch (e) {
@@ -2743,6 +2841,10 @@ async function buildAndChargeInvoicesForAuction(auctionId) {
       if (unlinkedIds.length) {
         await supabase.from('orders').update({ invoice_id: invoiceId }).in('id', unlinkedIds);
       }
+
+      // G2: the invoice's one discount (points reward or % code), decided once, before the charge. Never throws;
+      // with points off (or before migration z) it does nothing.
+      await rewards.applyInvoiceDiscount(invoiceId);
 
       try {
         await chargeInvoice(invoiceId, { auto: true });
@@ -3053,6 +3155,27 @@ async function loadShippableOrders(order_ids) {
   return { orders };
 }
 
+// G2: is this box's postage free for the buyer? A free-shipping promo for the event(s), or the bundle bonus (3+ lots
+// won by this buyer in that event). Every order in the box must qualify. null = the buyer pays, as before. The label
+// is still bought; only the buyer's charge is skipped. Never throws (a failed check = the buyer pays, as before).
+async function shippingPromoForOrders(orders) {
+  try {
+    const s = await rewards.settings();
+    if (!s.rewards_on || !orders?.length) return null;
+    const auctionIds = [...new Set(orders.map(o => o.auction_id))];
+    const promos = await rewards.promosFor(auctionIds);
+    if (!promos.length) return null;
+    const { data: won } = await supabase.from('orders').select('auction_id')
+      .eq('buyer_user_id', orders[0].buyer_user_id).in('auction_id', auctionIds);
+    const lotsWonBy = {};
+    for (const o of won || []) lotsWonBy[o.auction_id] = (lotsWonBy[o.auction_id] || 0) + 1;
+    return rewardsLib.shippingPromoFor(orders, promos, lotsWonBy);
+  } catch (e) {
+    console.error('shipping promo check failed (buyer pays):', e.message);
+    return null;
+  }
+}
+
 // Step 1 of the shipping flow: quote the real parcel with Shippo and return
 // the cheapest rate WITHOUT buying anything. Weight and dimensions come from
 // the host, entered at packing time - there is no hardcoded parcel and no
@@ -3118,9 +3241,13 @@ app.post('/admin/orders/shipping-quote', requireAdmin, normalizeBodyIds({ list: 
     }
 
     const rate = shipment.rates.sort((a, b) => parseFloat(a.amount) - parseFloat(b.amount))[0];
+    const shippingPromo = await shippingPromoForOrders(orders);
     res.json({
       rate_id: rate.object_id,
       amount_cents: Math.round(parseFloat(rate.amount) * 100),
+      // G2: what the buyer is charged for this label (0 when a promo makes it free) and why
+      buyer_pays_cents: shippingPromo ? 0 : Math.round(parseFloat(rate.amount) * 100),
+      shipping_promo: shippingPromo,
       provider: rate.provider,
       servicelevel: rate.servicelevel?.name || rate.servicelevel?.token || null,
       estimated_days: rate.estimated_days ?? null,
@@ -3165,7 +3292,21 @@ app.post('/admin/orders/label', requireAdmin, normalizeBodyIds({ list: ['order_i
     return res.status(409).json({ error: `The rate is now ${formatMoney(rateCents)}, not ${formatMoney(amount_cents)}. Get a new quote.` });
   }
 
-  const chargeResult = await chargeShipping(order_ids, rateCents);
+  // G2: free postage for the buyer (promo) - the label is bought, the buyer is not charged.
+  const shippingPromo = await shippingPromoForOrders(orders);
+  let chargeResult;
+  if (shippingPromo && orders.some(o => ['paid', 'charging'].includes(o.shipping_payment_status))) {
+    chargeResult = { success: false, error: 'Shipping already paid or being charged for one or more orders in this group' };
+  } else if (shippingPromo) {
+    const { data: claimed } = await supabase.from('orders')
+      .update({ shipping_payment_status: 'paid', shipping_payment_error: null, shipping_cost_cents: 0, shipping_promo: shippingPromo })
+      .in('id', order_ids).or('shipping_payment_status.is.null,shipping_payment_status.in.(unpaid,failed)').select('id');
+    chargeResult = claimed?.length === order_ids.length
+      ? { success: true, payment_intent_id: null }
+      : { success: false, error: 'Shipping already paid or being charged for one or more orders in this group' };
+  } else {
+    chargeResult = await chargeShipping(order_ids, rateCents);
+  }
   if (!chargeResult.success) {
     return res.status(402).json({ error: 'Shipping charge failed', detail: chargeResult.error });
   }
@@ -3224,6 +3365,8 @@ app.post('/admin/orders/label', requireAdmin, normalizeBodyIds({ list: ['order_i
       label_url: transaction.label_url,
       tracking_number: transaction.tracking_number,
       shipping_cost_cents: rateCents,
+      buyer_paid_cents: shippingPromo ? 0 : rateCents,
+      shipping_promo: shippingPromo,
     });
   } catch (e) {
     console.error('Shippo error:', e.message);
@@ -3460,9 +3603,13 @@ const SOFT_CLOSE_MINUTES = 2;
 
 // The auction rules a page may state in words (e.g. "a late bid resets that lot's clock to 2 minutes"), so no
 // page hard-codes them. Public, same for everyone, nothing secret. Contract in API.md.
-app.get('/config', (req, res) => {
+app.get('/config', async (req, res) => {
   res.set('Cache-Control', 'public, max-age=300');
-  res.json({ soft_close_minutes: SOFT_CLOSE_MINUTES });
+  // G2: whether points are on and the one-sentence numbers ("a point for every $1 you win; every 250 is $25 off"),
+  // so public pages can show the points line. Nothing per buyer.
+  const p = await rewards.settings();
+  res.json({ soft_close_minutes: SOFT_CLOSE_MINUTES,
+    points: p.enabled ? { enabled: true, points_per_dollar: p.points_per_dollar, points_per_reward: p.points_per_reward, reward_cents: p.reward_cents } : { enabled: false } });
 });
 
 // Lots open at $0.00, so "current bid + increment" would allow a $0 opening
@@ -4055,6 +4202,324 @@ app.post('/unsubscribe', async (req, res) => {
 });
 
 // The admin's view of interest: watchers per lot and followers per auction.
+// ---- Buyer points + promotions (G2, wtf-handoff POINTS_BRIEF.md; rules and the shared discount decision in
+// rewards.js). Everything answers "enabled: false" (buyer) or 503 (admin writes) until migration z is applied and
+// POINTS_ENABLED=true; with points off nothing here changes any money.
+const POINTS_HISTORY_LIMIT = 100;
+const pointsUnavailable = res => res.status(503).json({ error: 'Points are not available yet.' });
+const pointsDbError = (req, res, err) => rewardsLib.notMigrated(err) ? pointsUnavailable(res) : dbFailure(req, res, err);
+const expiresAt = (acct, months) => {
+  const base = acct?.last_win_at || acct?.created_at;
+  if (!base) return null;
+  const d = new Date(base); d.setUTCMonth(d.getUTCMonth() + months); return d.toISOString();
+};
+
+// The caller's own points: balance, progress, $ saved, expiry, auto-apply, history. Only ever the caller's rows.
+async function pointsFor(userId, s, { historyLimit = POINTS_HISTORY_LIMIT } = {}) {
+  const [balance, acct, { data: ledger, error: lErr }, { data: invs, error: iErr }] = await Promise.all([
+    rewards.balanceOf(userId),
+    rewards.account(userId),
+    supabase.from('points_ledger').select('kind, points, note, created_at, order_id, invoice_id')
+      .eq('user_id', userId).order('created_at', { ascending: false }).order('id', { ascending: false }).limit(historyLimit),
+    supabase.from('invoices').select('discount_cents, discount_premium_cents')
+      .eq('buyer_user_id', String(userId)).eq('discount_kind', 'points_reward').eq('payment_status', 'paid'),
+  ]);
+  if (lErr) throw lErr;
+  if (iErr) throw iErr;
+  const orderIds = [...new Set((ledger || []).map(r => r.order_id).filter(Boolean))];
+  const titles = {};
+  if (orderIds.length) {
+    const { data } = await supabase.from('orders').select('id, item_title').in('id', orderIds).eq('buyer_user_id', String(userId));
+    for (const o of data || []) titles[o.id] = o.item_title;
+  }
+  return {
+    enabled: true,
+    balance,
+    ...rewardsLib.progress(balance, s),
+    reward_cents: s.reward_cents,
+    points_per_dollar: s.points_per_dollar,
+    saved_cents: (invs || []).reduce((t, v) => t + (v.discount_cents || 0) + (v.discount_premium_cents || 0), 0),
+    auto_apply: acct.auto_apply !== false,
+    expires_at: balance > 0 ? expiresAt(acct, s.expiry_months) : null,
+    expiry_months: s.expiry_months,
+    history: (ledger || []).map(r => ({ kind: r.kind, points: r.points, note: r.note || null, created_at: r.created_at,
+      item_title: r.order_id ? titles[r.order_id] || null : null })),
+  };
+}
+
+app.get('/me/points', requireAuth, async (req, res) => {
+  const s = await rewards.settings();
+  if (!s.enabled) return res.json({ enabled: false });
+  try { res.json(await pointsFor(req.user.id, s)); } catch (e) { pointsDbError(req, res, e); }
+});
+
+app.put('/me/points/settings', requireAuth, LIMITS.watch, async (req, res) => {
+  const s = await rewards.settings();
+  if (!s.enabled) return res.status(404).json({ error: 'Points are not switched on.' });
+  const { auto_apply } = req.body || {};
+  if (typeof auto_apply !== 'boolean') return res.status(400).json({ error: 'auto_apply must be true or false' });
+  const { error } = await supabase.from('points_accounts')
+    .upsert({ user_id: req.user.id, auto_apply, updated_at: new Date().toISOString() }, { onConflict: 'user_id' });
+  if (error) return pointsDbError(req, res, error);
+  res.json({ auto_apply });
+});
+
+// Promotions a buyer can see on an event page: running or coming up, for this auction or site-wide. Never the
+// code itself (the house shares it), only that a % code exists.
+app.get('/auction/:id/promotions', async (req, res) => {
+  const id = canonicalUuid(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Invalid auction id' });
+  const s = await rewards.settings();
+  if (!s.rewards_on) return res.json([]);
+  const { data: auction } = await supabase.from('auctions').select('id, status').eq('id', id).maybeSingle();
+  if (!auction || auction.status === 'draft') return res.status(404).json({ error: 'Auction not found' });
+  try {
+    const now = Date.now();
+    const promos = (await rewards.promosFor([id])).filter(p => Date.parse(p.ends_at) > now);
+    res.json(promos.map(p => ({ kind: p.kind, percent: p.kind === 'percent_code' ? p.percent : null,
+      starts_at: p.starts_at, ends_at: p.ends_at, bundle_min_lots: p.kind === 'bundle_free_shipping' ? rewardsLib.BUNDLE_MIN_LOTS : null })));
+  } catch (e) { pointsDbError(req, res, e); }
+});
+
+// A % code for one event, entered before it closes. One per buyer per event (a new code replaces the old one until
+// the invoice is decided). Applied off the winning bids at close; doesn't stack with a points reward: the bigger
+// saving wins.
+async function codeState(userId, auctionId) {
+  const { data, error } = await supabase.from('promotion_uses').select('applied_at, promotions(code, percent)')
+    .eq('user_id', userId).eq('auction_id', auctionId).maybeSingle();
+  if (error) throw error;
+  return data ? { code: data.promotions?.code || null, percent: data.promotions?.percent ?? null, applied: !!data.applied_at } : null;
+}
+async function codeAuction(req, res, auctionIdRaw) {
+  const s = await rewards.settings();
+  if (!s.rewards_on) { res.status(404).json({ error: 'Promo codes are not available.' }); return null; }
+  const auctionId = canonicalUuid(auctionIdRaw);
+  if (!auctionId) { res.status(400).json({ error: 'Invalid auction id' }); return null; }
+  const { data: auction, error } = await supabase.from('auctions').select('id, status').eq('id', auctionId).maybeSingle();
+  if (error) { dbFailure(req, res, error); return null; }
+  if (!auction || auction.status === 'draft') { res.status(404).json({ error: 'Auction not found' }); return null; }
+  return auction;
+}
+const CODE_NOTE = 'Comes off your winning bids in this auction when it closes. If you also have a points reward, the bigger saving is used.';
+
+app.get('/checkout/code', requireAuth, async (req, res) => {
+  const auction = await codeAuction(req, res, req.query.auction_id);
+  if (!auction) return;
+  try { res.json({ entered: await codeState(req.user.id, auction.id), note: CODE_NOTE }); } catch (e) { pointsDbError(req, res, e); }
+});
+
+app.post('/checkout/apply-code', requireAuth, LIMITS.bidding, async (req, res) => {
+  const auction = await codeAuction(req, res, req.body?.auction_id);
+  if (!auction) return;
+  const code = rewardsLib.normaliseCode(req.body?.code);
+  const bad = () => res.status(400).json({ error: "That code isn't valid for this auction." });
+  if (!code) return bad();
+  if (auction.status === 'ended') return res.status(409).json({ error: 'This auction has closed, so codes can no longer be added.' });
+  const { data: inv } = await supabase.from('invoices').select('id').eq('auction_id', auction.id).eq('buyer_user_id', String(req.user.id)).maybeSingle();
+  if (inv) return res.status(409).json({ error: 'Your invoice for this auction has already been made, so codes can no longer be added.' });
+  try {
+    const now = Date.now();
+    const promo = (await rewards.promosFor([auction.id]))
+      .find(p => p.kind === 'percent_code' && p.code === code && rewardsLib.promoApplies(p, auction.id, now));
+    if (!promo) return bad();
+    const prev = await codeState(req.user.id, auction.id);
+    if (prev?.applied) return res.status(409).json({ error: 'A code has already been used on this auction.' });
+    const { error } = await supabase.from('promotion_uses')
+      .upsert({ promotion_id: promo.id, user_id: req.user.id, auction_id: auction.id, created_at: new Date().toISOString() }, { onConflict: 'user_id,auction_id' });
+    if (error) return pointsDbError(req, res, error);
+    res.json({ entered: { code: promo.code, percent: promo.percent, applied: false }, note: CODE_NOTE });
+  } catch (e) { pointsDbError(req, res, e); }
+});
+
+app.delete('/checkout/apply-code', requireAuth, LIMITS.bidding, async (req, res) => {
+  const auction = await codeAuction(req, res, req.query.auction_id);
+  if (!auction) return;
+  const { error } = await supabase.from('promotion_uses').delete()
+    .eq('user_id', req.user.id).eq('auction_id', auction.id).is('applied_at', null);
+  if (error) return pointsDbError(req, res, error);
+  res.json({ entered: null });
+});
+
+// -- Admin: points settings, promotions, a buyer's points, total outstanding --
+const POINTS_SETTING_RANGES = { points_per_dollar: [0, 100], points_per_reward: [1, 100000], reward_cents: [1, 100000], expiry_months: [1, 120] };
+async function adminPointsSettings() {
+  const s = await rewards.settings({ fresh: true });
+  const { data } = await supabase.from('points_settings').select('*').eq('id', 1).maybeSingle();
+  return {
+    admin_enabled: !!data?.enabled, env_enabled: rewardsLib.envOn(), migrated: s.migrated, enabled: s.enabled,
+    points_per_dollar: s.points_per_dollar, points_per_reward: s.points_per_reward, reward_cents: s.reward_cents, expiry_months: s.expiry_months,
+  };
+}
+app.get('/admin/points-settings', requireAdmin, async (req, res) => res.json(await adminPointsSettings()));
+
+app.put('/admin/points-settings', requireAdmin, async (req, res) => {
+  const b = req.body || {};
+  const u = {};
+  if (b.enabled !== undefined) {
+    if (typeof b.enabled !== 'boolean') return res.status(400).json({ error: 'enabled must be true or false' });
+    u.enabled = b.enabled;
+  }
+  for (const [k, [lo, hi]] of Object.entries(POINTS_SETTING_RANGES)) {
+    if (b[k] === undefined) continue;
+    if (!Number.isInteger(b[k]) || b[k] < lo || b[k] > hi) return res.status(400).json({ error: `${k} must be a whole number from ${lo} to ${hi}` });
+    u[k] = b[k];
+  }
+  const { error } = await supabase.from('points_settings').update({ ...u, updated_at: new Date().toISOString() }).eq('id', 1);
+  if (error) return pointsDbError(req, res, error);
+  rewards.forget();
+  res.json(await adminPointsSettings());
+});
+
+const PROMO_KINDS = ['percent_code', 'free_shipping', 'bundle_free_shipping'];
+function promoFields(b, { partial = false } = {}) {
+  const u = {};
+  if (!partial || b.kind !== undefined) {
+    if (!PROMO_KINDS.includes(b.kind)) return { error: `kind must be one of ${PROMO_KINDS.join(', ')}` };
+    u.kind = b.kind;
+  }
+  if (!partial || b.auction_id !== undefined) {
+    if (b.auction_id === null || b.auction_id === undefined || b.auction_id === '') u.auction_id = null;
+    else { u.auction_id = canonicalUuid(b.auction_id); if (!u.auction_id) return { error: 'Invalid auction_id' }; }
+  }
+  for (const k of ['starts_at', 'ends_at']) {
+    if (partial && b[k] === undefined) continue;
+    const t = Date.parse(b[k]);
+    if (!Number.isFinite(t)) return { error: `${k} must be a date and time` };
+    u[k] = new Date(t).toISOString();
+  }
+  if (b.active !== undefined) {
+    if (typeof b.active !== 'boolean') return { error: 'active must be true or false' };
+    u.active = b.active;
+  }
+  if (u.kind === 'percent_code') {
+    u.code = rewardsLib.normaliseCode(b.code);
+    if (!u.code) return { error: 'code: 3 to 30 letters, numbers, - or _' };
+    if (!Number.isInteger(b.percent) || b.percent < 1 || b.percent > 90) return { error: 'percent must be a whole number from 1 to 90' };
+    u.percent = b.percent;
+  } else if (u.kind) { u.code = null; u.percent = null; }
+  return { u };
+}
+app.get('/admin/promotions', requireAdmin, async (req, res) => {
+  let q = supabase.from('promotions').select('*').order('starts_at', { ascending: false });
+  if (req.query.auction_id) {
+    const id = canonicalUuid(req.query.auction_id);
+    if (!id) return res.status(400).json({ error: 'Invalid auction_id' });
+    q = q.or(`auction_id.eq.${id},auction_id.is.null`);
+  }
+  const { data, error } = await q;
+  if (error) return pointsDbError(req, res, error);
+  const ids = (data || []).map(p => p.id);
+  const uses = {};
+  if (ids.length) {
+    const { data: u } = await supabase.from('promotion_uses').select('promotion_id, applied_at').in('promotion_id', ids);
+    for (const r of u || []) { const x = uses[r.promotion_id] ||= { entered: 0, applied: 0 }; x.entered++; if (r.applied_at) x.applied++; }
+  }
+  res.json((data || []).map(p => ({ ...p, uses: uses[p.id] || { entered: 0, applied: 0 } })));
+});
+app.post('/admin/promotions', requireAdmin, async (req, res) => {
+  const { u, error: e } = promoFields(req.body || {});
+  if (e) return res.status(400).json({ error: e });
+  if (Date.parse(u.ends_at) <= Date.parse(u.starts_at)) return res.status(400).json({ error: 'ends_at must be after starts_at' });
+  const { data, error } = await supabase.from('promotions').insert({ ...u, active: u.active ?? true }).select('*').single();
+  if (error) return pointsDbError(req, res, error);
+  res.status(201).json(data);
+});
+app.patch('/admin/promotions/:id', requireAdmin, async (req, res) => {
+  const id = canonicalUuid(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Invalid id' });
+  const b = req.body || {};
+  if (b.kind !== undefined || b.code !== undefined || b.percent !== undefined) return res.status(400).json({ error: 'Kind, code and percent can not be changed; make a new promotion.' });
+  const { u, error: e } = promoFields(b, { partial: true });
+  if (e) return res.status(400).json({ error: e });
+  const { data, error } = await supabase.from('promotions').update(u).eq('id', id).select('*').maybeSingle();
+  if (error) return error.code === '23514' ? res.status(400).json({ error: 'ends_at must be after starts_at' }) : pointsDbError(req, res, error);
+  if (!data) return res.status(404).json({ error: 'Promotion not found' });
+  res.json(data);
+});
+app.delete('/admin/promotions/:id', requireAdmin, async (req, res) => {
+  const id = canonicalUuid(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Invalid id' });
+  const { count } = await supabase.from('promotion_uses').select('id', { count: 'exact', head: true }).eq('promotion_id', id).not('applied_at', 'is', null);
+  if (count > 0) return res.status(409).json({ error: 'This code has been used on invoices. Switch it off instead.' });
+  const { error } = await supabase.from('promotions').delete().eq('id', id);
+  if (error) return pointsDbError(req, res, error);
+  res.json({ deleted: true });
+});
+
+async function adminPointsUser(req, res) {
+  const id = canonicalUuid(req.params.userId);
+  if (!id) { res.status(400).json({ error: 'Invalid user id' }); return null; }
+  const { data: user } = await supabase.from('users').select('id, username').eq('id', id).maybeSingle();
+  if (!user) { res.status(404).json({ error: 'Buyer not found' }); return null; }
+  return user;
+}
+app.get('/admin/points/:userId', requireAdmin, async (req, res) => {
+  const user = await adminPointsUser(req, res);
+  if (!user) return;
+  const s = await rewards.settings({ fresh: true });
+  try { res.json({ username: user.username, ...(await pointsFor(user.id, s, { historyLimit: 1000 })), enabled: s.enabled }); }
+  catch (e) { pointsDbError(req, res, e); }
+});
+app.post('/admin/points/:userId/adjust', requireAdmin, async (req, res) => {
+  const user = await adminPointsUser(req, res);
+  if (!user) return;
+  const { points, note } = req.body || {};
+  if (!Number.isInteger(points) || points === 0 || Math.abs(points) > 100000) return res.status(400).json({ error: 'points must be a whole number, not 0' });
+  if (typeof note !== 'string' || !note.trim() || note.length > 300) return res.status(400).json({ error: 'A note (up to 300 characters) is required' });
+  const { data, error } = await supabase.rpc('points_adjust', { p_user_id: user.id, p_points: points, p_note: note.trim() });
+  if (error) {
+    if (/points_below_zero/.test(error.message || '')) return res.status(409).json({ error: 'That would take the balance below 0.' });
+    return pointsDbError(req, res, error);
+  }
+  res.json({ balance: data });
+});
+app.get('/admin/points-summary', requireAdmin, async (req, res) => {
+  const s = await rewards.settings({ fresh: true });
+  const { data, error } = await supabase.rpc('points_outstanding', { p_points_per_reward: s.points_per_reward });
+  if (error) return pointsDbError(req, res, error);
+  const row = Array.isArray(data) ? data[0] : data;
+  const points = Number(row?.points) || 0;
+  res.json({
+    points_outstanding: points, buyers: Number(row?.buyers) || 0, rewards_ready: Number(row?.rewards_ready) || 0,
+    // What the outstanding points are worth at the current rate (the most they could cost), and what could be used now.
+    value_cents: Math.floor(points * s.reward_cents / s.points_per_reward),
+    ready_value_cents: (Number(row?.rewards_ready) || 0) * s.reward_cents,
+    enabled: s.enabled,
+  });
+});
+
+// Expiry: points expire after expiry_months with no paid win; a reminder email goes 30 days before. Run from the
+// 30-second close job, at most once an hour per instance; the database functions are idempotent and lock per buyer,
+// so two instances at once can't double-expire or double-remind. `now` is a parameter so the suite can fake the clock.
+let pointsHousekeepingAt = 0;
+async function runPointsHousekeeping(now = new Date(), { force = false } = {}) {
+  if (!force && Date.now() - pointsHousekeepingAt < 60 * 60 * 1000) return null;
+  pointsHousekeepingAt = Date.now();
+  try {
+    const s = await rewards.settings();
+    if (!s.enabled) return null;
+    const { data: due, error: rErr } = await supabase.rpc('points_reminders_due', { p_now: now.toISOString(), p_months: s.expiry_months });
+    if (rErr) { if (!rewardsLib.notMigrated(rErr)) console.error('points reminders failed:', rErr.message); return null; }
+    let reminded = 0;
+    for (const r of due || []) {
+      const email = await getBuyerEmail(r.user_id);
+      if (!email) continue;
+      const when = new Date(r.expires_at).toLocaleDateString('en-US', { timeZone: SITE_TIMEZONE, month: 'long', day: 'numeric', year: 'numeric' });
+      const body = `<p>Your <strong>${r.balance} points</strong> expire on <strong>${escapeHtml(when)}</strong>.</p>
+        <p>Win any lot before then and they stay, along with everything you earn next. Every ${s.points_per_reward} points is ${formatMoney(s.reward_cents)} off a future win.</p>
+        <p><a href="${SITE_URL}/auctions" style="background:#1a1a1a;color:#fff;padding:9px 16px;border-radius:6px;text-decoration:none;">See what's on</a></p>
+        <p style="margin-top:24px;font-size:12px;color:#666;">${escapeHtml(BUSINESS_NAME)} &middot; ${escapeHtml(REPLY_TO)}${BUSINESS_POSTAL_ADDRESS ? ' &middot; ' + escapeHtml(BUSINESS_POSTAL_ADDRESS) : ''}</p>`;
+      if (await sendEmail({ from: BUYER_FROM, to: email, subject: `Your ${r.balance} points expire on ${when}`, html: emailHtml('Your points expire soon', body), kind: 'points_expiry' })) reminded++;
+    }
+    const { data: expired, error: eErr } = await supabase.rpc('points_expire_due', { p_now: now.toISOString(), p_months: s.expiry_months });
+    if (eErr) console.error('points expiry failed:', eErr.message);
+    return { reminded, expired: Number(expired) || 0 };
+  } catch (e) {
+    console.error('runPointsHousekeeping error:', e.message);
+    return null;
+  }
+}
+
 app.get('/admin/watch-counts', requireAdmin, async (req, res) => {
   const auctionId = canonicalUuid(req.query.auction_id);
   if (!auctionId) return res.status(400).json({ error: 'Invalid auction_id' });
@@ -4757,6 +5222,9 @@ async function autoCloseStandardItems() {
 
     // Step 4: watch-list reminders (F3). Never throws; does nothing before migration w.
     await runReminders()
+
+    // Step 5: points expiry + reminders (G2). Hourly; never throws; does nothing with points off.
+    await runPointsHousekeeping()
   } catch (e) {
     console.error('autoCloseStandardItems error:', e)
   } finally {

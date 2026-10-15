@@ -281,6 +281,16 @@ addresses. Production never sets it, and Railway traffic never arrives from loop
   grants unchanged). Security Advisor: 0 errors, 0 warnings. Suite: `function-search-path.js`
   (BEFORE: records the controls, including a real shadowing through a caller's temp tables, and exits 2).
 
+
+**Buyer points + promotions (G2)** (wtf-handoff `POINTS_BRIEF.md`, 2026-10-15). Needs migration
+`2026-10-15z-points.sql` (applied on wtf-test 2026-10-15; **not yet on production**). Ships switched off:
+`POINTS_ENABLED=true` on Railway and the admin switch must both be on. Contracts in `API.md`.
+
+| Suite | Proves |
+|---|---|
+| `points.js` | The pure maths in `rewards.js`; points earned only on a PAID invoice (a decline earns nothing), whole points per lot; ONE reward per invoice (600 points, $500 won -> one $25); the premium worked out on the lower amount, and the amount sent to Stripe equals the discounted total; auto-apply off = no reward; never below $0 (a $10 win with a $25 reward is $0, paid, no Stripe call; a 23c remainder under Stripe's minimum also comes off); a re-run changes nothing; two invoices for a 250-point buyer built at once -> exactly one reward; % code enter / refuse (bad, draft, closed, after the invoice) / best-of with the reward (no stacking, the loser untouched); public promotions never carry the code; `charge.refunded` takes points back, never below 0, the admin told about a shortfall or a partial refund; free-shipping and bundle bonus on the real label route (label bought, buyer not charged); expiry reminder once ~30 days before and expiry after 12 months with no win (fake clock); `/me/points` and `/my-orders` only the caller's; every admin route 403 for buyers; with `POINTS_ENABLED` unset nothing shows and invoices, emails and postage are exactly as before; `delete_account` removes the points rows. Stripe, Resend and Shippo are stubs in the server process; `points_settings.enabled` is switched on for the run and restored. Exits 2 before migration z. |
+| `account-delete.js` | Extended: after migration z, D's points history, balance, auto-apply setting and entered code are removed; E's points and D's invoice amounts untouched. |
+
 ## Not covered
 
 - **Before live mode is turned back on (parked 2026-09-27, do both together).**

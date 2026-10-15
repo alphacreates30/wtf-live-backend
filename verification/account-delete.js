@@ -73,14 +73,25 @@ async function history(D, E) {
     die(await s.from('notifications').insert({ user_id: D.id, kind: 'lot_closing', payload: { item_id: lot.id }, channel: 'push' }).select());
     die(await s.from('notifications').insert({ user_id: D.id, kind: 'auction_open', payload: { auction_id: a.id }, sent_at: new Date().toISOString() }).select());
   }
+  if (HAS_Z) {
+    // G2 (migration z): D has points (an adjust and a redeem on the invoice), an auto-apply setting and an entered promo
+    // code; E has points too, which must stay.
+    die(await s.from('points_accounts').insert({ user_id: D.id, auto_apply: false }).select());
+    die(await s.from('points_accounts').insert({ user_id: E.id, auto_apply: true }).select());
+    die(await s.from('points_ledger').insert([{ user_id: D.id, kind: 'adjust', points: 300, note: 'ZZTEST_del' }, { user_id: D.id, kind: 'redeem', points: -250, invoice_id: inv.id, note: 'ZZTEST_del' },
+      { user_id: E.id, kind: 'adjust', points: 40, note: 'ZZTEST_del' }]).select());
+    const promo = die(await s.from('promotions').insert({ auction_id: a.id, kind: 'percent_code', code: 'ZZDEL' + String(D.id).slice(0, 6).toUpperCase(), percent: 10, starts_at: new Date(Date.now() - 36e5).toISOString(), ends_at: new Date(Date.now() + 36e5).toISOString() }).select().single());
+    die(await s.from('promotion_uses').insert({ promotion_id: promo.id, user_id: D.id, auction_id: a.id }).select());
+  }
   const ord = die(await s.from('orders').insert({ auction_id: a.id, item_id: lot.id, invoice_id: inv.id, buyer_username: D.username, buyer_user_id: String(D.id), item_title: 'ZZTEST_del order', final_bid: 10, hammer_cents: 1000, premium_cents: 150, total_cents: 1150, status: 'delivered', payment_status: 'paid', payment_intent_id: 'pi_ZZTEST_del', ship_name: D.prof.full_name, ship_address1: D.prof.address_line1, ship_city: 'Secretville', ship_state: 'CA', ship_zip: '94999' }).select().single());
   return { a: a.id, lot: lot.id, inv: inv.id, ord: ord.id };
 }
 
-let HAS_W = false;
+let HAS_W = false, HAS_Z = false;
 (async () => {
   let srv;
   HAS_W = !(await s.from('lot_watches').select('item_id').limit(1)).error;
+  HAS_Z = !(await s.from('points_ledger').select('id').limit(1)).error;
   try {
     for (const f of [CALLS, MAIL]) { try { fs.unlinkSync(f); } catch {} }
     const D = await buyer('d'), E = await buyer('e');
@@ -108,6 +119,13 @@ let HAS_W = false;
       ok(dn.data.length === 1 && dn.data[0].sent_at, 'watch list (F3): D\'s unsent reminder removed; the one already sent stays as history');
       ok(ew.data.length === 1 && ep.data.length === 1 && ep.data[0].lot_closing === false, 'watch list (F3): E\'s watch and settings untouched');
     } else console.log('NOTE migration w not on this database: watch-list checks skipped');
+    if (HAS_Z) {
+      const q = (t, id) => s.from(t).select('user_id').eq('user_id', id);
+      const [dl, da, du, el, ea] = await Promise.all([q('points_ledger', D.id), q('points_accounts', D.id), q('promotion_uses', D.id), q('points_ledger', E.id), q('points_accounts', E.id)]);
+      const dInv = die(await s.from('invoices').select('total_cents').eq('id', H.inv).single());
+      ok(!dl.data.length && !da.data.length && !du.data.length, "points (G2): D's points history, balance, auto-apply setting and entered promo code removed");
+      ok(el.data.length === 1 && ea.data.length === 1 && dInv.total_cents === 1150, "points (G2): E's points untouched; D's invoice keeps its amounts");
+    } else console.log('NOTE migration z not on this database: points checks skipped');
     const calls = lines(CALLS);
     ok(calls.join('|') === [`list ${D.prof.stripe_customer_id}`, 'detach pm_ZZFAKE_1', 'detach pm_ZZFAKE_2', `del ${D.prof.stripe_customer_id}`].join('|'), `Stripe: both saved cards detached, then the customer deleted (${calls.length} calls)`);
 
@@ -174,6 +192,10 @@ let HAS_W = false;
     await s.from('account_deletions').delete().in('user_id', made.users);
     await s.from('password_resets').delete().in('user_id', made.users);
     if (HAS_W) for (const t of ['notifications', 'notification_prefs', 'auction_follows', 'lot_watches']) await s.from(t).delete().in('user_id', made.users);
+    if (HAS_Z) {
+      for (const t of ['points_ledger', 'points_accounts', 'promotion_uses']) await s.from(t).delete().in('user_id', made.users);
+      await s.from('promotions').delete().in('auction_id', made.auctions);
+    }
     await s.from('profiles').delete().in('user_id', made.users.map(String));
     await s.from('users').delete().in('id', made.users);
     await s.from('reserved_usernames').delete().in('username_hash', ['d', 'e'].map(l => sha(`zzdel_${l}_${tag}`)));
