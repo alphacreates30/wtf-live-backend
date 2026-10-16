@@ -14,7 +14,7 @@ const AUCTION_PUBLIC = [
 ];
 const LOT_PUBLIC = [
   'id', 'auction_id', 'position', 'title', 'description', 'condition', 'image_url', 'thumb_url', 'starting_bid',
-  'current_bid', 'bid_count', 'pre_bid_count', 'status', 'ends_at', 'created_at',
+  'current_bid', 'bid_count', 'pre_bid_count', 'status', 'ends_at', 'created_at', 'offer_next',
 ];
 
 const pick = (row, keys) => {

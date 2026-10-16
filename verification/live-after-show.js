@@ -8,7 +8,11 @@
 //   end        End is refused while a lot is open; Pass closes it with no sale
 //   one box    every lot a buyer wins in a show is in one order group
 //   summary    after the show, ONE "your show wins" email per buyer (lots, declined ones marked, one box); never twice
-//   re-offer   only after the show, only an unpaid lot: to a timed auction (open until its end, photos copied) or a
+//   re-run     "Re-run now" while the show is on air (host only, only a declined lot): back in this show's lineup,
+//              next or at the end (next_item takes it in that order; new lot numbers); the order is cancelled, points
+//              back; the buyer is told in the room and by email, the host's alert clears, the room sees only the
+//              lineup; the buyer still can't bid on the same card, and fixing it later charges nothing
+//   re-offer   elsewhere only after the show, only an unpaid lot: to a timed auction (open until its end, photos copied) or a
 //              later live show (waiting); the order is cancelled and leaves the box; a points reward spent on it comes
 //              back; the admin's count of failed live payments per buyer
 //   expiry     a show not on air 24 h after its start releases its pre-bids: deleted, one email per bidder, an outbox
@@ -76,19 +80,20 @@ const charges = () => lines(CALLS).filter(c => !c.capture);   // not the $1 card
 
     const D = await mkUser('d', { pm: 'pm_ZZLIVE_bad' }), E = await mkUser('e', { pm: 'pm_ZZLIVE_bad' }), F = await mkUser('f', { pm: 'pm_ZZLIVE_bad' });
     const W = await mkUser('w'), P = await mkUser('p');
-    const prices = [7, 10, 40, 12, 9, 40, 5, 6];
+    const G = await mkUser('g', { pm: 'pm_ZZLIVE_bad' }), H = await mkUser('h', { pm: 'pm_ZZLIVE_bad' });
+    const prices = [7, 10, 40, 12, 9, 40, 5, 6, 40, 8, 4];
     const show = await mkShow('main', { lots: prices.length });
     for (let i = 0; i < prices.length; i++) die(await s.from('auction_items').update({ starting_bid: prices[i] }).eq('id', show.lots[i]).select());
-    const [L1, L2, L3, L4, L5, L6, L7, L8] = show.lots;
+    const [L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11] = show.lots;
     die(await s.from('item_images').insert({ item_id: L3, url: 'https://example.invalid/zz-l3-2.jpg', position: 1 }).select());
-    for (const u of [D, E, F, W, P]) await terms(u, show.id);
-    die(await s.from('points_ledger').insert([{ user_id: E.id, kind: 'adjust', points: 300, note: 'zztest' }, { user_id: P.id, kind: 'adjust', points: 300, note: 'zztest' }]).select());
+    for (const u of [D, E, F, W, P, G, H]) await terms(u, show.id);
+    die(await s.from('points_ledger').insert([{ user_id: E.id, kind: 'adjust', points: 300, note: 'zztest' }, { user_id: P.id, kind: 'adjust', points: 300, note: 'zztest' }, { user_id: G.id, kind: 'adjust', points: 300, note: 'zztest' }]).select());
     await prebid(E, show.id, L8, 30);   // made before the show
 
     const host = await client(srv.url, show.id, ADMIN);
     const anon = await client(srv.url, show.id);
     const so = {};
-    for (const [k, u] of Object.entries({ D, E, F, W, P })) so[k] = await client(srv.url, show.id, u);
+    for (const [k, u] of Object.entries({ D, E, F, W, P, G, H })) so[k] = await client(srv.url, show.id, u);
     async function sell(lotId, key, price) {
       const from = anon.mark();
       const e = await ask(host, 'next_item', { timerSeconds: 5 }, ['item_activated', 'host_error']);
@@ -158,6 +163,71 @@ const charges = () => lines(CALLS).filter(c => !c.capture);   // not the $1 card
     ok(r.s === 400 && /until the end of the show/.test(r.j.error), `re-offer during the show -> ${r.s} ${r.j && r.j.error}`);
     r = await call(srv.url, 'POST', `/admin/live/orders/${o3.id}/reoffer`, E, { auction_id: timed });
     ok(r.s === 403, `a buyer can't re-offer -> ${r.s}`);
+
+    console.log('\n== "Re-run now": a declined lot back in this show ==');
+    const fromHo = host.mark();
+    await sell(L9, 'G', 40);   // G has 300 points: a $25 reward, then the card declines
+    await sell(L10, 'H', 8);
+    const [o9, o10] = [await settle(L9), await settle(L10)];
+    const a9 = await host.waitFor('lot_payment_failed', p => p.item_id === L9, 4000, fromHo);
+    ok(o9.payment_status === 'failed' && o9.discount_kind === 'points_reward' && o10.payment_status === 'failed' && a9 && a9.payload.can_rerun === true && a9.payload.lot_number === 9,
+      `G's lot 9 and H's lot 10 declined; the host's alert offers "Re-run now" (${JSON.stringify(a9 && { can_rerun: a9.payload.can_rerun, lot: a9.payload.lot_number })})`);
+    un = await call(srv.url, 'GET', `/admin/live/${show.id}/unpaid`, ADMIN);
+    ok(un.j.can_rerun === true && un.j.can_reoffer === false && un.j.lots.length === 4, `the unpaid list during the show: can_rerun, ${un.j.lots && un.j.lots.length} lots`);
+    e = await ask(so.W, 'rerun_lot', { orderId: o9.id }, ['rerun_ok', 'host_error']);
+    ok(e && e.event === 'host_error', `a buyer can't re-run -> ${e && e.payload.message}`);
+    e = await ask(host, 'rerun_lot', { orderId: o4.id }, ['rerun_ok', 'host_error']);
+    ok(e && e.event === 'host_error' && /unpaid/.test(e.payload.message), `re-run a paid lot -> ${e && e.payload.message}`);
+    // H's lot 10 at the end, then G's lot 9 next: lot 9's copy is offered before lot 11 and lot 10's copy.
+    const fromA = anon.mark(), fromG = so.G.mark(), fromH3 = host.mark();
+    const endRun = await ask(host, 'rerun_lot', { orderId: o10.id, next: false }, ['rerun_ok', 'host_error']);
+    const nextRun = await ask(host, 'rerun_lot', { orderId: o9.id, next: true }, ['rerun_ok', 'host_error']);
+    ok(endRun?.event === 'rerun_ok' && nextRun?.event === 'rerun_ok' && endRun.payload.lot_number === 12 && nextRun.payload.lot_number === 13,
+      `two re-runs: lot 10 again as lot ${endRun && endRun.payload.lot_number} (at the end), lot 9 again as lot ${nextRun && nextRun.payload.lot_number} (next)`);
+    const C10 = endRun.payload.item_id, C9 = nextRun.payload.item_id;
+    const [c9, c10] = [await K.lot(C9), await K.lot(C10)];
+    const o9b = await orderOf(L9), o10b = await orderOf(L10);
+    ok(c9.status === 'pending' && c9.offer_next === true && c9.auction_id === show.id && c9.title === (await K.lot(L9)).title && Number(c9.starting_bid) === 40 && c10.offer_next === false,
+      "the copies wait in this show (lot 9's offered next, lot 10's at the end); lot numbers never change");
+    ok(o9b.payment_status === 'cancelled' && o9b.reoffered_item_id === C9 && o9b.group_id === null && (await K.lot(L9)).status === 'unsold' && o10b.reoffered_item_id === C10,
+      'the declined orders are cancelled (kept as the record, pointing at the new lots); lot 9 marked unsold');
+    const ledG = (await s.from('points_ledger').select('kind, points, order_id').eq('user_id', G.id)).data;
+    ok(ledG.some(x => x.kind === 'adjust' && x.points === 250 && x.order_id === o9.id) && ledG.reduce((a, x) => a + x.points, 0) === 300, "G's 250 points spent on lot 9 came back (balance 300)");
+    const gTold = await so.G.waitFor('lot_rerun', p => p.rerun_of.item_id === L9, 3000, fromG);
+    const hTold = await host.waitFor('lot_rerun', p => p.rerun_of.item_id === L9, 3000, fromH3);
+    const aTold = await anon.waitFor('lot_rerun', p => p.rerun_of.item_id === L9, 3000, fromA);
+    ok(gTold && gTold.payload.you && gTold.payload.message === 'Your card was declined, so lot 9 was offered again.', `G is told in the room: "${gTold && gTold.payload.message}"`);
+    ok(hTold && hTold.payload.order_id === o9.id && hTold.payload.buyer === G.username, "the host's alert clears (lot_rerun with the order)");
+    ok(aTold && aTold.payload.item.id === C9 && aTold.payload.next === true && !('message' in aTold.payload) && !('buyer' in aTold.payload) && !('order_id' in aTold.payload),
+      'the room sees the lineup change, not who it was');
+    for (let i = 0; i < 20 && !mailsTo(G).some(m => /Lot 9 was offered again/.test(m.subject)); i++) await sleep(100);
+    const gMail = mailsTo(G).filter(m => /Lot 9 was offered again/.test(m.subject));
+    ok(gMail.length === 1 && /Your card was declined, so lot 9 was offered again/.test(gMail[0].html) && /won't be charged/.test(gMail[0].html) && /points reward on it is back/.test(gMail[0].html),
+      'G is emailed: lot 9 was offered again, not charged, points back');
+    from = anon.mark();
+    const act = await ask(host, 'next_item', { timerSeconds: 5 }, ['item_activated', 'host_error']);
+    ok(act && act.event === 'item_activated' && act.payload.item.id === C9, `next_item offers lot 9's copy next, before lot 11 (${act && act.payload.item ? 'lot ' + (act.payload.item.position + 1) : JSON.stringify(act && act.payload)})`);
+    e = await ask(so.G, 'place_bid', { itemId: C9, max_amount: 60 }, ['bid_ok', 'bid_error']);
+    ok(e && e.event === 'bid_error' && e.payload.code === 'payment_failed', `G (same card) still can't bid in the show -> ${e && e.payload.code}`);
+    await ask(so.P, 'place_bid', { itemId: C9, max_amount: 40 }, ['bid_ok']);
+    await anon.waitFor('lot_closed', p => p.item_id === C9, 15000, from);
+    const oc9 = await settle(C9);
+    ok(oc9 && oc9.buyer_username === P.username && oc9.payment_status === 'paid' && oc9.total_cents === 4000, `the re-run lot sells to P for $40 (${oc9 && oc9.payment_status})`);
+    const fromG3 = so.G.mark();
+    r = await call(srv.url, 'POST', '/save-payment-method', G, { payment_method_id: 'pm_ZZLIVE_good3' });
+    const gOk = await so.G.waitFor('payment_ok', p => p.charged === false, 4000, fromG3);
+    await sleep(500);
+    ok(r.j.card_verified === true && (await orderOf(L9)).payment_status === 'cancelled' && !charges().some(c => c.md.order_id === o9.id) && gOk,
+      'G fixes the card: lot 9 is NOT charged, and G hears "you can bid again"');
+    await sell(L11, null);
+    from = anon.mark();
+    const act10 = await ask(host, 'next_item', { timerSeconds: 30 }, ['item_activated']);
+    e = await ask(so.H, 'place_bid', { itemId: C10, max_amount: 20 }, ['bid_ok', 'bid_error']);
+    const eG = await ask(so.G, 'place_bid', { itemId: C10, max_amount: 9 }, ['bid_ok', 'bid_error']);
+    ok(act10?.payload.item.id === C10 && e?.payload.code === 'payment_failed' && eG?.event === 'bid_ok',
+      `then lot 11, then lot 10's copy at the end: H (card not fixed) can't bid (${e && e.payload.code}), G (new card) can (${eG && eG.event})`);
+    await ask(host, 'pass_lot', {}, ['lot_closed', 'host_error']);   // passed: no sale, so the summary counts below stay as they were
+    await anon.waitFor('lot_closed', p => p.item_id === C10, 5000, from);
 
     console.log('\n== End the show: one summary email per buyer ==');
     const mailsBefore = lines(MAIL).length;

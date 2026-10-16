@@ -243,9 +243,10 @@ Socket events (payloads always include `auctionId` and the buyer's/host's `token
 |---|---|---|
 | `place_bid { itemId?, max_amount }` | buyer | A max bid on the open lot (no `itemId` = the lot open now). Same engine as timed lots (`place_standard_bid`: proxy/max, tiers, row lock). Answers `bid_ok` (the public lot + `your_status`, `max_only: true` when the leader only raised their max) or `bid_error { message, code }`: the "Who may bid" codes, or `live_off`, `login_required`, `terms_required`, `payment_failed` (their card was declined for a lot in this show and isn't fixed yet), `not_on_air`, `bad_amount`, `not_found`, `lot_not_open`, `below_minimum`, `refused`, `rate_limited`. |
 | `start_auction` | host | On air (`upcoming` → `live`; sets `on_air_at`). |
-| `next_item { timerSeconds = 30, suddenDeath = false }` | host | Offers the next `pending` lot (by position) and starts its clock: **60, 30, 15 or 5 s** (any other value is refused). Pre-bids from buyers whose card was declined in this show are dropped first. Refused while a lot is open. |
+| `next_item { timerSeconds = 30, suddenDeath = false }` | host | Offers the next `pending` lot (a lot re-run "next" first, `offer_next`; then by position) and starts its clock: **60, 30, 15 or 5 s** (any other value is refused). Pre-bids from buyers whose card was declined in this show are dropped first. Refused while a lot is open. |
 | `extend_auction { extraSeconds }` | host | Adds 1–120 s to the open lot's clock. |
 | `pass_lot` | host | Closes the open lot with **no sale** (`unsold`, no order), whatever its bids. |
+| `rerun_lot { orderId, next = true }` | host | **"Re-run now"** on a declined-card alert, while the show is on air: a copy of the lot goes back in this show's lineup, offered next (`next: true`) or at the end (`false`), with the next free lot number. The declined order is cancelled (kept, `reoffered_item_id` = the copy) and is never charged, even if the buyer fixes their card later; a points reward spent on it is given back. Answers `rerun_ok { order_id, item_id, lot_number, next }` or `host_error` (code `rerun_refused`: not a declined lot, show not on air). |
 | `end_auction` | host | Ends the show. **Refused while a lot is open** (`host_error` code `lot_open`): let its clock finish or Pass it. Then the after-show emails. |
 
 | Event (server → client) | Payload |
@@ -255,8 +256,9 @@ Socket events (payloads always include `auctionId` and the buyer's/host's `token
 | `new_bid` | `{ auction_id, item_id, amount, bid_count, ends_at, server_now, you_lead }` |
 | `item_extended` | `{ auctionId, item_id, ends_at, server_now }` (the host's +N s) |
 | `lot_closed` | `{ auctionId, item_id, status: "sold" \| "unsold", amount, you_won, passed? }` |
-| `payment_failed` / `payment_ok` | to the buyer only: `{ auctionId, item_id, order_id, amount_cents, message }` (declined at the hammer / charged after they saved a new card) |
-| `lot_payment_failed` / `lot_payment_fixed` | to the host only: `{ auctionId, item_id, order_id, amount_cents, buyer, item_title, reason? }` |
+| `payment_failed` / `payment_ok` | to the buyer only: `{ auctionId, item_id, order_id, amount_cents, lot_number, message }` (declined at the hammer / charged after they saved a new card). `payment_ok { auctionId, charged: false, message }`: their declined lots were all re-run, and the new card lets them bid again |
+| `lot_payment_failed` / `lot_payment_fixed` | to the host only: `{ auctionId, item_id, order_id, amount_cents, lot_number, buyer, item_title, reason?, can_rerun? }` (`can_rerun`: the show is on air, so "Re-run now" works) |
+| `lot_rerun` | to the room: `{ auctionId, item (public lot, `offer_next`), lot_number, next, rerun_of: { item_id, lot_number, status: "unsold" } }`. The buyer also gets `you: true, message: "Your card was declined, so lot N was offered again."`; the host gets `order_id, buyer` (clears the alert). Nobody else learns who it was |
 | `items_finished`, `auction_started`, `auction_ended` | `{ auctionId }` |
 | `host_error` | `{ message, code? }` |
 
@@ -269,7 +271,9 @@ win email; a declined card emails the buyer and the admin at once.
 
 After a decline (phase 1b, migration `2026-10-16zb`): the buyer can't bid or pre-bid in that show (`payment_failed`)
 until they save a card that passes the $1 check (`POST /save-payment-method`); that charges their declined live lots
-at once. **One box per buyer per show:** every lot a buyer wins in a show (not pickup) joins one `orders.group_id`,
+at once. **Re-run now** (`rerun_lot`): the host can put a declined lot straight back in the show instead of waiting;
+the buyer is told in the room and by email ("Lot N was offered again"), that order is never charged, and the buyer
+still can't bid in the show until they save a new card. **One box per buyer per show:** every lot a buyer wins in a show (not pickup) joins one `orders.group_id`,
 so the label and postage go through the existing group flow once. **After the show:** one "Your wins from …" email
 per buyer (lots, declined ones marked, the one-box or pickup note), sent once every charge has settled
 (`auctions.live_summary_sent_at`). **Pre-bid expiry:** a live show with no `on_air_at` 24 h after its `starts_at`
@@ -277,10 +281,11 @@ releases its pre-bids (deleted; one email per bidder; a `notifications` row of k
 once per show, `prebids_released_at`); `POST …/prebid` on it is then 400 `{ code: "prebids_released" }`.
 
 Admin (403 for anyone else):
-- `GET /admin/live/:id/unpaid` → `{ show, can_reoffer (the show has ended), lots: [ { id (order), item_id, item_title,
+- `GET /admin/live/:id/unpaid` → `{ show, can_rerun (on air), can_reoffer (the show has ended), lots: [ { id (order), item_id, item_title,
   buyer_username, buyer_user_id, total_cents, payment_error, created_at } ] }`: lots whose card was declined and not fixed.
-- `POST /admin/live/orders/:orderId/reoffer { auction_id }` → `{ item_id, auction_id }`. Only after the show, only an
-  unpaid lot. `auction_id` = a later live show (the copy waits there, `pending`) or a timed auction that hasn't ended
+- `POST /admin/live/orders/:orderId/reoffer { auction_id, next? }` → `{ item_id, auction_id, lot_number }`. Only an
+  unpaid lot. `auction_id` = **the same show while it is on air** (= `rerun_lot`; `next`, default true), or, only after
+  the show, a later live show (the copy waits there, `pending`) or a timed auction that hasn't ended
   (the copy is `open` until that auction's `ends_at`). Title, description, condition, photos and starting bid are
   copied; the order becomes `cancelled` (kept as the record) and leaves the box; a points reward spent on it is given
   back. 400 with the reason otherwise.

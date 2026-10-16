@@ -2178,8 +2178,9 @@ async function tellRoomAboutPayment(orderId, r) {
   try {
     const { data: o } = await supabase.from('orders').select('id, auction_id, item_id, item_title, buyer_username, total_cents').eq('id', orderId).maybeSingle();
     if (!o) return;
-    const { data: a } = await supabase.from('auctions').select('host_username').eq('id', o.auction_id).maybeSingle();
-    const base = { auctionId: o.auction_id, item_id: o.item_id, order_id: o.id, amount_cents: o.total_cents };
+    const { data: a } = await supabase.from('auctions').select('host_username, status').eq('id', o.auction_id).maybeSingle();
+    const { data: lot } = await supabase.from('auction_items').select('position').eq('id', o.item_id).maybeSingle();
+    const base = { auctionId: o.auction_id, item_id: o.item_id, order_id: o.id, amount_cents: o.total_cents, lot_number: lot ? lot.position + 1 : null };
     for (const s of await io.in(o.auction_id).fetchSockets()) {
       const u = s.data?.username;
       if (u && u === o.buyer_username) {
@@ -2188,7 +2189,9 @@ async function tellRoomAboutPayment(orderId, r) {
           : "Your card was declined for a lot you won. Update your card to keep bidding: we'll charge it as soon as you do." });
       } else if (u && (u === a?.host_username || u === ADMIN_USERNAME)) {
         // The host is the admin: they see who it is (their orders page already does).
-        s.emit(r.success ? 'lot_payment_fixed' : 'lot_payment_failed', { ...base, buyer: o.buyer_username, item_title: o.item_title, ...(r.success ? {} : { reason: r.error || null }) });
+        // can_rerun: the alert's "Re-run now" (rerun_lot), while the show is on air.
+        s.emit(r.success ? 'lot_payment_fixed' : 'lot_payment_failed', { ...base, buyer: o.buyer_username, item_title: o.item_title,
+          ...(r.success ? {} : { reason: r.error || null, can_rerun: a?.status === 'live' }) });
       }
     }
   } catch (e) {
@@ -2200,8 +2203,7 @@ async function tellRoomAboutPayment(orderId, r) {
 // doesn't count: it is removed before the lot opens (it would otherwise make them the leader).
 async function dropBlockedPrebids(auctionId, itemId) {
   try {
-    const { data: blocked } = await supabase.from('orders').select('buyer_user_id').eq('auction_id', auctionId).eq('payment_status', 'failed').is('invoice_id', null);
-    const ids = [...new Set((blocked || []).map(o => o.buyer_user_id).filter(Boolean))];
+    const ids = await liveBlockedBuyers(auctionId);
     if (!ids.length) return;
     const { data: gone } = await supabase.from('pre_bids').delete().eq('item_id', itemId).in('buyer_user_id', ids).select('id');
     if (gone?.length) console.log(`Lot ${itemId}: ${gone.length} pre-bid(s) from buyers with a declined card in this show not counted`);
@@ -2210,27 +2212,98 @@ async function dropBlockedPrebids(auctionId, itemId) {
   }
 }
 
-// Does this buyer have a declined, not yet fixed, live lot in this show? Then they can't bid in it again.
+// The buyers who can't bid in this show: a declined live lot not yet fixed, or a declined lot the host re-ran in the
+// show ("Re-run now": that order is cancelled, but the card is the same one) with no new card saved since that win.
+// userId narrows it to one buyer. Returns their ids.
+async function liveBlockedBuyers(auctionId, userId = null) {
+  let q = supabase.from('orders').select('buyer_user_id, payment_status, created_at').eq('auction_id', auctionId).is('invoice_id', null)
+    .or('payment_status.eq.failed,and(payment_status.eq.cancelled,reoffered_item_id.not.is.null)');
+  if (userId) q = q.eq('buyer_user_id', String(userId));
+  const { data, error } = await q;
+  if (error) { if (!rewardsLib.notMigrated(error)) console.error('liveBlockedBuyers:', error.message); return []; }
+  const blocked = new Set((data || []).filter(o => o.payment_status === 'failed').map(o => o.buyer_user_id));
+  const rerun = (data || []).filter(o => o.payment_status === 'cancelled' && !blocked.has(o.buyer_user_id));
+  if (rerun.length) {
+    const { data: profs } = await supabase.from('profiles').select('user_id, card_verified_at').in('user_id', [...new Set(rerun.map(o => o.buyer_user_id))]);
+    const verifiedAt = new Map((profs || []).map(p => [String(p.user_id), p.card_verified_at ? Date.parse(p.card_verified_at) : 0]));
+    for (const o of rerun) if (!(verifiedAt.get(String(o.buyer_user_id)) > Date.parse(o.created_at))) blocked.add(o.buyer_user_id);
+  }
+  return [...blocked].filter(Boolean);
+}
+
+// Can this buyer not bid in this show (liveBlockedBuyers)?
 async function liveUnpaid(userId, auctionId) {
-  const { data } = await supabase.from('orders').select('id').eq('auction_id', auctionId).eq('buyer_user_id', String(userId))
-    .eq('payment_status', 'failed').is('invoice_id', null).limit(1);
-  return !!data?.length;
+  return (await liveBlockedBuyers(auctionId, userId)).length > 0;
 }
 const LIVE_UNPAID = "Your card was declined for a lot you won in this show. Update your card on your profile page to keep bidding.";
 
 // A buyer saved a card that passed the $1 check: their declined live lots are charged again at once (paid ones
-// clear the room alerts). A lot the host already re-offered is cancelled, so it is never charged. Never throws.
+// clear the room alerts). A lot the host already re-offered or re-ran is cancelled, so it is never charged; in a show
+// still on air, a buyer whose declined lots were all re-run hears "you can bid again". Never throws.
 async function retryLiveOrdersFor(userId) {
   try {
     const { data: failed } = await supabase.from('orders').select('id, auction_id').eq('buyer_user_id', String(userId))
       .eq('payment_status', 'failed').is('invoice_id', null).is('payment_intent_id', null);
-    if (!failed?.length) return;
-    const { data: live } = await supabase.from('auctions').select('id').eq('mode', 'live').in('id', [...new Set(failed.map(o => o.auction_id))]);
+    const { data: rerun } = await supabase.from('orders').select('auction_id, buyer_username').eq('buyer_user_id', String(userId))
+      .eq('payment_status', 'cancelled').not('reoffered_item_id', 'is', null);
+    if (!failed?.length && !rerun?.length) return;
+    const { data: live } = await supabase.from('auctions').select('id, status').eq('mode', 'live')
+      .in('id', [...new Set([...(failed || []), ...(rerun || [])].map(o => o.auction_id))]);
     const liveIds = new Set((live || []).map(a => a.id));
-    for (const o of failed) if (liveIds.has(o.auction_id)) await chargeLiveOrder(o.id, { retry: true });
+    for (const o of failed || []) if (liveIds.has(o.auction_id)) await chargeLiveOrder(o.id, { retry: true });
+    const onAir = new Set((live || []).filter(a => a.status === 'live').map(a => a.id));
+    for (const auctionId of new Set((rerun || []).filter(o => onAir.has(o.auction_id)).map(o => o.auction_id))) {
+      if ((failed || []).some(o => o.auction_id === auctionId) || await liveUnpaid(userId, auctionId)) continue;   // told by the charge
+      const username = rerun.find(o => o.auction_id === auctionId).buyer_username;
+      for (const s of await io.in(auctionId).fetchSockets()) {
+        if (username && s.data?.username === username) s.emit('payment_ok', { auctionId, charged: false, message: 'Your card is updated. You can bid again.' });
+      }
+    }
   } catch (e) {
     console.error('retryLiveOrdersFor error:', userId, e.message);
   }
+}
+
+// Re-offer a declined live lot (reoffer_live_order, migration zb): into a later show or a timed auction once the
+// show has ended, or back into the same show while it is on air ("Re-run now": next = offered next, else at the end
+// of the lineup). On a re-run the room hears the lineup changed, the host's alert clears, and the buyer is told in
+// the room and by email; the cancelled order is never charged, even if they fix their card later.
+// Returns { item_id, lot_number } or { error, status } (status 400: refused; 500: the database).
+async function reofferLiveOrder(orderId, targetId, next = false) {
+  const { data: newId, error } = await supabase.rpc('reoffer_live_order', { p_order_id: orderId, p_target_auction_id: targetId, p_next: !!next });
+  if (error) {
+    if (error.code === 'P0001') return { error: error.message, status: 400 };
+    console.error('reoffer_live_order failed:', orderId, error.code, error.message);
+    return { error: 'Could not re-offer the lot', status: 500, dbError: error };
+  }
+  const { data: lots } = await supabase.from('auction_items').select('*').in('id', [newId]);
+  const lot = lots?.[0];
+  const out = { item_id: newId, lot_number: lot ? lot.position + 1 : null };
+  try {
+    const { data: o } = await supabase.from('orders').select('id, auction_id, item_id, item_title, buyer_user_id, buyer_username').eq('id', orderId).maybeSingle();
+    if (!o || o.auction_id !== targetId || !lot) return out;
+    // A re-run in the same show.
+    const { data: show } = await supabase.from('auctions').select('id, title, host_username').eq('id', o.auction_id).maybeSingle();
+    const { data: old } = await supabase.from('auction_items').select('position').eq('id', o.item_id).maybeSingle();
+    const n = old ? old.position + 1 : null;
+    const said = `Your card was declined, so lot ${n} was offered again.`;
+    await emitPerViewer(o.auction_id, 'lot_rerun', u => ({
+      auctionId: o.auction_id, item: publicLot(lot), lot_number: out.lot_number, next: !!lot.offer_next,
+      rerun_of: { item_id: o.item_id, lot_number: n, status: 'unsold' },
+      ...(u && u === o.buyer_username ? { you: true, message: said } : {}),
+      ...(u && (u === show?.host_username || u === ADMIN_USERNAME) ? { order_id: o.id, buyer: o.buyer_username } : {}),
+    }));
+    const { data: back } = await supabase.from('points_ledger').select('points').eq('order_id', o.id).eq('kind', 'adjust').limit(1);
+    const email = await getBuyerEmail(o.buyer_user_id);
+    if (email) await sendEmail({ from: BUYER_FROM, to: email, subject: `Lot ${n} was offered again`, kind: 'failed',
+      html: emailHtml(`Lot ${n} was offered again`, `
+        <p>${escapeHtml(said)} The lot was <strong>${escapeHtml(o.item_title)}</strong> in <strong>${escapeHtml(show?.title || 'the show')}</strong>.</p>
+        <p style="margin:16px 0 0;">You won't be charged for it, even if you update your card later.${back?.length ? ' The points reward on it is back in your balance.' : ''}</p>
+        <p style="margin:16px 0 0;">To keep bidding in this show, update your card on your profile page.</p>`) });
+  } catch (e) {
+    console.error('reofferLiveOrder: telling the room/buyer failed:', orderId, e.message);
+  }
+  return out;
 }
 
 // One box per buyer per show (brief §1.6): every lot a buyer wins in a show joins one order group, so packing, the
@@ -2739,6 +2812,20 @@ io.on('connection', (socket) => {
     console.log(`- Host ${h.user.username} passed lot ${lot.id}`);
   });
 
+  // "Re-run now" on the host's declined-card alert (Albert, Oct 16): { orderId, next: true (offered next) | false (at
+  // the end of the lineup) }. Only while the show is on air; the order is cancelled and never charged (reofferLiveOrder).
+  on('rerun_lot', async ({ auctionId, orderId, next = true, token }) => {
+    const h = await liveHost(auctionId, token);
+    if (!h) return;
+    const id = canonicalUuid(orderId);
+    const { data: o } = id ? await supabase.from('orders').select('id, auction_id').eq('id', id).maybeSingle() : { data: null };
+    if (!o || o.auction_id !== auctionId) return socket.emit('host_error', { message: 'That lot is not in this show' });
+    const r = await reofferLiveOrder(o.id, auctionId, next !== false);
+    if (r.error) return socket.emit('host_error', { message: r.error, code: 'rerun_refused' });
+    socket.emit('rerun_ok', { auctionId, order_id: o.id, item_id: r.item_id, lot_number: r.lot_number, next: next !== false });
+    console.log(`- Host ${h.user.username} re-ran order ${o.id} as lot ${r.item_id}`);
+  });
+
   // +N seconds on the open lot's clock (the host's "+15 s").
   on('extend_auction', async ({ auctionId, extraSeconds, token }) => {
     const h = await liveHost(auctionId, token);
@@ -2765,8 +2852,9 @@ io.on('connection', (socket) => {
     if (h.auction.status !== 'live') return socket.emit('host_error', { message: 'Start the show first' });
     const secs = Number(timerSeconds) || LIVE_DEFAULT_CLOCK;
     if (!LIVE_CLOCK_PRESETS.includes(secs)) return socket.emit('host_error', { message: 'Clock must be 60, 30, 15 or 5 seconds' });
+    // A lot the host re-ran "next" (offer_next, migration zb) goes before the rest of the lineup.
     const { data: next } = await supabase.from('auction_items').select('id').eq('auction_id', auctionId).eq('status', 'pending')
-      .order('position', { ascending: true }).limit(1);
+      .order('offer_next', { ascending: false }).order('position', { ascending: true }).limit(1);
     if (!next?.length) return io.to(auctionId).emit('items_finished', { auctionId });
     await dropBlockedPrebids(auctionId, next[0].id);
     await syncDbClock();
@@ -3795,7 +3883,8 @@ app.get('/admin/live/:id/unpaid', requireAdmin, async (req, res) => {
   const { data: orders, error: oErr } = await supabase.from('orders').select('id, item_id, item_title, buyer_username, buyer_user_id, total_cents, payment_error, created_at')
     .eq('auction_id', show.id).eq('payment_status', 'failed').is('invoice_id', null).order('created_at');
   if (oErr) return dbFailure(req, res, oErr);
-  res.json({ show: { id: show.id, title: show.title, status: show.status }, can_reoffer: show.status === 'ended', lots: orders || [] });
+  // can_rerun: back into this show now (on air); can_reoffer: to a later show or a timed auction (after the show).
+  res.json({ show: { id: show.id, title: show.title, status: show.status }, can_rerun: show.status === 'live', can_reoffer: show.status === 'ended', lots: orders || [] });
 });
 
 // Failed live payments per buyer (answer 5: no automatic strike; the admin sees the count and can block a repeat
@@ -3817,19 +3906,19 @@ app.get('/admin/live/failed-payments', requireAdmin, async (req, res) => {
   res.json([...by.values()].sort((x, y) => (y.failed + y.reoffered) - (x.failed + x.reoffered)));
 });
 
-// Re-offer an unpaid live lot (after the show): the host chooses each time where it goes: { auction_id } of a later
-// live show (it waits there to be offered) or a timed auction that hasn't ended (open until that auction's end).
-// The order is cancelled and kept as the record; a points reward spent on it is given back (reoffer_live_order).
+// Re-offer an unpaid live lot: the host chooses each time where it goes: { auction_id } of a later live show (it
+// waits there to be offered) or a timed auction that hasn't ended (open until that auction's end), after the show;
+// or the show itself while it is on air ("Re-run now", { next: true (default) | false = at the end }; the host's
+// rerun_lot socket event does the same). The order is cancelled and kept as the record; a points reward spent on it
+// is given back (reoffer_live_order).
 app.post('/admin/live/orders/:orderId/reoffer', requireAdmin, async (req, res) => {
   const orderId = canonicalUuid(req.params.orderId), target = canonicalUuid(req.body?.auction_id);
   if (!orderId || !target) return res.status(400).json({ error: 'auction_id (the show or timed auction to re-offer it in) is required' });
-  const { data, error } = await supabase.rpc('reoffer_live_order', { p_order_id: orderId, p_target_auction_id: target });
-  if (error) {
-    if (error.code === 'P0001') return res.status(400).json({ error: error.message });
-    return dbFailure(req, res, error);
-  }
-  console.log(`Live order ${orderId} re-offered in auction ${target} as lot ${data}`);
-  res.json({ item_id: data, auction_id: target });
+  const r = await reofferLiveOrder(orderId, target, req.body?.next !== false);
+  if (r.dbError) return dbFailure(req, res, r.dbError);
+  if (r.error) return res.status(r.status).json({ error: r.error });
+  console.log(`Live order ${orderId} re-offered in auction ${target} as lot ${r.item_id}`);
+  res.json({ item_id: r.item_id, auction_id: target, lot_number: r.lot_number });
 });
 
 app.post('/admin/orders/:id/ungroup', requireAdmin, async (req, res) => {
