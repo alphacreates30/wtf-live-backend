@@ -17,6 +17,11 @@ const { s, ok, die, ADMIN, mkUser, mkShow, terms, prebid, client, ask, call, sle
 process.chdir(BE);
 const OLD_COMMIT = '93db3d7';
 const ON = { LIVE_ENABLED: 'true' };
+// Stripe: an in-process fake that always succeeds (nothing leaves the machine). Since phase 1b a declined live lot
+// blocks its buyer from bidding again in that show, so a blanked Stripe would block every winner after one win.
+const OK_STRIPE = [['const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(process.env.STRIPE_SECRET_KEY) : null;',
+  "const stripe = { paymentIntents: { create: async () => ({ id: 'pi_ZZLIVE_' + require('crypto').randomUUID().slice(0, 12) }), retrieve: async () => ({}), cancel: async () => ({}) }, paymentMethods: { retrieve: async () => ({ card: { last4: '4242' } }) } };"]];
+
 const near = (a, b, tol) => Math.abs(a - b) <= tol;
 
 (async () => {
@@ -26,12 +31,12 @@ const near = (a, b, tol) => Math.abs(a - b) <= tol;
   try {
     console.log(`(this machine's clock is ${(await K.syncClock()) / 1000} s from the database's; lots are timed by the database)\n`);
     const src = require('./guard').readSource(BE + '/server.js');
-    const srv = await boot('live-engine', 3611, src, { env: ON, timers: 'real' });
+    const srv = await boot('live-engine', 3611, src, { env: ON, timers: 'real', patch: OK_STRIPE });
     servers.push(srv);
     const A = await mkUser('a'), B = await mkUser('b'), C = await mkUser('c'), O = await mkUser('o');
-    const show = await mkShow('main', { lots: 6 });
+    const show = await mkShow('main', { lots: 7 });
     for (const u of [A, B, C, O]) await terms(u, show.id);
-    const [L1, L2, L3, L4, L5, L6] = show.lots;
+    const [L1, L2, L3, L4, L5, L6, L7] = show.lots;
     await prebid(A, show.id, L1, 40); await prebid(B, show.id, L1, 25); await prebid(C, show.id, L1, 10);
     await prebid(A, show.id, L2, 391.27);
 
@@ -41,15 +46,17 @@ const near = (a, b, tol) => Math.abs(a - b) <= tol;
 
     console.log('== Opening price (never the top max) ==');
     let from = anon.mark();
-    let e = await ask(host, 'next_item', { timerSeconds: 25 }, ['item_activated', 'host_error']);
+    let e = await ask(host, 'next_item', { timerSeconds: 20 }, ['item_activated', 'host_error']);
+    ok(e && e.event === 'host_error' && /60, 30, 15 or 5/.test(e.payload.message), `a 20 s clock is refused: ${e && e.payload.message}`);
+    e = await ask(host, 'next_item', { timerSeconds: 30 }, ['item_activated', 'host_error']);
     let act = await anon.waitFor('item_activated', () => true, 4000, from);
     let row = await K.lot(L1);
     ok(e && e.event === 'item_activated' && act && act.payload.item.current_bid == 26 && row.leading_bidder === A.username,
       `3 pre-bids (40 / 25 / 10): opens at $${act && act.payload.item.current_bid} = 25 + $1, top pre-bidder leads (${row.leading_bidder === A.username ? 'A' : row.leading_bidder})`);
     const text = JSON.stringify(anon.events.slice(from));
     ok(!/"top_pre_bid"|"max_amount"|"leading_bidder"/.test(text), `no bidder or max keys in anything the anonymous viewer received (${anon.events.length - from} events)`);
-    ok(row.status === 'open' && row.extend_by_seconds === 5 && row.extend_window_seconds === 5 && row.bid_count === 1 && near(Date.parse(row.ends_at) - dbNow(), 25000, 3000),
-      `lot open with a 25 s database clock, late-bid rule 5 s / 5 s, the opening counted as 1 bid`);
+    ok(row.status === 'open' && row.extend_by_seconds === 5 && row.extend_window_seconds === 5 && row.bid_count === 1 && near(Date.parse(row.ends_at) - dbNow(), 30000, 3000),
+      `lot open with a 30 s database clock (presets 60 / 30 / 15 / 5), late-bid rule 5 s / 5 s, the opening counted as 1 bid`);
     const ya = await ca.waitFor('item_activated'), yb = await cb.waitFor('item_activated');
     ok(ya && ya.payload.you_lead === true && yb && yb.payload.you_lead === false, 'each viewer is told only whether THEY lead (A yes, B no)');
 
@@ -110,14 +117,14 @@ const near = (a, b, tol) => Math.abs(a - b) <= tol;
 
     console.log('\n== One pre-bid / none ==');
     from = anon.mark();
-    await ask(host, 'next_item', { timerSeconds: 40 }, ['item_activated', 'host_error']);
+    await ask(host, 'next_item', { timerSeconds: 60 }, ['item_activated', 'host_error']);
     act = await anon.waitFor('item_activated', () => true, 4000, from);
     row = await K.lot(L2);
     ok(act && act.payload.item.current_bid == 1 && row.leading_bidder === A.username && !JSON.stringify(act.payload).includes('391.27'),
       `one pre-bid of $391.27: opens at $${act && act.payload.item.current_bid} (the opening minimum), A leads, the max is nowhere in the event`);
 
     console.log('\n== Late bid adds 5 s (database clock) ==');
-    const tick = await anon.waitFor('item_timer_tick', p => p.item_id === L2 && p.seconds <= 37, 8000, from);
+    const tick = await anon.waitFor('item_timer_tick', p => p.item_id === L2 && p.seconds <= 57, 8000, from);
     ok(tick && tick.payload.ends_at && tick.payload.server_now && tick.payload.auctionId === show.id, `ticks carry ends_at + server_now (${tick && tick.payload.seconds}s left)`);
     // Pull the clock in to 3 s left, then bid.
     await s.from('auction_items').update({ ends_at: dbAt(3000) }).eq('id', L2);
@@ -135,7 +142,7 @@ const near = (a, b, tol) => Math.abs(a - b) <= tol;
 
     console.log('\n== Sudden death ==');
     from = anon.mark();
-    e = await ask(host, 'next_item', { timerSeconds: 40, suddenDeath: true }, ['item_activated', 'host_error']);
+    e = await ask(host, 'next_item', { timerSeconds: 60, suddenDeath: true }, ['item_activated', 'host_error']);
     ok(e && e.payload.sudden_death === true && (await K.lot(L3)).extend_by_seconds === 0, 'lot 3 opened with Sudden death (extend_by 0)');
     await s.from('auction_items').update({ ends_at: dbAt(3000) }).eq('id', L3);
     const sd0 = Date.parse((await K.lot(L3)).ends_at);
@@ -160,33 +167,53 @@ const near = (a, b, tol) => Math.abs(a - b) <= tol;
     ok(ra && rb && ra.event === 'bid_ok' && rb.event === 'bid_ok' && row.leading_bidder === B.username && row.bid_count === pre.bid_count + 2 && nBids === 2 && Number(row.current_bid) > 70 && Number(row.current_bid) <= 80,
       `both counted (bid_count ${pre.bid_count} -> ${row.bid_count}, ${nBids} bid rows), B's higher max leads at $${row.current_bid}`);
 
-    console.log('\n== end_auction hammers the open lot; no auction-level order ==');
+    console.log('\n== End show: refused while a lot is open; Pass; then End once ==');
+    e = await ask(host, 'end_auction', {}, ['auction_ended', 'host_error']);
+    ok(e && e.event === 'host_error' && e.payload.code === 'lot_open' && (await K.lot(L5)).status === 'open', `End with lot 5 open -> ${e && e.payload.message}`);
     from = anon.mark();
-    const [h1, h2] = await Promise.all([ask(host, 'end_auction', {}, ['auction_ended', 'host_error']), ask(host, 'end_auction', {}, ['auction_ended', 'host_error'])]);
+    // Pull lot 5's clock in, then a bid: the server learns a lot's end time from the database through bids (and the
+    // host's +N s), not by re-reading it every second.
+    await s.from('auction_items').update({ ends_at: dbAt(1500) }).eq('id', L5);
+    await ask(cc, 'place_bid', { itemId: L5, max_amount: 75 }, ['bid_ok', 'bid_error']);
+    const c5 = await anon.waitFor('lot_closed', p => p.item_id === L5, 10000, from);
+    ok(c5 && c5.payload.status === 'sold', 'lot 5 sells when its clock finishes');
+    await ask(host, 'next_item', { timerSeconds: 60 }, ['item_activated', 'host_error']);
+    await ask(cb, 'place_bid', { itemId: L6, max_amount: 15 }, ['bid_ok', 'bid_error']);
+    from = anon.mark();
+    e = await ask(host, 'pass_lot', {}, ['host_error', 'lot_closed']);
+    const p6 = await anon.waitFor('lot_closed', p => p.item_id === L6, 3000, from);
+    ok(p6 && p6.payload.status === 'unsold' && p6.payload.passed === true && (await K.lot(L6)).status === 'unsold' && !(await s.from('orders').select('id').eq('item_id', L6)).data.length,
+      'Pass with a bid on it: lot 6 unsold, no order');
+    e = await ask(host, 'pass_lot', {}, ['host_error', 'lot_closed']);
+    ok(e && e.event === 'host_error' && /No lot is open/.test(e.payload.message), 'Pass with nothing open is refused');
+    const fromEnd = anon.mark(), fromHost = host.mark();
+    host.emit('end_auction', {}); host.emit('end_auction', {});
     await sleep(1500);
-    row = await K.lot(L5);
+    const endedEvents = anon.events.slice(fromEnd).filter(x => x.event === 'auction_ended').length;
+    const refused = host.events.slice(fromHost).filter(x => x.event === 'host_error').length;
     orders = (await s.from('orders').select('item_id, buyer_username, hammer_cents').eq('auction_id', show.id)).data;
     const ended = (await s.from('auctions').select('status').eq('id', show.id).single()).data.status;
-    ok(row.status === 'sold' && orders.filter(o => o.item_id === L5).length === 1 && ended === 'ended', `host taps End twice: lot 5 sold once, show '${ended}'`);
+    ok(ended === 'ended' && endedEvents === 1 && refused === 1, `End tapped twice: show '${ended}', the room told once, the second tap refused`);
     ok(orders.every(o => o.item_id) && orders.length === 4, `every order is a lot (${orders.length} orders: lots 1, 2, 3, 5; none for the show itself)`);
-    ok((await K.lot(L6)).status === 'pending', 'a lot never offered stays pending (the host can run it later)');
+    ok((await K.lot(L7)).status === 'pending', 'a lot never offered stays pending (the host can run it later)');
     for (const c of [host, ca, cb, cc, anon]) c.close();
 
     console.log('\n== A restart mid-lot resumes the clock from the database ==');
     const show2 = await mkShow('restart', { lots: 1 });
     await terms(A, show2.id);
     const h = await client(srv.url, show2.id, ADMIN);
-    await ask(h, 'next_item', { timerSeconds: 6 }, ['item_activated']);
+    await ask(h, 'next_item', { timerSeconds: 5 }, ['item_activated']);
     const a2 = await client(srv.url, show2.id, A);
     await ask(a2, 'place_bid', { max_amount: 3 }, ['bid_ok']);
     h.close(); a2.close();
     srv.stop(); servers.length = 0;
-    const srv2 = await boot('live-engine-2', 3612, src, { env: ON, timers: 'real' });
+    const srv2 = await boot('live-engine-2', 3612, src, { env: ON, timers: 'real', patch: OK_STRIPE, log: true });
     servers.push(srv2);
-    await sleep(9000);
+    await sleep(15000);   // a 5 s lot: the bid itself, inside the last 5 s, added 5 s
     const l7 = (await s.from('auction_items').select('status').eq('auction_id', show2.id).single()).data;
     const o7 = (await s.from('orders').select('hammer_cents').eq('auction_id', show2.id)).data;
     ok(l7.status === 'sold' && o7.length === 1 && o7[0].hammer_cents === 100, `the lot's server stopped; a new one sold it at ends_at (${l7.status}, ${o7.length} order)`);
+    if (l7.status !== 'sold' || o7.length !== 1) console.log('--- second server log ---' + srv2.log().slice(-3000));
     srv2.stop(); servers.length = 0;
 
     console.log('\n== The timed close job leaves live lots alone ==');

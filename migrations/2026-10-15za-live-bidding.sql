@@ -1,5 +1,6 @@
 -- STEP za: live shows, phase 1 (G1, wtf-handoff LIVE_SHOWS_BRIEF.md §1.1-1.4, LIVE_SHOWS_PHASE0_REVIEW.md).
--- NOT YET APPLIED ON PRODUCTION. Applied and verified on wtf-test 2026-10-15. Runs after migration z. Idempotent.
+-- APPLIED on production by Cowork 2026-10-16 (SQL editor; byte-identical to this file; place_standard_bid matched
+-- migration y before; after: old place_bid gone, 4 new functions, 2 triggers, no table with RLS off). Applied and verified on wtf-test 2026-10-15. Runs after migration z. Idempotent.
 --
 -- One bidding engine for timed lots and live lots. Live bids go through the same place_standard_bid (row lock,
 -- proxy/max bids, tiered increments, the same pre_bids table); the only difference is the clock rule, which the

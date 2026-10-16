@@ -22,14 +22,14 @@ module.exports = function kit(name) {
   ADMIN.tok = tok(ADMIN);
 
   // A buyer. Defaults: approved, a saved AND verified card. customer: the fake Stripe customer id (suites decide).
-  async function mkUser(label, { status = 'approved', card = true, verified = true, profile = true, customer } = {}) {
+  async function mkUser(label, { status = 'approved', card = true, verified = true, profile = true, customer, pm = 'pm_ZZLIVE' } = {}) {
     const id = crypto.randomUUID(), username = `zztest_live_${name}_${label}_${TAG}`.slice(0, 40).toLowerCase();
     die(await s.from('users').insert({ id, username, password_hash: 'zztest-not-a-real-hash', email: `${username}@example.invalid` }).select().single());
     made.users.push(id);
     if (profile) {
       die(await s.from('profiles').insert({ user_id: id, full_name: 'ZZ Live ' + label, email: `${username}@example.invalid`, phone: '5555550100',
         address_line1: '1 ZZ St', city: 'Testville', state: 'CA', zip: '94000', status, payment_status: 'ok',
-        ...(card ? { stripe_customer_id: customer || `cus_ZZLIVE_${label}`, stripe_payment_method_id: 'pm_ZZLIVE' } : {}),
+        ...(card ? { stripe_customer_id: customer || `cus_ZZLIVE_${label}`, stripe_payment_method_id: pm } : {}),
         ...(card && verified ? { card_verified_at: new Date().toISOString() } : {}) }).select().single());
     }
     const u = { id, username };

@@ -84,11 +84,13 @@ function socketRun(url, V) {
     for (const [k, sock] of Object.entries(socks)) {
       sock.onAny((event, payload) => {
         got[k].push({ event, payload });
-        if (event === 'auction_state' && ++joined === 4) socks.admin.emit('next_item', { auctionId: V, token: who.admin, timerSeconds: 60 });
+        if (event === 'auction_state' && ++joined === 4) socks.admin.emit('next_item', { auctionId: V, token: who.admin, timerSeconds: 5 });
         // C bids in the room under L's pre-bid (since live phase 1 the leader's own raise is max-only and silent).
         // On the pinned commit that bid fails (its old place_bid SQL was dropped by migration za): end the show anyway.
         if (k === 'admin' && event === 'item_activated' && step === 0) { step = 1; setTimeout(() => socks.anon.emit('place_bid', { auctionId: V, max_amount: 100, amount: 100, token: tok(C) }), 300); }
-        if (((k === 'admin' && event === 'new_bid') || (k === 'anon' && event === 'bid_error')) && step === 1) { step = 2; setTimeout(() => socks.admin.emit('end_auction', { auctionId: V, token: who.admin }), 300); }
+        // End is refused while a lot is open (live phase 1b): end once the 5 s lot has sold. The pinned commit has no
+        // lot_closed; its bid fails (bid_error), so it ends straight away.
+        if (((k === 'admin' && event === 'lot_closed') || (k === 'anon' && event === 'bid_error')) && step === 1) { step = 2; setTimeout(() => socks.admin.emit('end_auction', { auctionId: V, token: who.admin }), 300); }
         if (k === 'anon' && event === 'auction_ended') { clearTimeout(timer); setTimeout(done, 800); }
       });
       sock.on('connect', () => sock.emit('join_auction', { auctionId: V, token: who[k] || undefined }));
@@ -152,7 +154,8 @@ async function cleanup() {
   const servers = [];
   try {
     const oldS = await boot('bidid-old', 3371, guard.sourceAt(PINNED, BE)); servers.push(oldS);
-    const newS = await boot('bidid-new', 3372, guard.readSource(BE + '/server.js'), { env: { LIVE_ENABLED: 'true' } }); servers.push(newS);
+    // Real timers: the live lot's 5 s clock must run (End is refused while a lot is open).
+    const newS = await boot('bidid-new', 3372, guard.readSource(BE + '/server.js'), { env: { LIVE_ENABLED: 'true' }, timers: 'real' }); servers.push(newS);
 
     console.log(`== REPRODUCE on the pinned commit (${PINNED}): bidders named to anonymous callers and other buyers ==`);
     const old = await scenario(oldS.url, 'old');

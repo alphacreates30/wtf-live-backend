@@ -303,7 +303,7 @@ function wonChargedEmailHtml(order, last4, pickup = null) {
   `);
 }
 
-function paymentFailedEmailHtml(order, reason) {
+function paymentFailedEmailHtml(order, reason, live = false) {
   return emailHtml('You won - but your card did not go through', `
     <p>You won <strong>${escapeHtml(order.item_title)}</strong>, but we were unable to charge the card on file.</p>
     <table style="width:100%;border-collapse:collapse;margin:16px 0;">
@@ -312,7 +312,9 @@ function paymentFailedEmailHtml(order, reason) {
       <tr><td style="padding:8px 0 0;font-weight:bold;border-top:1px solid #ddd;">Total due</td><td style="padding:8px 0 0;text-align:right;font-weight:bold;border-top:1px solid #ddd;">${formatMoney(order.total_cents)}</td></tr>
     </table>
     <p style="margin:16px 0 0;color:#555;">Reason: ${escapeHtml(reason)}</p>
-    <p style="margin:16px 0 0;">Your win is still reserved for you. To fix this, log in to WhatTheFind Live and update your payment method on your profile, then reply to this email so the charge can be retried.</p>
+    ${live
+      ? '<p style="margin:16px 0 0;">Update your card on your profile page and we will charge it straight away. Until then you can\'t bid in this show. If it isn\'t fixed by the end of the show, the lot may be offered again.</p>'
+      : '<p style="margin:16px 0 0;">Your win is still reserved for you. To fix this, log in to WhatTheFind Live and update your payment method on your profile, then reply to this email so the charge can be retried.</p>'}
   `);
 }
 
@@ -470,7 +472,7 @@ async function notifyPaymentFailed(orderId, reason) {
       from: BUYER_FROM,
       to: email,
       subject: `Payment issue - you won "${order.item_title}"`,
-      html: paymentFailedEmailHtml(order, reason),
+      html: paymentFailedEmailHtml(order, reason, await isLiveModeAuction(order.auction_id)),
       kind: 'failed',
     });
   } catch (e) {
@@ -1288,6 +1290,7 @@ app.post('/save-payment-method', requireAuth, async (req, res) => {
         .eq('user_id', String(req.user.id));
     }
 
+    if (cardVerified) retryLiveOrdersFor(req.user.id);   // declined live lots: charged now (never throws)
     res.json({ success: true, card_verified: cardVerified });
   } catch (e) {
     console.error('Save payment method error:', e.message);
@@ -1579,6 +1582,7 @@ app.get('/my-bids', requireAuth, async (req, res) => {
 // invoice total.
 const MY_ORDERS_PAGE = 500;
 const MY_ORDERS_MAX_PAGES = 20;
+let myOrdersHasDiscount = null;
 app.get('/my-orders', requireAuth, async (req, res) => {
   const byId = new Map();
   let total = null;
@@ -1590,13 +1594,18 @@ app.get('/my-orders', requireAuth, async (req, res) => {
       break;
     }
     pages++;
-    const { data, error, count } = await supabase
+    // discount_kind/discount_cents (a live lot's G2 discount) exist only after migration za: asked for, and dropped
+    // from the select if the database doesn't have them yet.
+    const page = cols => supabase
       .from('orders')
-      .select('id, auction_id, invoice_id, item_title, hammer_cents, premium_cents, total_cents, payment_status, status, tracking_number, tracking_carrier, tracking_url, fulfillment_choice, shipping_cost_cents, shipping_payment_status, shipping_payment_error, created_at', { count: 'exact' })
+      .select(cols, { count: 'exact' })
       .eq('buyer_user_id', String(req.user.id))
       .order('created_at', { ascending: false })
       .order('id', { ascending: true })
       .range(fetched, fetched + MY_ORDERS_PAGE - 1);
+    const BASE = 'id, auction_id, invoice_id, item_title, hammer_cents, premium_cents, total_cents, payment_status, status, tracking_number, tracking_carrier, tracking_url, fulfillment_choice, shipping_cost_cents, shipping_payment_status, shipping_payment_error, created_at';
+    let { data, error, count } = await page(myOrdersHasDiscount === false ? BASE : BASE + ', discount_kind, discount_cents');
+    if (error && error.code === '42703' && myOrdersHasDiscount !== false) { myOrdersHasDiscount = false; ({ data, error, count } = await page(BASE)); }
     if (error) return res.status(500).json({ error: 'Failed to load orders' });
     total = count ?? 0;
     if (!data?.length) break;                 // count and rows disagree - never spin
@@ -1661,6 +1670,8 @@ app.get('/my-orders', requireAuth, async (req, res) => {
       shipping_payment_error: o.shipping_payment_error || null,
       invoice: inv ? { total_cents: inv.total_cents, discount_kind: inv.discount_kind || null,
         discount_cents: inv.discount_cents || 0, discount_premium_cents: inv.discount_premium_cents || 0 } : null,
+      // A live lot's own discount (G2, phase 1b): timed lots carry theirs on `invoice`.
+      discount: o.discount_kind && o.discount_cents > 0 ? { kind: o.discount_kind, cents: o.discount_cents } : null,
       points_earned: earnedMap[o.id] ?? null,
       shipping_promo: promoMap[o.id] || null,
       pickup: o.fulfillment_choice === 'pickup' && auction ? {
@@ -2064,7 +2075,13 @@ const userSockets = {}; // userId (string) -> Set of socket IDs
 // recoverLiveLots() re-watches every open live lot at boot and every 30 s.
 // The show itself has no clock: it ends when the host ends it. (The old auction-level timer ended a live show one
 // second after it started, because live shows have no ends_at, and made an order with no lot: audit finding 3.)
-const LIVE_DEFAULT_CLOCK = 30;               // seconds; brief §2 presets 20 / 30 / 60, any 5-600 accepted
+const LIVE_CLOCK_PRESETS = [60, 30, 15, 5];  // seconds per lot, the host's choice (Albert, Oct 15); the database allows 5-600
+const LIVE_DEFAULT_CLOCK = 30;
+// The show is on air from the host's start (or the first lot offered): stops pre-bid expiry (migration zb).
+async function markOnAir(auctionId) {
+  const { error } = await supabase.from('auctions').update({ on_air_at: new Date().toISOString() }).eq('id', auctionId).is('on_air_at', null);
+  if (error && !rewardsLib.notMigrated(error)) console.error('markOnAir failed:', auctionId, error.message);
+}
 const LIVE_EXTEND = { window: 5, by: 5 };    // "a bid in the last 5 s adds 5 s"; Sudden death = by 0
 const liveLots = new Map();                  // itemId -> { auctionId, endsAt (ms), interval, closing }
 
@@ -2130,6 +2147,7 @@ async function closeLiveLot(itemId, force) {
   unwatchLiveLot(itemId);
   const sold = lot.status === 'sold';
   const orderId = sold ? await createOrderOnWin(lot.auction_id, lot.leading_bidder, lot.current_bid, lot.id) : null;
+  if (orderId) await joinShowBox(orderId);
   // B7 until the live-names step (§5): the room hears the price and the outcome; only the winner hears "you won".
   await emitPerViewer(lot.auction_id, 'lot_closed', u => ({
     auctionId: lot.auction_id, item_id: lot.id, status: lot.status, amount: sold ? Number(lot.current_bid) : null,
@@ -2143,13 +2161,197 @@ async function closeLiveLot(itemId, force) {
 
 // A live lot's payment: its G2 discount (points reward or the show's % code, decided once; no premium in live),
 // then the card on file. Never throws; the result is for the suites and the log.
-function chargeLiveOrder(orderId) {
+function chargeLiveOrder(orderId, { retry = false } = {}) {
   return (async () => {
     await rewards.applyOrderDiscount(orderId);
     const r = await chargeOrder(orderId);
     if (!r.success && !r.skipped) console.log(`Live lot payment failed: order ${orderId}: ${r.error}`);
+    if (!r.skipped && (!r.success || retry)) await tellRoomAboutPayment(orderId, r);
     return r;
   })().catch(e => { console.error('chargeLiveOrder error:', orderId, e.message); return { success: false, error: e.message }; });
+}
+
+// Declined card mid-show (brief §1.5): the buyer sees it in the room (and can't bid again in this show until it is
+// fixed: liveUnpaid), and the host gets an alert on that lot. A retry that goes through clears both. The decline
+// email (notifyPaymentFailed) and the admin email go out from chargeOrder as for any order.
+async function tellRoomAboutPayment(orderId, r) {
+  try {
+    const { data: o } = await supabase.from('orders').select('id, auction_id, item_id, item_title, buyer_username, total_cents').eq('id', orderId).maybeSingle();
+    if (!o) return;
+    const { data: a } = await supabase.from('auctions').select('host_username').eq('id', o.auction_id).maybeSingle();
+    const base = { auctionId: o.auction_id, item_id: o.item_id, order_id: o.id, amount_cents: o.total_cents };
+    for (const s of await io.in(o.auction_id).fetchSockets()) {
+      const u = s.data?.username;
+      if (u && u === o.buyer_username) {
+        s.emit(r.success ? 'payment_ok' : 'payment_failed', { ...base, message: r.success
+          ? 'Your card went through. You can bid again.'
+          : "Your card was declined for a lot you won. Update your card to keep bidding: we'll charge it as soon as you do." });
+      } else if (u && (u === a?.host_username || u === ADMIN_USERNAME)) {
+        // The host is the admin: they see who it is (their orders page already does).
+        s.emit(r.success ? 'lot_payment_fixed' : 'lot_payment_failed', { ...base, buyer: o.buyer_username, item_title: o.item_title, ...(r.success ? {} : { reason: r.error || null }) });
+      }
+    }
+  } catch (e) {
+    console.error('tellRoomAboutPayment error:', orderId, e.message);
+  }
+}
+
+// A buyer whose card was declined in this show can't bid until it is fixed, so their pre-bid on the lot being opened
+// doesn't count: it is removed before the lot opens (it would otherwise make them the leader).
+async function dropBlockedPrebids(auctionId, itemId) {
+  try {
+    const { data: blocked } = await supabase.from('orders').select('buyer_user_id').eq('auction_id', auctionId).eq('payment_status', 'failed').is('invoice_id', null);
+    const ids = [...new Set((blocked || []).map(o => o.buyer_user_id).filter(Boolean))];
+    if (!ids.length) return;
+    const { data: gone } = await supabase.from('pre_bids').delete().eq('item_id', itemId).in('buyer_user_id', ids).select('id');
+    if (gone?.length) console.log(`Lot ${itemId}: ${gone.length} pre-bid(s) from buyers with a declined card in this show not counted`);
+  } catch (e) {
+    console.error('dropBlockedPrebids error:', itemId, e.message);
+  }
+}
+
+// Does this buyer have a declined, not yet fixed, live lot in this show? Then they can't bid in it again.
+async function liveUnpaid(userId, auctionId) {
+  const { data } = await supabase.from('orders').select('id').eq('auction_id', auctionId).eq('buyer_user_id', String(userId))
+    .eq('payment_status', 'failed').is('invoice_id', null).limit(1);
+  return !!data?.length;
+}
+const LIVE_UNPAID = "Your card was declined for a lot you won in this show. Update your card on your profile page to keep bidding.";
+
+// A buyer saved a card that passed the $1 check: their declined live lots are charged again at once (paid ones
+// clear the room alerts). A lot the host already re-offered is cancelled, so it is never charged. Never throws.
+async function retryLiveOrdersFor(userId) {
+  try {
+    const { data: failed } = await supabase.from('orders').select('id, auction_id').eq('buyer_user_id', String(userId))
+      .eq('payment_status', 'failed').is('invoice_id', null).is('payment_intent_id', null);
+    if (!failed?.length) return;
+    const { data: live } = await supabase.from('auctions').select('id').eq('mode', 'live').in('id', [...new Set(failed.map(o => o.auction_id))]);
+    const liveIds = new Set((live || []).map(a => a.id));
+    for (const o of failed) if (liveIds.has(o.auction_id)) await chargeLiveOrder(o.id, { retry: true });
+  } catch (e) {
+    console.error('retryLiveOrdersFor error:', userId, e.message);
+  }
+}
+
+// One box per buyer per show (brief §1.6): every lot a buyer wins in a show joins one order group, so packing, the
+// label and the postage charge happen once, through the existing group/label flow. Pickup wins aren't boxed.
+async function joinShowBox(orderId) {
+  try {
+    const { data: o } = await supabase.from('orders').select('id, auction_id, buyer_user_id, fulfillment_choice, group_id').eq('id', orderId).maybeSingle();
+    if (!o || o.group_id || o.fulfillment_choice === 'pickup') return;
+    const { data: sib } = await supabase.from('orders').select('group_id').eq('auction_id', o.auction_id).eq('buyer_user_id', o.buyer_user_id)
+      .not('group_id', 'is', null).neq('payment_status', 'cancelled').limit(1);
+    const groupId = sib?.[0]?.group_id || require('crypto').randomUUID();
+    await supabase.from('orders').update({ group_id: groupId }).eq('id', o.id).is('group_id', null);
+  } catch (e) {
+    console.error('joinShowBox error:', orderId, e.message);
+  }
+}
+
+// "Your show wins": one email per buyer after the show (brief §1.6; no per-lot win emails, review answer 1). Sent
+// once per show (auctions.live_summary_sent_at, migration zb), and only when every lot's charge has settled (paid or
+// declined), so it says what actually happened; the 30-second job tries again until then. Returns true if sent.
+async function sendLiveShowSummaries(auctionId) {
+  try {
+    const { data: a, error } = await supabase.from('auctions').select('*').eq('id', auctionId).maybeSingle();
+    if (error || !a || a.mode !== 'live' || a.status !== 'ended' || !('live_summary_sent_at' in a) || a.live_summary_sent_at) return false;
+    const { data: orders, error: oErr } = await supabase.from('orders').select('*').eq('auction_id', auctionId).order('created_at');
+    if (oErr || (orders || []).some(o => ['unpaid', 'charging'].includes(o.payment_status || 'unpaid'))) return false;
+    const { data: claimed } = await supabase.from('auctions').update({ live_summary_sent_at: new Date().toISOString() })
+      .eq('id', auctionId).is('live_summary_sent_at', null).select('id');
+    if (!claimed?.length) return false;
+    const byBuyer = new Map();
+    for (const o of orders || []) {
+      if (o.payment_status === 'cancelled' || !o.buyer_user_id) continue;
+      if (!byBuyer.has(o.buyer_user_id)) byBuyer.set(o.buyer_user_id, []);
+      byBuyer.get(o.buyer_user_id).push(o);
+    }
+    const pickup = byBuyer.size ? await pickupFor(auctionId) : null;
+    for (const [userId, list] of byBuyer) {
+      const email = await getBuyerEmail(userId);
+      if (!email) continue;
+      await sendEmail({ from: BUYER_FROM, to: email, subject: `Your wins from "${a.title}"`,
+        html: liveSummaryEmailHtml(a, list, list[0].fulfillment_choice === 'pickup' ? pickup : null), kind: 'won' });
+    }
+    console.log(`Live show ${auctionId}: summary emails to ${byBuyer.size} buyer(s)`);
+    return true;
+  } catch (e) {
+    console.error('sendLiveShowSummaries error:', auctionId, e.message);
+    return false;
+  }
+}
+function liveSummaryEmailHtml(show, orders, pickup) {
+  const td = 'padding:4px 0;';
+  const rows = orders.map(o => `<tr>
+      <td style="${td}color:#555;">${escapeHtml(o.item_title)}</td>
+      <td style="${td}text-align:right;">${formatMoney(o.hammer_cents)}${o.discount_cents > 0 ? `<br><span style="color:#2e6b34;">&minus;${formatMoney(o.discount_cents)} ${DISCOUNT_LABEL[o.discount_kind] || 'discount'}</span>` : ''}</td>
+      <td style="${td}text-align:right;">${o.payment_status === 'paid' ? 'Paid' : '<strong>Card declined</strong>'}</td>
+    </tr>`).join('');
+  const paid = orders.filter(o => o.payment_status === 'paid');
+  const declined = orders.some(o => o.payment_status !== 'paid');
+  const n = orders.length;
+  return emailHtml(`Your wins from ${escapeHtml(show.title)}`, `
+    <p>You won <strong>${n} lot${n === 1 ? '' : 's'}</strong> in the show. There is no buyer's premium in live shows: each lot is its winning bid.</p>
+    <table style="width:100%;border-collapse:collapse;margin:16px 0;">${rows}
+      <tr><td style="padding:8px 0 0;font-weight:bold;border-top:1px solid #ddd;">Charged to your card</td><td></td><td style="padding:8px 0 0;text-align:right;font-weight:bold;border-top:1px solid #ddd;">${formatMoney(paid.reduce((t, o) => t + (o.total_cents || 0), 0))}</td></tr>
+    </table>
+    ${declined ? '<p style="margin:16px 0 0;"><strong>Your card was declined for the lots marked above.</strong> Update your card on your profile page and we will charge it straight away. If it isn\'t fixed, those lots may be offered again.</p>' : ''}
+    ${pickup ? pickupBlockHtml(pickup, n > 1) : `<p style="margin:16px 0 0;">Everything you won in this show ships together in one box. Postage is charged once, after it is packed, and you'll get tracking by email.</p>`}
+  `);
+}
+
+// Pre-bid expiry (research additions; review answer 4): a live show that hasn't gone on air 24 hours after its
+// scheduled start releases its pre-bids. They are deleted, and each bidder gets one email listing their lots; the
+// outbox row (notifications, kind 'prebid_released') is the record. Once per show (auctions.prebids_released_at).
+const PREBID_EXPIRY_MS = 24 * 60 * 60 * 1000;
+async function releaseExpiredPrebids(now = new Date()) {
+  const out = { shows: 0, released: 0, emails: 0 };
+  try {
+    const cutoff = new Date(now.getTime() - PREBID_EXPIRY_MS).toISOString();
+    const { data: shows, error } = await supabase.from('auctions').select('id, title').eq('mode', 'live').in('status', ['upcoming', 'live'])
+      .is('on_air_at', null).is('prebids_released_at', null).lt('starts_at', cutoff);
+    if (error) { if (!rewardsLib.notMigrated(error)) console.error('releaseExpiredPrebids:', error.message); return out; }
+    for (const show of shows || []) {
+      const { data: claimed } = await supabase.from('auctions').update({ prebids_released_at: now.toISOString() })
+        .eq('id', show.id).is('prebids_released_at', null).is('on_air_at', null).select('id');
+      if (!claimed?.length) continue;
+      out.shows++;
+      const { data: pbs } = await supabase.from('pre_bids').select('id, item_id, buyer_user_id').eq('auction_id', show.id);
+      if (!pbs?.length) continue;
+      await supabase.from('pre_bids').delete().in('id', pbs.map(p => p.id));
+      out.released += pbs.length;
+      const lotIds = [...new Set(pbs.map(p => p.item_id))];
+      await supabase.from('auction_items').update({ pre_bid_count: 0, top_pre_bid: null }).in('id', lotIds).eq('status', 'pending');
+      const { data: lots } = await supabase.from('auction_items').select('id, title, position').in('id', lotIds);
+      const lotById = Object.fromEntries((lots || []).map(l => [l.id, l]));
+      const byBuyer = new Map();
+      for (const p of pbs) { if (!byBuyer.has(p.buyer_user_id)) byBuyer.set(p.buyer_user_id, new Set()); byBuyer.get(p.buyer_user_id).add(p.item_id); }
+      for (const [userId, items] of byBuyer) {
+        const titles = [...items].map(id => lotById[id]).filter(Boolean).sort((x, y) => x.position - y.position)
+          .map(l => `<li>Lot ${l.position + 1}: ${escapeHtml(l.title)}</li>`).join('');
+        const email = await getBuyerEmail(userId);
+        const sent = email ? await sendEmail({ from: BUYER_FROM, to: email, subject: `Your pre-bids on "${show.title}" were released`, kind: 'prebid_released',
+          html: emailHtml('Your pre-bids were released', `<p>The live show <strong>${escapeHtml(show.title)}</strong> didn't start within 24 hours of its scheduled time, so your pre-bids on it no longer count:</p><ul>${titles}</ul><p style="margin:16px 0 0;">Nothing was charged. If the show is rescheduled, you can pre-bid again.</p>`) }) : false;
+        if (sent) out.emails++;
+        const stamp = new Date().toISOString();
+        const { error: nErr } = await supabase.from('notifications').insert({ user_id: userId, kind: 'prebid_released', payload: { auction_id: show.id, item_ids: [...items] },
+          claimed_at: stamp, attempts: 1, sent_at: stamp, error: sent ? null : (email ? 'email not sent' : 'no email on file') });
+        if (nErr) console.error('prebid_released outbox row failed:', nErr.message);
+      }
+      console.log(`Live show ${show.id} not on air 24 h after its start: ${pbs.length} pre-bid(s) released`);
+    }
+  } catch (e) {
+    console.error('releaseExpiredPrebids error:', e.message);
+  }
+  return out;
+}
+
+// The 30-second job's live step (after recoverLiveLots): pre-bid expiry, and summaries for ended shows still owed one.
+async function runLiveHousekeeping() {
+  await releaseExpiredPrebids();
+  const { data: owed, error } = await supabase.from('auctions').select('id').eq('mode', 'live').eq('status', 'ended').is('live_summary_sent_at', null);
+  if (error) { if (!rewardsLib.notMigrated(error)) console.error('runLiveHousekeeping:', error.message); return; }
+  for (const a of owed || []) await sendLiveShowSummaries(a.id);
 }
 
 // Boot, and every 30 s (the auto-close job): watch every open live lot (a restart mid-lot resumes from ends_at), and
@@ -2367,6 +2569,7 @@ io.on('connection', (socket) => {
     if (refusal) return fail(refusal.error, refusal.code);
     if (auction.status !== 'live') return fail('This show is not on air', 'not_on_air');
     if (!(await hasAcceptedTerms(user.id, auctionId))) return fail('You must accept the auction terms before bidding', 'terms_required');
+    if (await liveUnpaid(user.id, auctionId)) return fail(LIVE_UNPAID, 'payment_failed');
     const max = parseMaxBid(max_amount ?? amount);
     if (max == null) return fail(`Max bid must be between $1 and $${MAX_BID_DOLLARS.toLocaleString('en-US')}`, 'bad_amount');
 
@@ -2503,21 +2706,37 @@ io.on('connection', (socket) => {
     } else if (h.auction.status !== 'live') {
       return socket.emit('host_error', { message: 'This show has ended or is not published' });
     }
+    await markOnAir(auctionId);
     io.to(auctionId).emit('auction_started', { auctionId });
     console.log(`- Host ${h.user.username} started show ${auctionId}`);
   });
 
-  // End the show: an open lot is hammered first (to its leader, if any), through the same close as the clock. No
-  // auction-level order: every sale is a lot.
+  // End the show. Refused while a lot is open (Albert, Oct 15): the host lets its clock finish or Passes it first.
+  // No auction-level order: every sale is a lot. Then the "your show wins" emails (once every charge has settled).
   on('end_auction', async ({ auctionId, token }) => {
     const h = await liveHost(auctionId, token);
     if (!h) return;
-    const { data: open } = await supabase.from('auction_items').select('id').eq('auction_id', auctionId).eq('status', 'open');
-    for (const lot of open || []) await closeLiveLot(lot.id, true);
+    const { data: open } = await supabase.from('auction_items').select('id').eq('auction_id', auctionId).eq('status', 'open').limit(1);
+    if (open?.length) return socket.emit('host_error', { message: 'A lot is still open. Let its clock finish, or Pass it, then end the show.', code: 'lot_open' });
     const { data: ended } = await supabase.from('auctions').update({ status: 'ended' }).eq('id', auctionId).eq('status', 'live').select('id');
     if (!ended?.length) return socket.emit('host_error', { message: 'This show is not on air' });
     io.to(auctionId).emit('auction_ended', { auctionId });
     console.log(`- Host ${h.user.username} ended show ${auctionId}`);
+    sendLiveShowSummaries(auctionId);   // never throws; the 30-second job retries until every charge has settled
+  });
+
+  // Pass: the open lot closes with no sale, whatever its bids (`unsold`, no order). It can be offered again later.
+  on('pass_lot', async ({ auctionId, token }) => {
+    const h = await liveHost(auctionId, token);
+    if (!h) return;
+    const { data: open } = await supabase.from('auction_items').select('id').eq('auction_id', auctionId).eq('status', 'open').limit(1);
+    if (!open?.length) return socket.emit('host_error', { message: 'No lot is open' });
+    const { data: lot, error } = await supabase.rpc('pass_live_lot', { p_item_id: open[0].id });
+    if (error) { console.error('pass_live_lot failed:', error.code, error.message); return socket.emit('host_error', { message: 'Could not pass the lot' }); }
+    if (!lot?.id) return socket.emit('host_error', { message: 'The lot just closed' });
+    unwatchLiveLot(lot.id);
+    await emitPerViewer(auctionId, 'lot_closed', () => ({ auctionId, item_id: lot.id, status: 'unsold', passed: true, amount: null, you_won: false }));
+    console.log(`- Host ${h.user.username} passed lot ${lot.id}`);
   });
 
   // +N seconds on the open lot's clock (the host's "+15 s").
@@ -2539,16 +2758,17 @@ io.on('connection', (socket) => {
   });
 
   // Offer the next lot: its pre-bids apply by the proxy rule (never at the top max: brief §1.2) and its clock
-  // starts. { timerSeconds = 30, suddenDeath = false }. Refused while another lot is still open.
+  // starts. { timerSeconds: 60 | 30 | 15 | 5 (default 30), suddenDeath = false }. Refused while another lot is open.
   on('next_item', async ({ auctionId, token, timerSeconds = LIVE_DEFAULT_CLOCK, suddenDeath = false }) => {
     const h = await liveHost(auctionId, token);
     if (!h) return;
     if (h.auction.status !== 'live') return socket.emit('host_error', { message: 'Start the show first' });
     const secs = Number(timerSeconds) || LIVE_DEFAULT_CLOCK;
-    if (!Number.isInteger(secs) || secs < 5 || secs > 600) return socket.emit('host_error', { message: 'Clock must be 5 to 600 seconds' });
+    if (!LIVE_CLOCK_PRESETS.includes(secs)) return socket.emit('host_error', { message: 'Clock must be 60, 30, 15 or 5 seconds' });
     const { data: next } = await supabase.from('auction_items').select('id').eq('auction_id', auctionId).eq('status', 'pending')
       .order('position', { ascending: true }).limit(1);
     if (!next?.length) return io.to(auctionId).emit('items_finished', { auctionId });
+    await dropBlockedPrebids(auctionId, next[0].id);
     await syncDbClock();
     const { data: lot, error } = await supabase.rpc('open_live_lot', {
       p_item_id: next[0].id, p_seconds: secs, p_extend_window_seconds: LIVE_EXTEND.window,
@@ -2560,6 +2780,7 @@ io.on('connection', (socket) => {
       return socket.emit('host_error', { message: 'Could not open the lot' });
     }
     watchLiveLot(lot);
+    await markOnAir(auctionId);
     const clock = liveClock(auctionId, lot.id, Date.parse(lot.ends_at));
     await emitPerViewer(auctionId, 'item_activated', u => ({
       item: publicLot(lot), you_lead: !!u && u === lot.leading_bidder, pre_bid_count: lot.pre_bid_count || 0,
@@ -3565,6 +3786,52 @@ app.post('/admin/orders/group', requireAdmin, normalizeBodyIds({ list: ['order_i
   res.json({ group_id: groupId });
 });
 
+// ---- Live shows after the show (brief §1.5, review answer 5) ----
+// A show's lots whose buyer's card was declined and never fixed: what the host may re-offer once the show has ended.
+app.get('/admin/live/:id/unpaid', requireAdmin, async (req, res) => {
+  const { data: show, error } = await supabase.from('auctions').select('id, title, mode, status').eq('id', req.params.id).maybeSingle();
+  if (error) return dbFailure(req, res, error);
+  if (!show || show.mode !== 'live') return res.status(404).json({ error: 'Live show not found' });
+  const { data: orders, error: oErr } = await supabase.from('orders').select('id, item_id, item_title, buyer_username, buyer_user_id, total_cents, payment_error, created_at')
+    .eq('auction_id', show.id).eq('payment_status', 'failed').is('invoice_id', null).order('created_at');
+  if (oErr) return dbFailure(req, res, oErr);
+  res.json({ show: { id: show.id, title: show.title, status: show.status }, can_reoffer: show.status === 'ended', lots: orders || [] });
+});
+
+// Failed live payments per buyer (answer 5: no automatic strike; the admin sees the count and can block a repeat
+// non-payer the usual way). failed = still unpaid, reoffered = lots that went back on sale.
+app.get('/admin/live/failed-payments', requireAdmin, async (req, res) => {
+  const { data: shows, error } = await supabase.from('auctions').select('id').eq('mode', 'live');
+  if (error) return dbFailure(req, res, error);
+  if (!shows?.length) return res.json([]);
+  const { data: orders, error: oErr } = await supabase.from('orders').select('buyer_user_id, buyer_username, payment_status, created_at')
+    .in('auction_id', shows.map(s => s.id)).in('payment_status', ['failed', 'cancelled']).is('invoice_id', null);
+  if (oErr) return dbFailure(req, res, oErr);
+  const by = new Map();
+  for (const o of orders || []) {
+    const b = by.get(o.buyer_user_id) || { buyer_user_id: o.buyer_user_id, username: o.buyer_username, failed: 0, reoffered: 0, last_at: null };
+    if (o.payment_status === 'failed') b.failed++; else b.reoffered++;
+    if (!b.last_at || o.created_at > b.last_at) b.last_at = o.created_at;
+    by.set(o.buyer_user_id, b);
+  }
+  res.json([...by.values()].sort((x, y) => (y.failed + y.reoffered) - (x.failed + x.reoffered)));
+});
+
+// Re-offer an unpaid live lot (after the show): the host chooses each time where it goes: { auction_id } of a later
+// live show (it waits there to be offered) or a timed auction that hasn't ended (open until that auction's end).
+// The order is cancelled and kept as the record; a points reward spent on it is given back (reoffer_live_order).
+app.post('/admin/live/orders/:orderId/reoffer', requireAdmin, async (req, res) => {
+  const orderId = canonicalUuid(req.params.orderId), target = canonicalUuid(req.body?.auction_id);
+  if (!orderId || !target) return res.status(400).json({ error: 'auction_id (the show or timed auction to re-offer it in) is required' });
+  const { data, error } = await supabase.rpc('reoffer_live_order', { p_order_id: orderId, p_target_auction_id: target });
+  if (error) {
+    if (error.code === 'P0001') return res.status(400).json({ error: error.message });
+    return dbFailure(req, res, error);
+  }
+  console.log(`Live order ${orderId} re-offered in auction ${target} as lot ${data}`);
+  res.json({ item_id: data, auction_id: target });
+});
+
 app.post('/admin/orders/:id/ungroup', requireAdmin, async (req, res) => {
   await supabase.from('orders').update({ group_id: null }).eq('id', req.params.id);
   res.json({ success: true });
@@ -3746,10 +4013,13 @@ app.post('/auction/:id/items/:itemId/prebid', requireAuth, LIMITS.bidding, async
   if (max_amount == null) return res.status(400).json({ error: `Max bid must be between $1 and $${MAX_BID_DOLLARS.toLocaleString('en-US')}` });
   const refusal = await biddingRefusal(req.user);
   if (refusal) return res.status(refusal.status).json({ error: refusal.error, code: refusal.code });
-  const { data: auctionRow } = await supabase.from('auctions').select('status, mode, host_username').eq('id', req.params.id).single();
+  // '*': prebids_released_at only exists after migration zb.
+  const { data: auctionRow } = await supabase.from('auctions').select('*').eq('id', req.params.id).single();
   if (!auctionRow) return res.status(404).json({ error: 'Auction not found' });
   if (auctionRow.status === 'draft') return res.status(400).json({ error: 'Auction is not published yet' });
   if (auctionRow.mode === 'live' && !LIVE_ENABLED) return res.status(400).json({ error: LIVE_OFF, code: 'live_off' });
+  if (auctionRow.mode === 'live' && auctionRow.prebids_released_at) return res.status(400).json({ error: "This show didn't start on time, so its pre-bids were released. Pre-bidding is closed.", code: 'prebids_released' });
+  if (auctionRow.mode === 'live' && await liveUnpaid(req.user.id, req.params.id)) return res.status(403).json({ error: LIVE_UNPAID, code: 'payment_failed' });
   if (hostCannotBid(req.user, auctionRow)) return res.status(403).json({ error: HOST_CANNOT_BID.error, code: HOST_CANNOT_BID.code });
 
   // A pre-bid is equally binding as a live bid - it commits the buyer to
@@ -5440,8 +5710,10 @@ async function autoCloseStandardItems() {
     // Step 5: points expiry + reminders (G2). Hourly; never throws; does nothing with points off.
     await runPointsHousekeeping()
 
-    // Step 6: live lots (G1): re-watch open ones, finish a hammer a crash interrupted. Never throws.
+    // Step 6: live lots (G1): re-watch open ones, finish a hammer a crash interrupted; pre-bid expiry and the
+    // after-show summaries (phase 1b). Never throws.
     await recoverLiveLots()
+    await runLiveHousekeeping()
   } catch (e) {
     console.error('autoCloseStandardItems error:', e)
   } finally {

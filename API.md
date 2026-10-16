@@ -241,11 +241,12 @@ Socket events (payloads always include `auctionId` and the buyer's/host's `token
 
 | Event (client → server) | Who | What |
 |---|---|---|
-| `place_bid { itemId?, max_amount }` | buyer | A max bid on the open lot (no `itemId` = the lot open now). Same engine as timed lots (`place_standard_bid`: proxy/max, tiers, row lock). Answers `bid_ok` (the public lot + `your_status`, `max_only: true` when the leader only raised their max) or `bid_error { message, code }`: the "Who may bid" codes, or `live_off`, `login_required`, `terms_required`, `not_on_air`, `bad_amount`, `not_found`, `lot_not_open`, `below_minimum`, `refused`, `rate_limited`. |
-| `start_auction` | host | On air (`upcoming` → `live`). |
-| `next_item { timerSeconds = 30, suddenDeath = false }` | host | Offers the next `pending` lot (by position) and starts its clock (5–600 s). Refused while a lot is open. |
+| `place_bid { itemId?, max_amount }` | buyer | A max bid on the open lot (no `itemId` = the lot open now). Same engine as timed lots (`place_standard_bid`: proxy/max, tiers, row lock). Answers `bid_ok` (the public lot + `your_status`, `max_only: true` when the leader only raised their max) or `bid_error { message, code }`: the "Who may bid" codes, or `live_off`, `login_required`, `terms_required`, `payment_failed` (their card was declined for a lot in this show and isn't fixed yet), `not_on_air`, `bad_amount`, `not_found`, `lot_not_open`, `below_minimum`, `refused`, `rate_limited`. |
+| `start_auction` | host | On air (`upcoming` → `live`; sets `on_air_at`). |
+| `next_item { timerSeconds = 30, suddenDeath = false }` | host | Offers the next `pending` lot (by position) and starts its clock: **60, 30, 15 or 5 s** (any other value is refused). Pre-bids from buyers whose card was declined in this show are dropped first. Refused while a lot is open. |
 | `extend_auction { extraSeconds }` | host | Adds 1–120 s to the open lot's clock. |
-| `end_auction` | host | Hammers the open lot (to its leader, if any), then ends the show. |
+| `pass_lot` | host | Closes the open lot with **no sale** (`unsold`, no order), whatever its bids. |
+| `end_auction` | host | Ends the show. **Refused while a lot is open** (`host_error` code `lot_open`): let its clock finish or Pass it. Then the after-show emails. |
 
 | Event (server → client) | Payload |
 |---|---|
@@ -253,7 +254,9 @@ Socket events (payloads always include `auctionId` and the buyer's/host's `token
 | `item_timer_tick` | every second: `{ auctionId, item_id, seconds, ends_at, server_now }`. Time left = `ends_at − server_now` (the database's clock). |
 | `new_bid` | `{ auction_id, item_id, amount, bid_count, ends_at, server_now, you_lead }` |
 | `item_extended` | `{ auctionId, item_id, ends_at, server_now }` (the host's +N s) |
-| `lot_closed` | `{ auctionId, item_id, status: "sold" \| "unsold", amount, you_won }` |
+| `lot_closed` | `{ auctionId, item_id, status: "sold" \| "unsold", amount, you_won, passed? }` |
+| `payment_failed` / `payment_ok` | to the buyer only: `{ auctionId, item_id, order_id, amount_cents, message }` (declined at the hammer / charged after they saved a new card) |
+| `lot_payment_failed` / `lot_payment_fixed` | to the host only: `{ auctionId, item_id, order_id, amount_cents, buyer, item_title, reason? }` |
 | `items_finished`, `auction_started`, `auction_ended` | `{ auctionId }` |
 | `host_error` | `{ message, code? }` |
 
@@ -262,7 +265,27 @@ pre-bid: the opening minimum, $1 or the starting bid; two or more: `least(top, s
 leading). A bid with 5 s or less left adds 5 s (Sudden death: nothing). At 0 the database closes the lot
 (`close_live_lot`, one closer only), the order is created (one per lot), `lot_closed` goes out, and **then** the card
 is charged in the background (`chargeOrder`, with the lot's G2 discount): the hammer price, no premium. No per-lot
-win email (one summary after the show comes in phase 1b); a declined card emails the buyer and the admin at once.
+win email; a declined card emails the buyer and the admin at once.
+
+After a decline (phase 1b, migration `2026-10-16zb`): the buyer can't bid or pre-bid in that show (`payment_failed`)
+until they save a card that passes the $1 check (`POST /save-payment-method`); that charges their declined live lots
+at once. **One box per buyer per show:** every lot a buyer wins in a show (not pickup) joins one `orders.group_id`,
+so the label and postage go through the existing group flow once. **After the show:** one "Your wins from …" email
+per buyer (lots, declined ones marked, the one-box or pickup note), sent once every charge has settled
+(`auctions.live_summary_sent_at`). **Pre-bid expiry:** a live show with no `on_air_at` 24 h after its `starts_at`
+releases its pre-bids (deleted; one email per bidder; a `notifications` row of kind `prebid_released` is the record;
+once per show, `prebids_released_at`); `POST …/prebid` on it is then 400 `{ code: "prebids_released" }`.
+
+Admin (403 for anyone else):
+- `GET /admin/live/:id/unpaid` → `{ show, can_reoffer (the show has ended), lots: [ { id (order), item_id, item_title,
+  buyer_username, buyer_user_id, total_cents, payment_error, created_at } ] }`: lots whose card was declined and not fixed.
+- `POST /admin/live/orders/:orderId/reoffer { auction_id }` → `{ item_id, auction_id }`. Only after the show, only an
+  unpaid lot. `auction_id` = a later live show (the copy waits there, `pending`) or a timed auction that hasn't ended
+  (the copy is `open` until that auction's `ends_at`). Title, description, condition, photos and starting bid are
+  copied; the order becomes `cancelled` (kept as the record) and leaves the box; a points reward spent on it is given
+  back. 400 with the reason otherwise.
+- `GET /admin/live/failed-payments` → `[ { buyer_user_id, username, failed, reoffered, last_at } ]`: per buyer, live lots
+  still unpaid and lots re-offered after a decline (no automatic strike; block a repeat non-payer as usual).
 
 ## Watch list, follows and reminders (login required unless noted)
 
@@ -344,7 +367,9 @@ changes. Only ever the logged-in buyer's own points.
   404 promotions off / draft. Rate limited like bids.
 - `DELETE /checkout/apply-code?auction_id=` → `{ "entered": null }` (until it has been used).
 - `GET /my-orders` rows gain `invoice: { total_cents, discount_kind: "points_reward" | "promo_code" | null,
-  discount_cents, discount_premium_cents } | null`, `points_earned` (that lot) and `shipping_promo`.
+  discount_cents, discount_premium_cents } | null`, `points_earned` (that lot) and `shipping_promo`. A live-show lot
+  (charged on its own, no invoice) carries `discount: { kind, cents } | null` instead; its `total_cents` is after it.
+  `payment_status` can also be `cancelled` (a live lot re-offered after a decline).
 
 How a discount applies (timed auctions): when the invoice is built, **one** discount is decided, once: the points
 reward (if auto-apply is on and the balance has `points_per_reward`) or the entered code, whichever saves more (a tie

@@ -138,7 +138,7 @@ global.SRV = srv;
 
     console.log('\n== Two servers watching the same lot ==');
     const from7 = anon.mark();
-    await ask(host, 'next_item', { timerSeconds: 10 }, ['item_activated']);
+    await ask(host, 'next_item', { timerSeconds: 15 }, ['item_activated']);
     await ask(socks.W, 'place_bid', { itemId: L7, max_amount: 9 }, ['bid_ok']);
     const srv2 = await boot('live-hammer-2', 3632, src, { env: ENV, preload: STUBS, patch: PATCH, timers: 'real' });   // watches the open lot at boot
     servers.push(srv2);

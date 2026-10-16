@@ -27,7 +27,7 @@ const OLD_COMMIT = '93db3d7';
     for (const u of [good, pending, blocked, nocard, unver, noprof]) { await terms(u, show.id); await terms(u, offAir.id); }
 
     const host = await client(srv.url, show.id, ADMIN);
-    const e0 = await ask(host, 'next_item', { timerSeconds: 120 }, ['item_activated', 'host_error']);
+    const e0 = await ask(host, 'next_item', { timerSeconds: 60 }, ['item_activated', 'host_error']);
     ok(e0 && e0.event === 'item_activated', 'the host opens the lot');
     const L = show.lots[0];
     const snapshot = async () => { const l = await K.lot(L); const pb = (await s.from('pre_bids').select('id').eq('item_id', L)).data.length; return `${l.bid_count}/${l.current_bid}/${l.leading_bidder}/${pb}`; };
