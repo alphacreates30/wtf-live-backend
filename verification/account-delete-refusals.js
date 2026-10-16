@@ -30,7 +30,7 @@ const stripeCalls = () => fs.existsSync(CALLS) ? fs.readFileSync(CALLS, 'utf8').
 async function buyer(label) {
   const u = die(await s.from('users').insert({ username: `zzdel_${label}_${tag}`, password_hash: await bcrypt.hash(PW, 10), email: `zzdel-${label}-${tag}@mail.example.com` }).select().single());
   made.users.push(u.id);
-  die(await s.from('profiles').insert({ user_id: String(u.id), full_name: 'ZZ Delete ' + label, email: u.email, phone: '5555550100', address_line1: '1 ZZ St', city: 'Testville', state: 'CA', zip: '94000', status: 'approved', payment_status: 'ok', stripe_customer_id: 'cus_ZZFIXTURE_del_' + label, stripe_payment_method_id: 'pm_ZZFIXTURE_del' }).select().single());
+  die(await s.from('profiles').insert({ user_id: String(u.id), full_name: 'ZZ Delete ' + label, email: u.email, phone: '5555550100', address_line1: '1 ZZ St', city: 'Testville', state: 'CA', zip: '94000', status: 'approved', payment_status: 'ok', stripe_customer_id: 'cus_ZZFIXTURE_del_' + label, card_verified_at: new Date().toISOString(), stripe_payment_method_id: 'pm_ZZFIXTURE_del' }).select().single());
   return { ...u, tok: jwt.sign({ id: u.id, username: u.username }, process.env.JWT_SECRET, { expiresIn: '10m' }) };
 }
 async function auction(label, status) {

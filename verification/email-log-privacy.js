@@ -30,7 +30,7 @@ async function buyer(label, auctionId) {
   const email = `zz-${label}-${tag}@mail.example.com`;
   const u = die(await s.from('users').insert({ username: `zztest_elog_${label}_${tag}`, password_hash: 'x', email }).select().single());
   made.users.push(u.id);
-  die(await s.from('profiles').insert({ user_id: String(u.id), full_name: 'ZZ', email, phone: '0', address_line1: '1', city: 'X', state: 'CA', zip: '1', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_elog', stripe_payment_method_id: 'pm_ZZFIXTURE_elog' }).select().single());
+  die(await s.from('profiles').insert({ user_id: String(u.id), full_name: 'ZZ', email, phone: '0', address_line1: '1', city: 'X', state: 'CA', zip: '1', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_elog', card_verified_at: new Date().toISOString(), stripe_payment_method_id: 'pm_ZZFIXTURE_elog' }).select().single());
   die(await s.from('auction_terms_acceptances').insert({ auction_id: auctionId, user_id: String(u.id), buyers_premium_pct: 15, fulfillment_mode: 'shipping', fulfillment_choice: 'shipping', terms_version: '1' }).select().single());
   return { ...u, email, tok: jwt.sign({ id: u.id, username: u.username }, process.env.JWT_SECRET, { expiresIn: '10m' }) };
 }

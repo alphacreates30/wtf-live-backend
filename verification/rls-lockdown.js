@@ -76,7 +76,9 @@ const PROBE_BID = `select public.place_standard_bid('00000000-0000-4000-8000-000
       ok((await as(c, role, `update public.orders set payment_status = 'paid'`)) === '42501', `${role}: UPDATE orders refused`);
       ok((await as(c, role, `delete from public.invoices`)) === '42501', `${role}: DELETE from invoices refused`);
       ok((await as(c, role, PROBE_BID)) === '42501', `${role}: EXECUTE place_standard_bid refused`);
-      ok((await as(c, role, `select public.place_bid('00000000-0000-4000-8000-000000000000'::uuid, 'zz', 1)`)) === '42501', `${role}: EXECUTE place_bid refused`);
+      // 42883 = no such function: place_bid was dropped by migration za (2026-10-15).
+      const pb = await as(c, role, `select public.place_bid('00000000-0000-4000-8000-000000000000'::uuid, 'zz', 1)`);
+      ok(pb === '42501' || pb === '42883', `${role}: EXECUTE place_bid refused${pb === '42883' ? ' (dropped by migration za)' : ''}`);
       ok((await as(c, role, `select nextval('public.ai_usage_id_seq')`)) === '42501', `${role}: sequence use refused`);
     }
     const noRls = (await c.query(`select relname from pg_class where relnamespace = 'public'::regnamespace and relkind = 'r' and not relrowsecurity`)).rows.map(r => r.relname);

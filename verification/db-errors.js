@@ -49,7 +49,7 @@ const made = { auctions: [], users: [] };
     made.auctions.push(a.id);
     const lot = die(await s.from('auction_items').insert({ auction_id: a.id, title: 'ZZTEST_dberr lot', starting_bid: 0, current_bid: 0, position: 0, status: 'pending', ends_at: new Date(Date.now() + 36e5).toISOString() }).select().single());
     const u = { id: crypto.randomUUID(), username: 'zztest_dberr' }; made.users.push(u.id);
-    die(await s.from('profiles').insert({ user_id: u.id, full_name: 'ZZ', email: 'zz@example.invalid', phone: '0', address_line1: '1', city: 'X', state: 'CA', zip: '1', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_dberr', stripe_payment_method_id: 'pm_ZZFIXTURE_dberr' }).select().single());
+    die(await s.from('profiles').insert({ user_id: u.id, full_name: 'ZZ', email: 'zz@example.invalid', phone: '0', address_line1: '1', city: 'X', state: 'CA', zip: '1', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_dberr', card_verified_at: new Date().toISOString(), stripe_payment_method_id: 'pm_ZZFIXTURE_dberr' }).select().single());
     die(await s.from('auction_terms_acceptances').insert({ auction_id: a.id, user_id: u.id, buyers_premium_pct: 15, fulfillment_mode: 'shipping', fulfillment_choice: 'shipping', terms_version: '1' }).select().single());
     const r = await fetch(`${srv.url}/auction/${a.id}/items/${lot.id}/bid`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + jwt.sign(u, process.env.JWT_SECRET, { expiresIn: '10m' }) }, body: JSON.stringify({ max_amount: 5 }) });
     const j = await r.json();

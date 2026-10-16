@@ -103,7 +103,8 @@ Body: `{ "email": "…", "website": "" }`. `website` is a honeypot: leave the fi
 No login. The auction rules a page may put into words, so none are hard-coded:
 `{ "soft_close_minutes": 2 }` (a bid in a lot's last N minutes moves its end to N minutes after that bid; the same
 value as `time.soft_close_minutes` on `GET /lots/:id`). `Cache-Control: public, max-age=300`. Also `points` (G2, see
-"Points and promotions" below).
+"Points and promotions" below) and `live_enabled` (G1: `true` only when the backend runs with `LIVE_ENABLED=true`; a page
+hides every live-show control while it is `false`).
 
 ## `POST /upload-image` (admin)
 
@@ -208,10 +209,60 @@ OTHER live auctions sharing at least one title word (the auction category only b
   else leads or their max).
 - `GET /my-orders` — each order has `pickup: { address, town, starts_at, ends_at } | null`: the street address,
   only on the caller's own won orders and only when they chose pickup (B6). The same address is in their win email.
-- Socket (live mode, gated off): `auction_state`, `item_activated`, `new_bid` and `auction_ended` carry no bidder;
-  each socket gets its own `you_lead` / `you_won`. `bid_history` goes to the admin only. Chat messages show
-  usernames by design (see OPEN_ITEMS; decide before live mode returns).
+- Socket (live shows, see "Live shows (G1)" below): `auction_state`, `item_activated`, `new_bid`, `lot_closed` and
+  `auction_ended` carry no bidder; each socket gets its own `you_lead` / `you_won`. `bid_history` goes to the admin
+  only. Chat messages show usernames by design. (Usernames on live bids and wins come with live phase 5.)
 - `GET /auction/:auctionId/items/:itemId/images` — a lot's photos, full size (the lot page now reads them from `GET /lots/:id`).
+
+## Who may bid (every auction)
+
+A bid, a pre-bid and accepting an auction's terms all need: logged in, a buyer profile, `approved`, not `blocked`, a
+saved card **that passed the $1 check** (`profiles.card_verified_at`), and not the host/admin account (Albert, Oct 15,
+2026). A refusal is 403 `{ error, code }` with `code` one of `no_profile`, `blocked`, `not_approved`, `no_card`,
+`card_not_verified`, `host_cannot_bid` (a lookup failure is 503). `POST /save-payment-method` answers
+`{ success: true, card_verified: true | false }`; an approved buyer replaces a failed card on their profile page.
+A pre-bid can be withdrawn (`DELETE …/prebid`) only while its lot is `pending`: on an open lot the same row is that
+bidder's live max (400).
+
+## Live shows (G1)
+
+Brief: wtf-handoff `LIVE_SHOWS_BRIEF.md`. **Switched off** unless the backend runs with `LIVE_ENABLED=true`: then
+`POST /auction` with `mode: "live"` is 400, every live socket event below answers `live_off`, live pre-bids are 400
+`{ code: "live_off" }` and `GET /auction/:id/token` is 404. Needs migration `2026-10-15za-live-bidding.sql`.
+
+- A live show is an auction with `mode: "live"`. It has **no buyer's premium** (created at 0; `PATCH` with any other
+  value is 400; the database forces 0) and **no reserve** (bulk lots with one are refused; the database drops one).
+  Its lots wait as `pending` (no clock) until the host offers them.
+- Lot status: `pending` → `open` (with `ends_at`, the database clock) → `sold` | `unsold`.
+- `POST /auction/:id/items/:itemId/bid` refuses a live lot: 400 `{ code: "live_lot" }` (bid in the show).
+  `POST …/prebid` works on a live lot while it is `pending` (same gates as a bid).
+
+Socket events (payloads always include `auctionId` and the buyer's/host's `token`):
+
+| Event (client → server) | Who | What |
+|---|---|---|
+| `place_bid { itemId?, max_amount }` | buyer | A max bid on the open lot (no `itemId` = the lot open now). Same engine as timed lots (`place_standard_bid`: proxy/max, tiers, row lock). Answers `bid_ok` (the public lot + `your_status`, `max_only: true` when the leader only raised their max) or `bid_error { message, code }`: the "Who may bid" codes, or `live_off`, `login_required`, `terms_required`, `not_on_air`, `bad_amount`, `not_found`, `lot_not_open`, `below_minimum`, `refused`, `rate_limited`. |
+| `start_auction` | host | On air (`upcoming` → `live`). |
+| `next_item { timerSeconds = 30, suddenDeath = false }` | host | Offers the next `pending` lot (by position) and starts its clock (5–600 s). Refused while a lot is open. |
+| `extend_auction { extraSeconds }` | host | Adds 1–120 s to the open lot's clock. |
+| `end_auction` | host | Hammers the open lot (to its leader, if any), then ends the show. |
+
+| Event (server → client) | Payload |
+|---|---|
+| `item_activated` | `{ item (public lot), you_lead, pre_bid_count, timer_seconds, sudden_death, ends_at, server_now }` (also sent to a viewer who joins mid-lot) |
+| `item_timer_tick` | every second: `{ auctionId, item_id, seconds, ends_at, server_now }`. Time left = `ends_at − server_now` (the database's clock). |
+| `new_bid` | `{ auction_id, item_id, amount, bid_count, ends_at, server_now, you_lead }` |
+| `item_extended` | `{ auctionId, item_id, ends_at, server_now }` (the host's +N s) |
+| `lot_closed` | `{ auctionId, item_id, status: "sold" \| "unsold", amount, you_won }` |
+| `items_finished`, `auction_started`, `auction_ended` | `{ auctionId }` |
+| `host_error` | `{ message, code? }` |
+
+How a lot sells: the opening price applies the pre-bids by the proxy rule and **never** shows the top max (one
+pre-bid: the opening minimum, $1 or the starting bid; two or more: `least(top, second + increment)`, the top pre-bidder
+leading). A bid with 5 s or less left adds 5 s (Sudden death: nothing). At 0 the database closes the lot
+(`close_live_lot`, one closer only), the order is created (one per lot), `lot_closed` goes out, and **then** the card
+is charged in the background (`chargeOrder`, with the lot's G2 discount): the hammer price, no premium. No per-lot
+win email (one summary after the show comes in phase 1b); a declined card emails the buyer and the admin at once.
 
 ## Watch list, follows and reminders (login required unless noted)
 
@@ -306,11 +357,13 @@ back, never below 0; a partial refund changes nothing and emails the admin. Post
 `bundle_free_shipping` when the buyer won 3+ lots in that auction, makes `/admin/orders/label` buy the label without
 charging the buyer (`buyer_paid_cents: 0`, `orders.shipping_promo`); the quote shows `buyer_pays_cents`.
 
-**For live shows (G1):** call `rewards.discountsForCharge({ userId, auctionId, hammerCents, premiumCents: 0, atMs })`
-for each hammer charge (per lot), record the result on the order the way `apply_invoice_discount` does for invoices
-(a per-order variant: the ledger already allows one `redeem` per `order_id`), lower the charge, and call
-`rewards.earnForOrders([order])` on success (already wired into `chargeOrder`). The live "one box per show" postage goes
-through the same label route, so the shipping promos already apply.
+**Live shows (G1, wired in phase 1):** each hammer charge calls `rewards.applyOrderDiscount(orderId)`, which asks
+`discountsForCharge({ scope: 'lot', … premiumCents: 0 })` and records the result once with `apply_order_discount`
+(migration za): at most one points reward per lot, or the show's % code (an entered code covers every lot the buyer
+wins in that show), the bigger saving; never below $0 and never 1–49c left. `orders.discount_kind / discount_cents`
+show it and `orders.total_cents` is what is charged; a $0 lot is paid with `payment_intent_id = 'no_charge_discount'`.
+Points are earned per paid lot (`chargeOrder`). The live "one box per show" postage goes through the same label
+route, so the shipping promos already apply.
 
 Admin (403 for anyone else):
 - `GET /admin/points-settings` → `{ admin_enabled, env_enabled, migrated, enabled, points_per_dollar,

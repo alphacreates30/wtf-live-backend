@@ -26,7 +26,8 @@ async function boot(name, port, source) {
   const file = BE + '/server.tmp-' + name + '.js';
   fs.writeFileSync(file, source);
   const runner = BE + '/run.tmp-' + name + '.js';
-  fs.writeFileSync(runner, "global.setInterval = () => 0; process.env.PORT='" + port + "'; require('./server.tmp-" + name + ".js');");
+  // LIVE_ENABLED: the NEW server must run live shows for the item_activated check (the pinned commit ignores it).
+  fs.writeFileSync(runner, "global.setInterval = () => 0; process.env.PORT='" + port + "'; process.env.LIVE_ENABLED='true'; require('./server.tmp-" + name + ".js');");
   const child = spawn(process.execPath, [runner], { cwd: BE, stdio: 'ignore' });
   for (let i = 0; i < 25; i++) { try { await fetch('http://localhost:' + port + '/auctions'); break; } catch { await sleep(1000); } }
   return { cleanup: () => { child.kill(); try { fs.unlinkSync(file); fs.unlinkSync(runner); } catch {} } };
@@ -76,7 +77,7 @@ async function fixtures(label) {
   const VL = await lot(V, 'pending');
   // Bidders must be approved with a saved card (review #3): placeholder ids, nothing reaches Stripe.
   for (const u of [L, C]) {
-    const p = await s.from('profiles').upsert({ user_id: u.id, full_name: 'ZZTEST secretmax', email: 'zztest_secretmax@example.invalid', phone: '0', address_line1: '1 ZZ St', city: 'X', state: 'CA', zip: '94000', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_secretmax', stripe_payment_method_id: 'pm_ZZFIXTURE_secretmax' }, { onConflict: 'user_id' });
+    const p = await s.from('profiles').upsert({ user_id: u.id, full_name: 'ZZTEST secretmax', email: 'zztest_secretmax@example.invalid', phone: '0', address_line1: '1 ZZ St', city: 'X', state: 'CA', zip: '94000', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_secretmax', card_verified_at: new Date().toISOString(), stripe_payment_method_id: 'pm_ZZFIXTURE_secretmax' }, { onConflict: 'user_id' });
     if (p.error) throw new Error('profile: ' + JSON.stringify(p.error));
   }
   for (const u of [L, C]) for (const a of [S, V]) {
@@ -134,12 +135,11 @@ async function scenario(port, label) {
   const events = await socketRun(port, V);
   const activated = events.find(e => e.event === 'item_activated');
   if (!activated) throw new Error('no item_activated received');
-  // Live mode (gated off in v2) opens the lot AT the top pre-bid max, so current_bid equals it by design of that
-  // flow. That is the live-mode price, reported below, not searched for here; the row's top_pre_bid key is.
-  const { current_bid: openingPrice, leading_bidder: _lb, ...activatedRest } = activated.payload.item || {};
-  for (const e of events) {
-    seen.push([`anonymous socket: ${e.event}`, e === activated ? { ...activated.payload, item: activatedRest } : e.payload]);
-  }
+  // The pinned commit opened a live lot AT the top pre-bid max (current_bid = L's max). Since live phase 1
+  // (migration za, open_live_lot) it opens at the second max + increment, so the whole payload is searched,
+  // current_bid included.
+  const openingPrice = (activated.payload.item || {}).current_bid;
+  for (const e of events) seen.push([`anonymous socket: ${e.event}`, e.payload]);
 
   const controls = {
     adminItems: (await call(port, 'GET', `/auction/${S}/items`, tokAdmin)).j,
@@ -202,7 +202,7 @@ async function cleanup() {
       ok(!text.includes(L.username) && !text.includes(C.username) && !text.includes('"username"'), `NEW ${who}: no username on the lot page or in its history`);
     }
     ok(now.controls.leaderMe && now.controls.leaderMe.my_max === STD_MAX && now.controls.leaderMe.status === 'winning', `NEW L's own /lots/SL/me shows their OWN max (${now.controls.leaderMe && now.controls.leaderMe.my_max})`);
-    console.log(`\nNOTE live mode (gated off in v2) opens a lot at the top pre-bid max: item_activated current_bid = ${now.openingPrice} (L's pre-bid max ${PRE_MAX}). Not fixed here; see README.`);
+    ok(Number(now.openingPrice) === 8, `NEW a live lot opens at C's $7 + $1 = $${now.openingPrice}, never at L's pre-bid max $${PRE_MAX} (was the NOTE here before live phase 1)`);
   } finally {
     servers.forEach(x => x.cleanup());
     await cleanup();

@@ -60,10 +60,10 @@ const prebids = async id => (await s.from('pre_bids').select('id,auction_id,item
     const itemB2 = await mkItem(B, 'ZZTEST B pending lot', 'pending');
     const itemA = await mkItem(A, 'ZZTEST A open lot', 'open');
     const itemA2 = await mkItem(A, 'ZZTEST A pending lot', 'pending');
-    const p = await s.from('profiles').insert({ user_id: U, full_name: 'ZZTEST termsgate', email: 'zztest_termsgate@example.invalid', phone: '5555550100', address_line1: '1 Test St', city: 'Testville', state: 'CA', zip: '94000', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_termsgate', stripe_payment_method_id: 'pm_ZZFIXTURE_termsgate' });
+    const p = await s.from('profiles').insert({ user_id: U, full_name: 'ZZTEST termsgate', email: 'zztest_termsgate@example.invalid', phone: '5555550100', address_line1: '1 Test St', city: 'Testville', state: 'CA', zip: '94000', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_termsgate', card_verified_at: new Date().toISOString(), stripe_payment_method_id: 'pm_ZZFIXTURE_termsgate' });
     if (p.error) throw new Error('profile: ' + JSON.stringify(p.error));
     // the challenger bids too, so it needs the same standing (review #3); placeholder card ids
-    const p2 = await s.from('profiles').insert({ user_id: U2, full_name: 'ZZTEST termsgate 2', email: 'zztest_termsgate2@example.invalid', phone: '5555550100', address_line1: '1 Test St', city: 'Testville', state: 'CA', zip: '94000', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_termsgate2', stripe_payment_method_id: 'pm_ZZFIXTURE_termsgate2' });
+    const p2 = await s.from('profiles').insert({ user_id: U2, full_name: 'ZZTEST termsgate 2', email: 'zztest_termsgate2@example.invalid', phone: '5555550100', address_line1: '1 Test St', city: 'Testville', state: 'CA', zip: '94000', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_termsgate2', card_verified_at: new Date().toISOString(), stripe_payment_method_id: 'pm_ZZFIXTURE_termsgate2' });
     if (p2.error) throw new Error('profile 2: ' + JSON.stringify(p2.error));
     // The buyer accepted terms on auction A ONLY (15% premium, shipping). Never on B (25%, both).
     const t = await s.from('auction_terms_acceptances').insert({ auction_id: A, user_id: U, accepted_at: new Date().toISOString(), buyers_premium_pct: 15, fulfillment_mode: 'shipping', fulfillment_choice: 'shipping', terms_version: '1' });

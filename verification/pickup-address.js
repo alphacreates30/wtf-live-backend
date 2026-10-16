@@ -63,7 +63,7 @@ async function fixtures(label) {
   auctionIds.push(P.id);
   const PL = die(await s.from('auction_items').insert({ auction_id: P.id, title: 'ZZTEST zzpickup lot', starting_bid: 0, current_bid: 0, position: 0, status: 'open', ends_at: future(120) }).select().single());
   for (const u of [W, Y, X]) {
-    die(await s.from('profiles').upsert({ user_id: u.id, full_name: 'ZZTEST pickup', email: u.email, phone: '0', address_line1: '1 ZZ St', city: 'X', state: 'FL', zip: '33101', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_pickup', stripe_payment_method_id: 'pm_ZZFIXTURE_pickup' }, { onConflict: 'user_id' }));
+    die(await s.from('profiles').upsert({ user_id: u.id, full_name: 'ZZTEST pickup', email: u.email, phone: '0', address_line1: '1 ZZ St', city: 'X', state: 'FL', zip: '33101', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_pickup', card_verified_at: new Date().toISOString(), stripe_payment_method_id: 'pm_ZZFIXTURE_pickup' }, { onConflict: 'user_id' }));
     die(await s.from('auction_terms_acceptances').insert({ auction_id: P.id, user_id: u.id, accepted_at: new Date().toISOString(), buyers_premium_pct: 15, fulfillment_mode: 'both', fulfillment_choice: u === Y ? 'shipping' : 'pickup', terms_version: '1' }));
   }
   // W won a lot and chose pickup; Y won one and chose shipping. X bid but won nothing.

@@ -41,7 +41,7 @@ const sha = v => crypto.createHash('sha256').update(v).digest('hex');
 async function buyer(label, extra = {}) {
   const u = die(await s.from('users').insert({ username: `zzdel_${label}_${tag}`, password_hash: await bcrypt.hash(PW, 10), email: `zzdel-${label}-${tag}@mail.example.com` }).select().single());
   made.users.push(u.id);
-  const prof = { user_id: String(u.id), full_name: `Zelda Deletable ${label}`, email: u.email, phone: label === 'd' ? '5555550199' : '5555550288', address_line1: `42 Private Lane ${label}`, address_line2: 'Apt 7', city: 'Secretville', state: 'CA', zip: '94999', status: 'approved', payment_status: 'ok', stripe_customer_id: `cus_ZZFIXTURE_del_${label}_${tag}`, stripe_payment_method_id: 'pm_ZZFIXTURE_del', ...extra };
+  const prof = { user_id: String(u.id), full_name: `Zelda Deletable ${label}`, email: u.email, phone: label === 'd' ? '5555550199' : '5555550288', address_line1: `42 Private Lane ${label}`, address_line2: 'Apt 7', city: 'Secretville', state: 'CA', zip: '94999', status: 'approved', payment_status: 'ok', stripe_customer_id: `cus_ZZFIXTURE_del_${label}_${tag}`, card_verified_at: new Date().toISOString(), stripe_payment_method_id: 'pm_ZZFIXTURE_del', ...extra };
   die(await s.from('profiles').insert(prof).select().single());
   return { ...u, prof, tok: jwt.sign({ id: u.id, username: u.username }, process.env.JWT_SECRET, { expiresIn: '10m' }) };
 }

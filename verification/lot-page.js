@@ -99,7 +99,7 @@ async function fixtures() {
   const Q = await auction({ title: 'ZZTEST_lotpage Quiet', category: null });
   const QL = await lots(Q.id, [{ title: 'zzlplonely item' }, { title: 'zzlpquiet twin' }, { title: 'zzlpquiet third' }]);
   for (const u of [A, B, C]) {
-    const p = await s.from('profiles').upsert({ user_id: u.id, full_name: 'ZZTEST lotpage', email: 'zztest_lotpage@example.invalid', phone: '0', address_line1: '1 ZZ St', city: 'X', state: 'CA', zip: '94000', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_lotpage', stripe_payment_method_id: 'pm_ZZFIXTURE_lotpage' }, { onConflict: 'user_id' });
+    const p = await s.from('profiles').upsert({ user_id: u.id, full_name: 'ZZTEST lotpage', email: 'zztest_lotpage@example.invalid', phone: '0', address_line1: '1 ZZ St', city: 'X', state: 'CA', zip: '94000', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_lotpage', card_verified_at: new Date().toISOString(), stripe_payment_method_id: 'pm_ZZFIXTURE_lotpage' }, { onConflict: 'user_id' });
     if (p.error) throw new Error('profile: ' + JSON.stringify(p.error));
     const t = await s.from('auction_terms_acceptances').insert({ auction_id: S.id, user_id: u.id, accepted_at: new Date().toISOString(), buyers_premium_pct: 15, fulfillment_mode: 'both', fulfillment_choice: 'shipping', terms_version: '1' });
     if (t.error) throw new Error('acceptance: ' + JSON.stringify(t.error));
@@ -161,11 +161,11 @@ async function cleanup() {
     ok(L.price.premium_amount === 0.15 && L.price.total_with_premium === 1.15, 'premium on the opening bid: $0.15 -> $1.15');
     ok(L.time && L.time.soft_close_minutes === 2 && L.time.ends_at === new Date(lot0.ends_at).toISOString(), 'time: ends_at and the live soft-close minutes (2)');
     const cfg = (await call('GET', '/config')).j;
-    // G2 added `points` (on/off and the public rate only; nothing per buyer).
+    // G2 added `points` (on/off and the public rate only; nothing per buyer); G1 added `live_enabled` (true/false).
     const pointsOk = cfg && cfg.points && typeof cfg.points.enabled === 'boolean'
       && Object.keys(cfg.points).every(k => ['enabled', 'points_per_dollar', 'points_per_reward', 'reward_cents'].includes(k));
-    ok(cfg && cfg.soft_close_minutes === L.time.soft_close_minutes && JSON.stringify(Object.keys(cfg)) === '["soft_close_minutes","points"]' && pointsOk,
-      `GET /config: the same soft-close setting the lot page uses, plus the public points switch (${JSON.stringify(cfg)}), nothing else`);
+    ok(cfg && cfg.soft_close_minutes === L.time.soft_close_minutes && JSON.stringify(Object.keys(cfg)) === '["soft_close_minutes","live_enabled","points"]' && pointsOk && typeof cfg.live_enabled === 'boolean',
+      `GET /config: the same soft-close setting the lot page uses, plus the public live and points switches (${JSON.stringify(cfg)}), nothing else`);
     ok(L.fulfilment && L.fulfilment.pickup && L.fulfilment.pickup.town === 'Miami, FL' && L.fulfilment.pickup.free === true && L.fulfilment.shipping && L.fulfilment.shipping.priced === 'after_auction' && L.fulfilment.shipping.estimate === null,
       'fulfilment: pickup town (its own column) only, shipping priced after the auction, no estimate (lots have no weight/size)');
     ok(L.nav && L.nav.prev === null && L.nav.next && L.nav.next.id === lot1.id && L.nav.next.number === 2, 'nav: first lot has no prev; next = lot 2');

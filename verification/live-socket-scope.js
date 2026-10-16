@@ -30,8 +30,8 @@ const emit = (url, event, payload) => new Promise(res => {
   c.on('connect_error', () => res(got));
 });
 
-async function phase(label, port, source) {
-  const srv = await boot('lsock-' + label, port, source);
+async function phase(label, port, source, env = {}) {
+  const srv = await boot('lsock-' + label, port, source, { env });
   try {
     const buyer = die(await s.from('users').select('id, username').eq('username', BUYER).single());
     const buyerTok = jwt.sign({ id: buyer.id, username: buyer.username }, process.env.JWT_SECRET, { expiresIn: '10m' });
@@ -39,13 +39,18 @@ async function phase(label, port, source) {
     const std = await mkAuction(label + ' standard (bid)', 'standard');
     const stdEnd = await mkAuction(label + ' standard (end)', 'standard');
     const live = await mkAuction(label + ' live-mode control', 'live');
+    // Since live phase 1 a live bid is on the open LOT, by a buyer who accepted the show's terms.
+    const liveLot = die(await s.from('auction_items').insert({ auction_id: live, title: 'ZZTEST_lsock lot', starting_bid: 0, current_bid: 0, position: 0, status: 'open',
+      ends_at: at(3600), extend_window_seconds: 5, extend_by_seconds: 5 }).select().single()).id;
+    die(await s.from('auction_terms_acceptances').insert({ auction_id: live, user_id: buyer.id, buyers_premium_pct: 0, fulfillment_mode: 'shipping', fulfillment_choice: 'shipping', terms_version: '1' }).select());
     const bidEvents = await emit(srv.url, 'place_bid', { auctionId: std, amount: 50, token: buyerTok });
     const endEvents = await emit(srv.url, 'end_auction', { auctionId: stdEnd, token: adminTok });
     const liveEvents = await emit(srv.url, 'place_bid', { auctionId: live, amount: 7, token: buyerTok });
-    return { bid: await row(std), bidEvents, end: await row(stdEnd), endEvents, live: await row(live), liveEvents };
+    return { bid: await row(std), bidEvents, end: await row(stdEnd), endEvents, live: die(await s.from('auction_items').select('leading_bidder, current_bid').eq('id', liveLot).single()), liveEvents };
   } finally { srv.stop(); }
 }
 
+const std0 = '00000000-0000-4000-8000-000000000000';
 (async () => {
   try {
     const oldSrc = require('./guard').sourceAt(OLD_COMMIT, BE);
@@ -53,14 +58,16 @@ async function phase(label, port, source) {
 
     console.log(`== REPRODUCE on ${OLD_COMMIT}: live-mode socket events on a STANDARD auction ==`);
     let r = await phase('old', 3371, oldSrc);
-    ok(r.bid.leading_bidder === BUYER && Number(r.bid.current_bid) === 50, `OLD: socket place_bid on a standard auction set its auction-level leader to ${r.bid.leading_bidder} at $${r.bid.current_bid}  <- WRITTEN`);
+    const oldSqlGone = !(await s.rpc('place_bid', { p_auction_id: std0, p_username: BUYER, p_amount: 1 }).then(x => !x.error || !/Could not find|does not exist/i.test(x.error.message)));
+    if (oldSqlGone) console.log("SKIP OLD socket place_bid on a standard auction: can't be replayed - the old place_bid SQL it called was dropped by migration za (2026-10-15)");
+    else ok(r.bid.leading_bidder === BUYER && Number(r.bid.current_bid) === 50, `OLD: socket place_bid on a standard auction set its auction-level leader to ${r.bid.leading_bidder} at $${r.bid.current_bid}  <- WRITTEN`);
     ok(r.end.status === 'ended', `OLD: admin end_auction on a standard auction -> '${r.end.status}'  <- ENDED WITHOUT INVOICES`);
 
     console.log('\n== SAME on the FIXED code ==');
-    r = await phase('new', 3372, newSrc);
+    r = await phase('new', 3372, newSrc, { LIVE_ENABLED: 'true' });
     ok(!r.bid.leading_bidder && Number(r.bid.current_bid) === 0 && r.bidEvents.some(e => e.startsWith('bid_error')), `NEW: place_bid on a standard auction refused (${r.bidEvents.find(e => e.startsWith('bid_error'))}), auction unchanged`);
     ok(r.end.status === 'live' && r.endEvents.some(e => e.startsWith('host_error')), `NEW: end_auction on a standard auction refused (${r.endEvents.find(e => e.startsWith('host_error'))}), still '${r.end.status}'`);
-    ok(r.live.leading_bidder === BUYER && Number(r.live.current_bid) === 7, `NEW control: a real live-mode auction still takes a socket bid (leader ${r.live.leading_bidder} at $${r.live.current_bid})`);
+    ok(r.live.leading_bidder === BUYER && Number(r.live.current_bid) === 1 && r.liveEvents.some(e => e.startsWith('bid_ok')), `NEW control: a live show's open lot still takes a socket bid (leader ${r.live.leading_bidder} at the $${r.live.current_bid} opening)`);
   } finally {
     for (const id of made) { const d = await s.rpc('delete_auction_cascade', { p_auction_id: id }); if (d.error) console.log('cleanup error', id, d.error.message); }
     const left = (await s.from('auctions').select('id').like('title', 'ZZTEST_lsock%')).data.length

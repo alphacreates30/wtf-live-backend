@@ -37,7 +37,7 @@ const token = async (url, id, t) => {
     const pending = await person('pending', 'pending'), approved = await person('approved', 'approved'), none = await person('noprofile', null);
     const host = jwt.sign({ id: crypto.randomUUID(), username: 'whatthefind' }, process.env.JWT_SECRET, { expiresIn: '10m' });
     const draftLive = await mkAuction('draft live-mode', 'draft', 'live'), standard = await mkAuction('standard', 'live', 'standard'), live = await mkAuction('live-mode', 'live', 'live');
-    const oldSrv = await boot('lk-old', 3521, oldSrc, { env: LK }), newSrv = await boot('lk-new', 3522, newSrc, { env: LK });
+    const oldSrv = await boot('lk-old', 3521, oldSrc, { env: LK }), newSrv = await boot('lk-new', 3522, newSrc, { env: { ...LK, LIVE_ENABLED: 'true' } });   // off = 404 (live-flag.js)
     servers.push(oldSrv, newSrv);
 
     console.log(`== REPRODUCE on ${OLD_COMMIT} ==`);

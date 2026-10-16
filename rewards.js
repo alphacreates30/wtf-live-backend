@@ -1,8 +1,9 @@
 // Buyer points and promotions (G2, wtf-handoff POINTS_BRIEF.md). Migration 2026-10-15z.
 //
-// One function decides the discounts for a charge: discountsForCharge(). The timed-auction invoice uses it now
-// (buildAndChargeInvoicesForAuction -> applyInvoiceDiscount) and the live-show hammer charge (G1) will call it with
-// scope 'lot' and premiumCents 0. It never changes a bid: it returns what comes off the winning bids AFTER the win.
+// One function decides the discounts for a charge: discountsForCharge(). The timed-auction invoice uses it
+// (buildAndChargeInvoicesForAuction -> applyInvoiceDiscount) and so does the live-show hammer charge (G1:
+// closeLiveLot -> chargeLiveOrder -> applyOrderDiscount, scope 'lot', premiumCents 0). It never changes a bid: it
+// returns what comes off the winning bids AFTER the win.
 //
 // Rules (Albert, Oct 15):
 //   earn     points_per_dollar per whole $1 of winning bid, per lot, rounded down; credited when the payment succeeds
@@ -143,12 +144,13 @@ function makeRewards(supabase) {
     return data || [];
   }
 
-  // The buyer's entered code for this event, if its promotion is still valid at `atMs`.
-  async function enteredCode(userId, auctionId, atMs) {
-    const { data, error } = await supabase.from('promotion_uses').select('promotion_id, applied_at, promotions(*)')
+  // The buyer's entered code for this event, if its promotion is still valid at `atMs`. On a timed auction the code
+  // is used once, by the invoice. In a live show (reuse) it covers every lot the buyer wins in that show.
+  async function enteredCode(userId, auctionId, atMs, { reuse = false } = {}) {
+    const { data, error } = await supabase.from('promotion_uses').select('promotion_id, applied_at, invoice_id, promotions(*)')
       .eq('user_id', userId).eq('auction_id', auctionId).maybeSingle();
     if (error) throw error;
-    if (!data || data.applied_at || !data.promotions) return null;
+    if (!data || !data.promotions || (data.applied_at && !(reuse && !data.invoice_id))) return null;
     const p = data.promotions;
     if (p.kind !== 'percent_code' || !promoApplies(p, auctionId, atMs)) return null;
     return { promotion_id: p.id, percent: p.percent, code: p.code };
@@ -157,13 +159,13 @@ function makeRewards(supabase) {
   // THE shared decision for one charge (timed invoice now; live hammer charge in G1).
   //   scope 'invoice' | 'lot'; hammerCents/premiumCents = the charge before discounts; atMs = when the event closed
   //   (the code must have been valid then). Returns decideDiscount()'s result plus the settings used.
-  async function discountsForCharge({ userId, auctionId, hammerCents, premiumCents = 0, atMs = Date.now() }) {
+  async function discountsForCharge({ scope = 'invoice', userId, auctionId, hammerCents, premiumCents = 0, atMs = Date.now() }) {
     const s = await settings();
     if (!s.rewards_on) return { ...decideDiscount({ hammerCents: 0, settings: s }), settings: s };
     const [balance, acct, code] = await Promise.all([
       s.enabled ? balanceOf(userId) : 0,
       s.enabled ? account(userId) : { auto_apply: false },
-      enteredCode(userId, auctionId, atMs),
+      enteredCode(userId, auctionId, atMs, { reuse: scope === 'lot' }),
     ]);
     return { ...decideDiscount({ hammerCents, premiumCents, balance, autoApply: acct.auto_apply, code, settings: s }), settings: s };
   }
@@ -197,6 +199,37 @@ function makeRewards(supabase) {
       return null;
     } catch (e) {
       console.error('applyInvoiceDiscount error:', invoiceId, e.message);
+      return null;
+    }
+  }
+
+  // A live lot's discount, decided once before its charge (G1 hammer). Same rules as an invoice, per lot: at most one
+  // reward per lot, or the show's % code (the bigger saving), never below $0, never 1-49c left. Never throws; returns
+  // the kind applied (or null).
+  async function applyOrderDiscount(orderId) {
+    try {
+      const s = await settings();
+      if (!s.rewards_on) return null;
+      const { data: o, error } = await supabase.from('orders').select('*').eq('id', orderId).maybeSingle();
+      if (error) { if (!notMigrated(error)) console.error('applyOrderDiscount read failed:', orderId, error.message); return null; }
+      if (!o || o.discount_decided_at || o.invoice_id || o.payment_intent_id || (o.payment_status || 'unpaid') !== 'unpaid') return o?.discount_kind || null;
+      const atMs = Date.parse(o.created_at) || Date.now();
+      const premium = o.premium_cents || 0;
+      let d = await discountsForCharge({ scope: 'lot', userId: o.buyer_user_id, auctionId: o.auction_id, hammerCents: o.hammer_cents, premiumCents: premium, atMs });
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const off = d.kind ? d.off_cents + d.premium_off_cents + belowStripeMinimum(o.total_cents, d) : 0;
+        const { data: result, error: rpcErr } = await supabase.rpc('apply_order_discount', {
+          p_order_id: orderId, p_kind: d.kind || 'none', p_points: d.points, p_discount_cents: off, p_promotion_id: d.promotion_id,
+        });
+        if (rpcErr) { if (!notMigrated(rpcErr)) console.error('apply_order_discount failed:', orderId, rpcErr.message); return null; }
+        if (result !== 'insufficient') { const k = String(result).replace(/^already:/, ''); return k === 'none' || k === 'not_unpaid' ? null : k; }
+        d = d.kind === 'points_reward'
+          ? decideDiscount({ hammerCents: o.hammer_cents, premiumCents: premium, balance: 0, code: await enteredCode(o.buyer_user_id, o.auction_id, atMs, { reuse: true }), settings: s })
+          : decideDiscount({ hammerCents: 0, settings: s });
+      }
+      return null;
+    } catch (e) {
+      console.error('applyOrderDiscount error:', orderId, e.message);
       return null;
     }
   }
@@ -243,7 +276,7 @@ function makeRewards(supabase) {
   }
 
   return { settings, forget, balanceOf, account, promosFor, enteredCode, discountsForCharge, applyInvoiceDiscount,
-    earnForOrders, reverseForOrders, summaryFor };
+    applyOrderDiscount, earnForOrders, reverseForOrders, summaryFor };
 }
 
 module.exports = {

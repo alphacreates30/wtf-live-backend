@@ -53,7 +53,8 @@ async function shadowed(c) {
     }
 
     console.log('== AFTER migration 2026-09-29s ==');
-    ok(FUNCS.every(f => rows.some(r => r.proname === f)) && rows.every(pinned), `every public function (${rows.length}) has search_path pinned to ''`);
+    // place_bid (the old live auction-row bid) was dropped by migration za (2026-10-15): it may be absent.
+    ok(FUNCS.filter(f => f !== 'place_bid').every(f => rows.some(r => r.proname === f)) && rows.every(pinned), `every public function (${rows.length}) has search_path pinned to ''${rows.some(r => r.proname === 'place_bid') ? '' : ' (place_bid dropped by migration za)'}`);
     ok(!(await shadowed(c)), 'a caller\'s TEMP tables named auctions / auction_items are ignored: the function reads public.* only');
     ok(rows.every(r => !r.anon && !r.auth && r.sr), 'grants unchanged: anon/authenticated cannot EXECUTE, service_role can (migration p holds)');
     // The bodies' logic is exercised end to end by the other suites (bids: terms-gate, secret-max, bid-eligibility;

@@ -56,7 +56,7 @@ async function fixtures(label) {
   const SL = await lot(S.id, 'open', 'ZZTEST zzbidid lot');
   const VL = await lot(V.id, 'pending', 'ZZTEST zzbidid live lot');
   for (const u of [L, C, O]) {
-    const p = await s.from('profiles').upsert({ user_id: u.id, full_name: 'ZZTEST bidid', email: 'zztest_bidid@example.invalid', phone: '0', address_line1: '1 ZZ St', city: 'X', state: 'CA', zip: '94000', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_bidid', stripe_payment_method_id: 'pm_ZZFIXTURE_bidid' }, { onConflict: 'user_id' });
+    const p = await s.from('profiles').upsert({ user_id: u.id, full_name: 'ZZTEST bidid', email: 'zztest_bidid@example.invalid', phone: '0', address_line1: '1 ZZ St', city: 'X', state: 'CA', zip: '94000', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_bidid', card_verified_at: new Date().toISOString(), stripe_payment_method_id: 'pm_ZZFIXTURE_bidid' }, { onConflict: 'user_id' });
     if (p.error) throw new Error('profile: ' + JSON.stringify(p.error));
     for (const a of [S.id, V.id]) {
       const t = await s.from('auction_terms_acceptances').insert({ auction_id: a, user_id: u.id, accepted_at: new Date().toISOString(), buyers_premium_pct: 15, fulfillment_mode: 'shipping', fulfillment_choice: 'shipping', terms_version: '1' });
@@ -85,8 +85,10 @@ function socketRun(url, V) {
       sock.onAny((event, payload) => {
         got[k].push({ event, payload });
         if (event === 'auction_state' && ++joined === 4) socks.admin.emit('next_item', { auctionId: V, token: who.admin, timerSeconds: 60 });
-        if (k === 'admin' && event === 'item_activated' && step === 0) { step = 1; setTimeout(() => socks.L.emit('place_bid', { auctionId: V, amount: 450, token: who.L }), 300); }
-        if (k === 'admin' && event === 'new_bid' && step === 1) { step = 2; setTimeout(() => socks.admin.emit('end_auction', { auctionId: V, token: who.admin }), 300); }
+        // C bids in the room under L's pre-bid (since live phase 1 the leader's own raise is max-only and silent).
+        // On the pinned commit that bid fails (its old place_bid SQL was dropped by migration za): end the show anyway.
+        if (k === 'admin' && event === 'item_activated' && step === 0) { step = 1; setTimeout(() => socks.anon.emit('place_bid', { auctionId: V, max_amount: 100, amount: 100, token: tok(C) }), 300); }
+        if (((k === 'admin' && event === 'new_bid') || (k === 'anon' && event === 'bid_error')) && step === 1) { step = 2; setTimeout(() => socks.admin.emit('end_auction', { auctionId: V, token: who.admin }), 300); }
         if (k === 'anon' && event === 'auction_ended') { clearTimeout(timer); setTimeout(done, 800); }
       });
       sock.on('connect', () => sock.emit('join_auction', { auctionId: V, token: who[k] || undefined }));
@@ -150,7 +152,7 @@ async function cleanup() {
   const servers = [];
   try {
     const oldS = await boot('bidid-old', 3371, guard.sourceAt(PINNED, BE)); servers.push(oldS);
-    const newS = await boot('bidid-new', 3372, guard.readSource(BE + '/server.js')); servers.push(newS);
+    const newS = await boot('bidid-new', 3372, guard.readSource(BE + '/server.js'), { env: { LIVE_ENABLED: 'true' } }); servers.push(newS);
 
     console.log(`== REPRODUCE on the pinned commit (${PINNED}): bidders named to anonymous callers and other buyers ==`);
     const old = await scenario(oldS.url, 'old');
@@ -158,8 +160,9 @@ async function cleanup() {
     for (const [w, l] of oldLeaks) console.log(`  leak: ${w} -> ${[...new Set(l)].join(', ')}`);
     const has = w => oldLeaks.some(([x]) => x.startsWith(w));
     ok(has(`anonymous: GET /auction/${old.F.S.id} `) && has(`anonymous: GET /auction/${old.F.S.id}/bids`) && has(`anonymous: GET /auction/${old.F.S.id}/items/standard-status`)
-      && has('anon socket: new_bid') && has('anon socket: auction_ended') && leaks(old.bidOut.C).includes(L.username),
-      `OLD names bidders in ${oldLeaks.length} responses (auction, bid list, lot rows, socket new_bid and auction_ended, the losing bid's answer)  <- BUG REPRODUCED`);
+      && has('anon socket: auction_ended') && leaks(old.bidOut.C).includes(L.username),
+      `OLD names bidders in ${oldLeaks.length} responses (auction, bid list, lot rows, socket auction_ended, the losing bid's answer)  <- BUG REPRODUCED`);
+    // (The pinned commit's socket new_bid leak can no longer be replayed: its place_bid SQL is gone since migration za.)
     await cleanup();
 
     console.log('\n== SAME scenario on the NEW code ==');
@@ -170,8 +173,8 @@ async function cleanup() {
     for (const [w, b] of now.seen) { const l = leaks(b); if (l.length) ok(false, `NEW ${label(w)}: LEAKS ${[...new Set(l)].join(', ')}`); }
     ok(clean === now.seen.length, `NEW: all ${now.seen.length} payloads to anonymous and to another buyer (${new Set(now.seen.map(([w]) => w.split(':')[1])).size} REST reads/socket events) name no bidder and carry no max`);
     const anonEvents = new Set(now.events.anon.map(e => e.event));
-    ok(['auction_state', 'item_activated', 'new_bid', 'auction_ended'].every(e => anonEvents.has(e)) && !anonEvents.has('bid_history'),
-      `the socket checks saw state, activation, a bid and the end; no bid list for the public (${[...anonEvents].join(', ')})`);
+    ok(['auction_state', 'item_activated', 'new_bid', 'lot_closed', 'auction_ended'].every(e => anonEvents.has(e)) && !anonEvents.has('bid_history'),
+      `the socket checks saw state, activation, a bid, the hammer and the end; no bid list for the public (${[...anonEvents].join(', ')})`);
     const home = now.seen.find(([w]) => w === 'anonymous: GET /home (200)')[1];
     ok(Object.values(home.rails).flat().some(l => l.id === SL && l.bid_count === 2), "the public still sees the price and the bid count (/home carries the bid-on lot: 2 bids; L's raise was max-only)");
     ok(!leaks(now.bidOut.C).length && now.bidOut.C.your_status === 'outbid' && now.bidOut.L.your_status === 'winning',
@@ -186,8 +189,8 @@ async function cleanup() {
     ok(o.Lstand.lots[SL] === 'winning' && o.Cstand.lots[SL] === 'outbid', 'my-standing: L winning, C outbid (the room\'s status line)');
     ok(!leaks(o.CmyBids.map(({ max_bid, ...x }) => x)).length && o.CmyBids[0].leading === false && o.LmyBids[0].leading === true, "/my-bids: whether YOU lead, never the leader's name");
     const lSock = now.events.L, oSock = now.events.O;
-    ok(lSock.some(e => e.event === 'new_bid' && e.payload.you_lead === true) && lSock.some(e => e.event === 'auction_ended' && e.payload.you_won === true)
-      && oSock.some(e => e.event === 'auction_ended' && e.payload.you_won === false), "sockets: L's own copy says you_lead / you_won; O's says not");
+    ok(lSock.some(e => e.event === 'new_bid' && e.payload.you_lead === true) && lSock.some(e => e.event === 'lot_closed' && e.payload.you_won === true)
+      && oSock.some(e => e.event === 'lot_closed' && e.payload.you_won === false), "sockets: L's own copy says you_lead / you_won; O's says not");
 
     console.log('\n== The admin: the full picture ==');
     const a = now.admin;

@@ -79,7 +79,7 @@ async function mkUser(label, { decline = false } = {}) {
   die(await s.from('users').insert({ id, username, password_hash: 'zztest-not-a-real-hash', email }).select().single());
   made.users.push(id);
   die(await s.from('profiles').insert({ user_id: id, full_name: 'ZZ Points ' + label, email, phone: '5555550100', address_line1: '1 ZZ St', city: 'Testville', state: 'CA', zip: '94000',
-    status: 'approved', payment_status: 'ok', stripe_customer_id: decline ? 'cus_ZZPTS_decline' : 'cus_ZZPTS_' + label, stripe_payment_method_id: 'pm_ZZPTS' }).select().single());
+    status: 'approved', payment_status: 'ok', stripe_customer_id: decline ? 'cus_ZZPTS_decline' : 'cus_ZZPTS_' + label, card_verified_at: new Date().toISOString(), stripe_payment_method_id: 'pm_ZZPTS' }).select().single());
   return { id, username, email, tok: jwt.sign({ id, username }, process.env.JWT_SECRET, { expiresIn: '30m' }) };
 }
 async function mkAuction(label, status = 'ended', extra = {}) {

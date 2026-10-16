@@ -93,7 +93,7 @@ async function mkFixture(label) {
   const auction = die(await s.from('auctions').insert({ title: 'ZZTEST_Scale_' + label, description: 'scale fixture', status: 'draft', mode: 'standard', buyers_premium_pct: 15, fulfillment_mode: 'shipping', host_username: 'whatthefind', starts_at: new Date().toISOString() }).select().single());
   for (let n = 1; n <= BUYERS; n++) {
     const cus = 'cus_ZZFAKE_' + pad(n) + (DECLINERS.includes(n) ? '_DECLINE' : n === THROWER ? '_THROW' : '');
-    die(await s.from('profiles').insert({ user_id: String(users[n - 1].id), full_name: 'ZZ Scale ' + pad(n), email: null, phone: '0', address_line1: '1 ZZ St', city: 'Miami', state: 'FL', zip: '33125', country: 'US', status: 'approved', payment_status: 'ok', stripe_customer_id: cus, stripe_payment_method_id: 'pm_ZZFAKE_' + pad(n) }).select().single());
+    die(await s.from('profiles').insert({ user_id: String(users[n - 1].id), full_name: 'ZZ Scale ' + pad(n), email: null, phone: '0', address_line1: '1 ZZ St', city: 'Miami', state: 'FL', zip: '33125', country: 'US', status: 'approved', payment_status: 'ok', stripe_customer_id: cus, card_verified_at: new Date().toISOString(), stripe_payment_method_id: 'pm_ZZFAKE_' + pad(n) }).select().single());
     die(await s.from('auction_terms_acceptances').insert({ auction_id: auction.id, user_id: String(users[n - 1].id), buyers_premium_pct: 15, fulfillment_mode: 'shipping', fulfillment_choice: 'shipping', terms_version: 'zz' }).select().single());
   }
   // lot plan: whale wins the first WHALE_LOTS; the middle band is spread over buyers 2..20 and SOLD; then 20 lots

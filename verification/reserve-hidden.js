@@ -24,7 +24,7 @@ async function setup(label) {
   const lot = die(await s.from('auction_items').insert({ auction_id: a.id, title: 'ZZTEST_reserve lot', starting_bid: 0, current_bid: 0, position: 0, status: 'open', reserve_price: RESERVE, ends_at: new Date(Date.now() + 36e5).toISOString() }).select().single());
   const u = { id: crypto.randomUUID(), username: 'zztest_reserve_' + label };
   made.users.push(u.id);
-  die(await s.from('profiles').insert({ user_id: u.id, full_name: 'ZZTEST reserve', email: 'zz@example.invalid', phone: '0', address_line1: '1 ZZ St', city: 'X', state: 'CA', zip: '94000', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_reserve', stripe_payment_method_id: 'pm_ZZFIXTURE_reserve' }).select().single());
+  die(await s.from('profiles').insert({ user_id: u.id, full_name: 'ZZTEST reserve', email: 'zz@example.invalid', phone: '0', address_line1: '1 ZZ St', city: 'X', state: 'CA', zip: '94000', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_reserve', card_verified_at: new Date().toISOString(), stripe_payment_method_id: 'pm_ZZFIXTURE_reserve' }).select().single());
   die(await s.from('auction_terms_acceptances').insert({ auction_id: a.id, user_id: u.id, buyers_premium_pct: 15, fulfillment_mode: 'shipping', fulfillment_choice: 'shipping', terms_version: '1' }).select().single());
   return { a: a.id, lot: lot.id, tok: jwt.sign(u, process.env.JWT_SECRET, { expiresIn: '10m' }) };
 }

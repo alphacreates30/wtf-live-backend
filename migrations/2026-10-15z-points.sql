@@ -1,4 +1,6 @@
--- STEP z: buyer points + promotions (G2, wtf-handoff POINTS_BRIEF.md). NOT YET APPLIED ON PRODUCTION.
+-- STEP z: buyer points + promotions (G2, wtf-handoff POINTS_BRIEF.md). APPLIED on production by Cowork 2026-10-15
+-- (SQL editor; byte-identical to this file; delete_account matched migration w before; after: enabled=false,
+-- 0 ledger rows, no table with RLS off).
 -- Runs after migration w (it redefines delete_account again, keeping w's lines). Idempotent.
 --
 --   points_settings        one row (id = 1): enabled, points per $1, points per reward, reward value, expiry months.

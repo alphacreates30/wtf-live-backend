@@ -23,7 +23,7 @@ const KINDS = [['no profile', null, false], ['pending', 'pending', true], ['reje
 async function mkBuyer(label, status, card) {
   const u = { id: crypto.randomUUID(), username: 'zztest_bidelig_' + label.replace(/\W+/g, '_') };
   made.users.push(u.id);
-  if (status) die(await s.from('profiles').insert({ user_id: u.id, full_name: 'ZZTEST bidelig', email: 'zztest_bidelig@example.invalid', phone: '0', address_line1: '1 ZZ St', city: 'X', state: 'CA', zip: '94000', status, ...(card ? { stripe_customer_id: 'cus_ZZFIXTURE_bidelig', stripe_payment_method_id: 'pm_ZZFIXTURE_bidelig' } : {}) }).select().single());
+  if (status) die(await s.from('profiles').insert({ user_id: u.id, full_name: 'ZZTEST bidelig', email: 'zztest_bidelig@example.invalid', phone: '0', address_line1: '1 ZZ St', city: 'X', state: 'CA', zip: '94000', status, ...(card ? { stripe_customer_id: 'cus_ZZFIXTURE_bidelig', card_verified_at: new Date().toISOString(), stripe_payment_method_id: 'pm_ZZFIXTURE_bidelig' } : {}) }).select().single());
   return { ...u, tok: jwt.sign(u, process.env.JWT_SECRET, { expiresIn: '10m' }) };
 }
 async function mkAuction(label) {

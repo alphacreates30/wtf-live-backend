@@ -31,7 +31,7 @@ const tally = arr => arr.reduce((m, x) => (m[x] = (m[x] || 0) + 1, m), {});
 async function fixtures(label) {
   const u = die(await s.from('users').insert({ username: `${tag}_${label}`, password_hash: await bcrypt.hash(PW, 10), email: `${tag}_${label}@example.invalid` }).select().single());
   made.users.push(u.id);
-  die(await s.from('profiles').insert({ user_id: String(u.id), full_name: 'ZZTEST rl', email: 'zz@example.invalid', phone: '0', address_line1: '1 ZZ St', city: 'X', state: 'CA', zip: '94000', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_rl', stripe_payment_method_id: 'pm_ZZFIXTURE_rl' }).select().single());
+  die(await s.from('profiles').insert({ user_id: String(u.id), full_name: 'ZZTEST rl', email: 'zz@example.invalid', phone: '0', address_line1: '1 ZZ St', city: 'X', state: 'CA', zip: '94000', status: 'approved', stripe_customer_id: 'cus_ZZFIXTURE_rl', card_verified_at: new Date().toISOString(), stripe_payment_method_id: 'pm_ZZFIXTURE_rl' }).select().single());
   made.profiles.push(String(u.id));
   const a = die(await s.from('auctions').insert({ title: 'ZZTEST_rl ' + label, description: 'x', status: 'live', mode: 'standard', fulfillment_mode: 'shipping', host_username: 'whatthefind', ends_at: new Date(Date.now() + 36e5).toISOString() }).select().single());
   made.auctions.push(a.id);
