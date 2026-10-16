@@ -1,6 +1,7 @@
 -- STEP zb: live shows, phase 1b (G1, wtf-handoff LIVE_SHOWS_PHASE0_AUDIT.md §1.5-1.6 + pre-bid expiry;
 -- LIVE_SHOWS_PHASE0_REVIEW.md answers 4 and 5, the "Phase 1 build decisions" and the "Phase 1b decisions").
--- NOT YET APPLIED ON PRODUCTION. Applied and verified on wtf-test 2026-10-16 (changed the same day for "Re-run now").
+-- APPLIED on production by Cowork 2026-10-16 (SQL editor; byte-identical to this file incl. "Re-run now"; after:
+-- 2 functions, 5 new columns, no table with RLS off). Applied and verified on wtf-test 2026-10-16 (changed the same day for "Re-run now").
 -- Runs after migration za. Idempotent.
 --
 --   auctions.on_air_at              when the host started the show (start_auction, or the first lot offered). A
