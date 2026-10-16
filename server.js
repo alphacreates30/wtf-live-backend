@@ -188,7 +188,8 @@ async function shouldSuppressOutbid() {
 // echo it back. Railway keeps logs; addresses stay in the database.
 const redactEmails = t => String(t ?? '').replace(/[^\s@"'<>,;:()]+@[^\s@"'<>,;:()]+\.[^\s@"'<>,;:()]+/g, '[email]');
 
-async function sendEmail({ from, to, subject, html, text, kind = 'other', headers }) {
+// replyTo: where a reply goes (default the business address); a service request's email to Albert replies to its sender.
+async function sendEmail({ from, to, subject, html, text, kind = 'other', headers, replyTo }) {
   if (!process.env.RESEND_API_KEY) return false; // skip if not configured
   if (!to) return false;
 
@@ -204,7 +205,7 @@ async function sendEmail({ from, to, subject, html, text, kind = 'other', header
         Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ from, to, reply_to: REPLY_TO, subject, html, text, ...(headers ? { headers } : {}) }),
+      body: JSON.stringify({ from, to, reply_to: replyTo || REPLY_TO, subject, html, text, ...(headers ? { headers } : {}) }),
       signal: AbortSignal.timeout(8000),
     });
     if (!res.ok) {
@@ -4691,6 +4692,13 @@ app.get('/me/watching', requireAuth, async (req, res) => {
 require('./lot_page')(app, {
   supabase, requireAuth, dbFailure, ADMIN_USERNAME, thumbsFor, homeLot, premiumMap, blurbOf, auctionPhase, isoOrNull,
   standingFor, SOFT_CLOSE_MINUTES, CONTACT_EMAIL: REPLY_TO,
+});
+
+// Service requests (F5, migration zc): POST /service-requests (the Services/Contact form) and Admin -> Requests.
+// service_requests.js; contracts in API.md. Requests go to SERVICES_EMAIL, else the business address in the terms.
+require('./service_requests')(app, {
+  supabase, requireAdmin, dbFailure, limiter, canonicalUuid, cleanEmail, reencodeUpload, sendEmail, emailHtml, escapeHtml,
+  BUYER_FROM, ADMIN_FROM, SITE_URL, INBOX: process.env.SERVICES_EMAIL || REPLY_TO,
 });
 
 async function prefsFor(userId) {

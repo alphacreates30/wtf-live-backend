@@ -53,7 +53,7 @@ function patchedServer(fixId, tag) {
   retrieve: async () => ({}) } };`);
   // 2. isolation: only the fixture auction, and the draft exemption only for it
   rep(".lt('ends_at', now)\n      .not('status', 'in', '(\"sold\",\"unsold\")')", ".lt('ends_at', now)\n      .eq('auction_id', '" + fixId + "')\n      .not('status', 'in', '(\"sold\",\"unsold\")')");
-  rep("if (draftAuctionIds.has(item.auction_id)) continue", "if (false) continue");
+  rep("if (draftAuctionIds.has(item.auction_id) || liveModeIds.has(item.auction_id)) continue", "if (liveModeIds.has(item.auction_id)) continue");   // G1 phase 1 added the live-mode skip
   // the fixture stays 'draft' until the job ends it, so 'draft' here plays the role of production's status='live' filter:
   // once the job marks it 'ended' it is NOT revisited (dropping the status filter entirely made the job re-charge it every tick)
   rep(".eq('mode', 'standard')\n      .eq('status', 'live')\n\n    for (const auction of liveAuctions || [])", ".eq('id', '" + fixId + "')\n      .eq('status', 'draft')\n\n    for (const auction of liveAuctions || [])");

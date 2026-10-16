@@ -98,6 +98,34 @@ Body: `{ "email": "…", "website": "" }`. `website` is a honeypot: leave the fi
 - 429 after 5 sign-ups per IP per hour.
 - 503 before migration `2026-09-30u-drop-signups.sql` is applied.
 
+## Service requests (F5): `POST /service-requests`, admin `/admin/service-requests`
+
+The one form behind the Services pages (Sell to us, Consign, Estate buyouts, Collection auctions) and Contact. Needs
+migration `2026-10-16zc-service-requests.sql`; before it, `POST` answers 503 `{ code: "not_available" }` and the admin
+reads answer `{ "available": false }`. Contact details and photos are never public.
+
+`POST /service-requests`: no login, **multipart/form-data**, 10 an hour per IP (429 after).
+Fields: `service` (`sell` | `consign` | `estates` | `collection_auction` | `general`), `name` (≤120), `email`,
+`phone` (a US number in any format; stored as its 10 digits), `location` (city/ZIP, optional, ≤120), `details` (≤4000),
+`item_count` (optional: `1` | `2-10` | `11-25` | `26-100` | `100+`), `heard_from` (optional, ≤200), `website` (the
+honeypot: hidden and empty), and up to 10 files named `photos` (JPEG, PNG or WebP, read from the bytes; ≤8 MB each).
+- 200 `{ "ok": true, "message": "Thanks, we'll be in touch within 72 hours." }` (also for a filled honeypot, which
+  stores nothing).
+- 400 `{ error, field, code: "invalid" }`, `field` naming the input to fix (`photos` for a bad photo); 400
+  `{ code: "bad_upload" }` for too many or too large files.
+- Photos are re-encoded (no EXIF/GPS) into the PRIVATE bucket `service-request-photos`. Albert gets an email at
+  `SERVICES_EMAIL` (else whatthefind.co@gmail.com) with the details and a link to Admin, Requests (replies go to the
+  sender); the sender gets a short confirmation that repeats none of what they typed.
+
+Admin (403 for anyone else, 401 logged out):
+- `GET /admin/service-requests?service=&status=&id=` → `{ available, new_count, requests: [ { id, service, service_label,
+  name, email, phone, phone_display, location, details, item_count, heard_from, status, notes, created_at, updated_at,
+  photos: [ { path, url } ] } ], services, statuses, item_counts }`. Newest first, at most 200. Photo `url`s are signed
+  and last 10 minutes.
+- `GET /admin/service-requests/summary` → `{ available, new_count }` (the admin home and nav).
+- `PATCH /admin/service-requests/:id { status?: new | contacted | offer_made | closed, notes? }` → the request.
+- `DELETE /admin/service-requests/:id` → 204. Its photos are removed first; if they can't be, 500 and the request stays.
+
 ## `GET /config`
 
 No login. The auction rules a page may put into words, so none are hard-coded:
