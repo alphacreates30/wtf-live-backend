@@ -1,6 +1,7 @@
 -- STEP zd: live shows, phase 2a (G1, wtf-handoff LIVE_SHOWS_PHASE2_BRIEF.md step 2a; LIVE_SHOWS_PHASE0_AUDIT.md §2):
 -- the show lifecycle behind the host's phone screen.
--- NOT YET APPLIED ON PRODUCTION. Applied and verified on wtf-test 2026-10-18. Runs after migrations za and zb.
+-- APPLIED on production by Cowork 2026-10-18 (SQL editor; byte-identical to this file, sha256 c5c7c9d6…451c; after:
+-- 12 columns, 3 functions service_role only, 0 public tables with RLS off, anon can't read auctions). Applied and verified on wtf-test 2026-10-18. Runs after migrations za and zb.
 -- Idempotent.
 --
 --   auctions.clock_seconds          the show's default clock per lot: 60, 30, 15 or 5 (default 30). The host can
