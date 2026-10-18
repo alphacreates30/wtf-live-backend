@@ -312,7 +312,7 @@ measure the offset instead of trusting their own clock.
 | Every suite that makes a bidder | Its fixture buyer now has `card_verified_at` (bidding needs a verified card everywhere). |
 
 **Live shows (G1) phase 2a** (wtf-handoff `LIVE_SHOWS_PHASE2_BRIEF.md` step 2a, 2026-10-18). Needs migration
-`2026-10-18zd-live-show-lifecycle.sql` (applied on wtf-test 2026-10-18; **not yet on production**) after za and zb. Run
+`2026-10-18zd-live-show-lifecycle.sql` (applied on wtf-test and, by Cowork, on production 2026-10-18) after za and zb. Run
 alone, like the phase 1 live suites.
 
 | Suite | Proves |
@@ -321,6 +321,13 @@ alone, like the phase 1 live suites.
 | `live-rehearsal.js` | A draft live show: 404 everywhere without the key (REST reads, room, token), never in /auctions, /home or /search, even on air; the key is the admin's (made, rotated) and never in a response; with the key a logged-in tester reads, accepts terms, joins, chats and bids; logged out with the key: 404; a socket without the key can't bid or chat; Go live keeps it a draft; rotating sends the old-key tester out and 404s the old key; End refused mid-lot, then a draft with ended_at that can't be published. **rehearsal_key never leaves the server except to the host/admin:** a published live show is given a key by a direct write, then 54 responses to an anonymous visitor, a buyer and the tester (auction, lots, bids, chat, show-state, lineup, terms, /home, lists, search, the lot page and related, my bids/orders/watching, config) and the room's socket events carry neither key nor a rehearsal_key field; the admin's row does (so the check can see one); public_view marks it host-only and auctionFor strips it. |
 | `live-before-zd.js` | Production before migration zd, with live shows off: every zd column and function name in the server's source is renamed to one that doesn't exist (wtf-test has zd), so each query naming one fails as it would there. The server boots and its 30-second job runs with nothing in the log; a timed auction works (auction, lots, bids, chat, terms, a bid, publish, /home, /lots); drafts stay hidden (lots, bids, chat, terms); live socket events answer `live_off`. REPRODUCE: the first 2a read of an auction's lots (it named `rehearsal_key`) served a draft's lots to anyone before zd. |
 | `live-bid-engine.js`, `live-flag.js`, `bidder-identity.js` | Updated: live `new_bid` / `lot_closed` name the bidder by username (live shows only; no id, no max); a live show needs a start time; `bidder-identity` allows a username in the live socket fields `username` / `leader` / `winner` only, and still proves timed auctions and every REST read name nobody. |
+
+**Live shows (G1) phase 2b: the viewer room** (step 2b, 2026-10-18). No migration. Frontend repo next to this one
+(`../wtf-live-frontend`), read from disk.
+
+| Suite | Proves |
+|---|---|
+| `live-room-frontend.js` | The gate: a live show opens the host screen for the host and the viewer room for everyone else, each loaded only when needed; the old desktop room, ItemQueue and LiveStream are gone and nothing imports them; each room imports its own CSS. One socket hook per room: the rooms never touch the socket, and `useRoomSocket` removes exactly the handlers it added. **Amounts come from the server:** the one-tap Bid uses `next_bid` and the room computes no increments; a real bid battle on wtf-test (5 bids across the $50 and $100 tiers): every `new_bid` and `show_state` `next_bid` equals lot_rules. Copy: every "premium" in the room says "no buyer's premium"; the shipping line before the first bid; the banners (winning, outbid with the mark, won with the Glint, declined with Update card); confetti only without reduced motion. Gates: logged out, Bid goes to login with `?next=` the room (and its rehearsal key) and login returns there; terms on `terms_required`; the card form in a sheet on `no_card` / `card_not_verified` / `payment_failed`; the first bid in a show confirms, then one tap. |
 
 ## Not covered
 

@@ -2558,7 +2558,8 @@ async function liveShowState(auctionId) {
     auctionId, title: a.title, status: a.status, on_air: showOnAir(a), rehearsal: a.status === 'draft', ended: showEnded(a),
     on_air_at: a.on_air_at || null, ended_at: a.ended_at || null, starts_at: a.starts_at || null,
     clock_seconds: a.clock_seconds ?? LIVE_DEFAULT_CLOCK, auto_pace: !!a.auto_pace, on_hold: !!a.on_hold, autostart_at: a.autostart_at || null,
-    shown: liveLotView(shown, { leader: !!open }), open: open ? { ...liveLotView(open, { leader: true }), ends_at: new Date(Date.parse(open.ends_at)).toISOString() } : null,
+    // open.next_bid: the one-tap Bid amount for anyone not leading (lot_rules, the same rule the bid is checked by).
+    shown: liveLotView(shown, { leader: !!open }), open: open ? { ...liveLotView(open, { leader: true }), ends_at: new Date(Date.parse(open.ends_at)).toISOString(), next_bid: lotRules.nextBidAmounts(open)[0] } : null,
     last: last ? { item_id: last.id, lot_number: last.position + 1, title: last.title, status: last.status,
       amount: last.status === 'sold' ? Number(last.current_bid) : null, winner: last.status === 'sold' ? last.leading_bidder : null,
       // passed: the host Passed it, or skipped it before its clock started (no bids, no live clock).
@@ -2600,7 +2601,7 @@ async function openLiveLot(auctionId, itemId, secs, suddenDeath) {
   const clock = liveClock(auctionId, lot.id, Date.parse(lot.ends_at));
   await emitPerViewer(auctionId, 'item_activated', u => ({
     item: publicLot(lot), lot_number: lot.position + 1, you_lead: !!u && u === lot.leading_bidder, pre_bid_count: lot.pre_bid_count || 0,
-    leader: lot.bid_count > 0 ? lot.leading_bidder : null, timer_seconds: secs, sudden_death: !!suddenDeath, ends_at: clock.ends_at, server_now: clock.server_now,
+    leader: lot.bid_count > 0 ? lot.leading_bidder : null, next_bid: lotRules.nextBidAmounts(lot)[0], timer_seconds: secs, sudden_death: !!suddenDeath, ends_at: clock.ends_at, server_now: clock.server_now,
   }));
   io.to(auctionId).emit('item_timer_tick', clock);
   await emitShowState(auctionId);
@@ -2920,6 +2921,7 @@ io.on('connection', (socket) => {
     // viewer also learns whether THEY lead. Outbid = the in-room alert (no outbid email per bid during a show).
     await emitPerViewer(auctionId, 'new_bid', u => ({
       auction_id: auctionId, item_id: data.id, amount: Number(data.current_bid), bid_count: data.bid_count, username: data.leading_bidder || null,
+      next_bid: lotRules.nextBidAmounts(data)[0],
       ends_at: data.ends_at, server_now: new Date(dbNow()).toISOString(), you_lead: !!u && u === data.leading_bidder,
     }));
   });

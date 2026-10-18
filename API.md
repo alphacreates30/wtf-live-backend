@@ -303,10 +303,10 @@ Out-of-order steps are refused with a code: `not_on_air`, `ended`, `already_on_a
 
 | Event (server → client) | Payload |
 |---|---|
-| `show_state` | Everything a show screen needs (also `GET /auction/:id/show-state`): `{ auctionId, title, status, on_air, rehearsal, ended, on_air_at, ended_at, starts_at, clock_seconds, auto_pace, on_hold, autostart_at (auto-pace: when the lot on screen starts by itself), shown (the lot on screen: public lot + lot_number), open (the selling lot + leader, sudden_death, ends_at) \| null, last { item_id, lot_number, title, status, amount, winner, passed, can_run_again } \| null, up_next (next 3 lots), stats { sold_count, sold_total, lots_left, lots_total }, server_now, you_lead }` |
-| `item_activated` | `{ item (public lot), lot_number, leader, you_lead, pre_bid_count, timer_seconds, sudden_death, ends_at, server_now }` (also sent to a viewer who joins mid-lot) |
+| `show_state` | Everything a show screen needs (also `GET /auction/:id/show-state`): `{ auctionId, title, status, on_air, rehearsal, ended, on_air_at, ended_at, starts_at, clock_seconds, auto_pace, on_hold, autostart_at (auto-pace: when the lot on screen starts by itself), shown (the lot on screen: public lot + lot_number), open (the selling lot + leader, sudden_death, ends_at, next_bid: the one-tap Bid amount for anyone not leading) \| null, last { item_id, lot_number, title, status, amount, winner, passed, can_run_again } \| null, up_next (next 3 lots), stats { sold_count, sold_total, lots_left, lots_total }, server_now, you_lead }` |
+| `item_activated` | `{ item (public lot), lot_number, leader, you_lead, pre_bid_count, next_bid, timer_seconds, sudden_death, ends_at, server_now }` (also sent to a viewer who joins mid-lot) |
 | `item_timer_tick` | every second: `{ auctionId, item_id, seconds, ends_at, server_now }`. Time left = `ends_at − server_now` (the database's clock). |
-| `new_bid` | `{ auction_id, item_id, amount, bid_count, username (the leader after this bid), ends_at, server_now, you_lead }` |
+| `new_bid` | `{ auction_id, item_id, amount, bid_count, username (the leader after this bid), next_bid (the next one-tap amount; `lot_rules.nextBidAmounts`, the rule the bid is checked by, so a client never computes increments), ends_at, server_now, you_lead }` |
 | `item_extended` | `{ auctionId, item_id, ends_at, server_now }` (the host's +N s) |
 | `lot_closed` | `{ auctionId, item_id, lot_number, status: "sold" \| "unsold", amount, username (the winner) \| null, you_won, passed? }` |
 | `lineup_changed` | `{ auctionId, … }`: refetch the lineup (a Run again copy, a reorder) |
