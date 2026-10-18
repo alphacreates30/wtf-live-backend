@@ -237,9 +237,11 @@ OTHER live auctions sharing at least one title word (the auction category only b
   else leads or their max).
 - `GET /my-orders` — each order has `pickup: { address, town, starts_at, ends_at } | null`: the street address,
   only on the caller's own won orders and only when they chose pickup (B6). The same address is in their win email.
-- Socket (live shows, see "Live shows (G1)" below): `auction_state`, `item_activated`, `new_bid`, `lot_closed` and
-  `auction_ended` carry no bidder; each socket gets its own `you_lead` / `you_won`. `bid_history` goes to the admin
-  only. Chat messages show usernames by design. (Usernames on live bids and wins come with live phase 5.)
+- Socket (live shows, see "Live shows (G1)" below): live shows show **usernames** on bids and wins (Albert, Oct 15;
+  live phase 2): `new_bid.username`, `lot_closed.username`, `item_activated.leader`, `show_state` (`open.leader`,
+  `last.winner`). Only the username: never a user id, email or anyone's max. Each socket also gets its own
+  `you_lead` / `you_won`. `bid_history` goes to the admin only. Chat messages show usernames by design. Timed
+  auctions name nobody (unchanged).
 - `GET /auction/:auctionId/items/:itemId/images` — a lot's photos, full size (the lot page now reads them from `GET /lots/:id`).
 
 ## Who may bid (every auction)
@@ -265,29 +267,54 @@ Brief: wtf-handoff `LIVE_SHOWS_BRIEF.md`. **Switched off** unless the backend ru
 - `POST /auction/:id/items/:itemId/bid` refuses a live lot: 400 `{ code: "live_lot" }` (bid in the show).
   `POST …/prebid` works on a live lot while it is `pending` (same gates as a bid).
 
-Socket events (payloads always include `auctionId` and the buyer's/host's `token`):
+**The show (phase 2a, migration `2026-10-18zd`).** Publishing a live show leaves it **scheduled** (`upcoming`), whatever
+its `starts_at`; it is **on air** from the host's `go_live` (`live`, `on_air_at`) and **ended** by `end_show` or the
+auto-end (`ended`, `ended_at`). A **rehearsal**: a *draft* live show the host puts on air; it stays a draft (never
+listed) and only logged-in accounts with its private key (`?rehearsal=<key>` on REST reads, `rehearsal` in
+`join_auction`) get in; it ends as a draft with `ended_at` and can't be published. The show auto-ends after **60 min
+with no host activity** (counted from `on_air_at` if the host never tapped anything), never while a lot is open or a
+clock start is due. `POST /auction` with `mode: "live"` needs `starts_at`; optional `clock_seconds` (60 | 30 | 15 | 5,
+default 30) and `auto_pace` (default false). `PATCH /auction/:id` takes `clock_seconds`, `auto_pace` and (before it has
+been on air) `starts_at` on a live show.
+
+Socket events (payloads always include `auctionId` and the buyer's/host's `token`). Every host event answers the sender
+`host_ok { action, … }` or `host_error { message, code }`, records host activity, and the room gets a new `show_state`.
+Out-of-order steps are refused with a code: `not_on_air`, `ended`, `already_on_air`, `lot_open`, `no_lot_shown`,
+`no_lot_open`, `no_bids`, `no_lots`, `not_pending`, `bad_clock`, `lineup_changed`, `refused` (the database's reason).
 
 | Event (client → server) | Who | What |
 |---|---|---|
 | `place_bid { itemId?, max_amount }` | buyer | A max bid on the open lot (no `itemId` = the lot open now). Same engine as timed lots (`place_standard_bid`: proxy/max, tiers, row lock). Answers `bid_ok` (the public lot + `your_status`, `max_only: true` when the leader only raised their max) or `bid_error { message, code }`: the "Who may bid" codes, or `live_off`, `login_required`, `terms_required`, `payment_failed` (their card was declined for a lot in this show and isn't fixed yet), `not_on_air`, `bad_amount`, `not_found`, `lot_not_open`, `below_minimum`, `refused`, `rate_limited`. |
-| `start_auction` | host | On air (`upcoming` → `live`; sets `on_air_at`). |
-| `next_item { timerSeconds = 30, suddenDeath = false }` | host | Offers the next `pending` lot (a lot re-run "next" first, `offer_next`; then by position) and starts its clock: **60, 30, 15 or 5 s** (any other value is refused). Pre-bids from buyers whose card was declined in this show are dropped first. Refused while a lot is open. |
-| `extend_auction { extraSeconds }` | host | Adds 1–120 s to the open lot's clock. |
-| `pass_lot` | host | Closes the open lot with **no sale** (`unsold`, no order), whatever its bids. |
+| `go_live` | host | Scheduled → on air (a draft: a rehearsal on air). `start_auction` (phase 1 name) does the same and doesn't refuse a show already on air. |
+| `show_lot { itemId? }` | host | Puts a waiting lot on screen (`shown_item_id`), no clock yet: `itemId` or the next in the lineup. Refused while a lot is open. |
+| `start_clock { seconds?, suddenDeath? }` | host | Opens the lot on screen: **60, 30, 15 or 5 s** (default: the lot card's `clock_seconds`, else the show's), Sudden death = bids add no time (default: the lot's `sudden_death`). Pre-bids from buyers whose card was declined in this show are dropped first; the rest apply by the proxy rule. |
+| `next_item { timerSeconds = 30, suddenDeath = false }` | host | Phase 1's one step: `show_lot` (unless a lot is already on screen) + `start_clock`. |
+| `add_time { seconds = 15 }` | host | Adds 1–120 s to the open lot's clock (`extend_auction { extraSeconds }` is the phase 1 name). |
+| `sold_now` | host | Sells the open lot to its leader at the current bid now (the hammer). Needs a bid (`no_bids`). |
+| `pass` | host | The open lot closes with **no sale** (`unsold`, no order), whatever its bids; a lot on screen whose clock hasn't started is skipped (`unsold`). `pass_lot` = phase 1b name. |
+| `run_again { itemId, next = false }` | host | A lot that closed unsold: a copy with the next free lot number goes back in the lineup, next or at the end (`run_again_of` = the original). Once per lot while the copy waits. Answers `host_ok { item_id, lot_number, next }`; the room gets `lineup_changed`. |
+| `hold { on? }` | host | Hold on/off (toggle without `on`): auto-pace waits; releasing it with a lot on screen starts that lot's clock after 15 s. |
+| `set_show_options { auto_pace?, clock_seconds? }` | host | The show's auto-pace and default clock. |
+| `set_lot_clock { itemId, seconds?, suddenDeath? }` | host | A waiting lot's card: its clock (60 / 30 / 15 / 5, or `null` = the show's default) and Sudden death. |
+| `reorder_lineup { itemIds }` | host | Every waiting lot, in the new order (`run_order`); lot numbers don't change. Anything else is `lineup_changed`. |
 | `rerun_lot { orderId, next = true }` | host | **"Re-run now"** on a declined-card alert, while the show is on air: a copy of the lot goes back in this show's lineup, offered next (`next: true`) or at the end (`false`), with the next free lot number. The declined order is cancelled (kept, `reoffered_item_id` = the copy) and is never charged, even if the buyer fixes their card later; a points reward spent on it is given back. Answers `rerun_ok { order_id, item_id, lot_number, next }` or `host_error` (code `rerun_refused`: not a declined lot, show not on air). |
-| `end_auction` | host | Ends the show. **Refused while a lot is open** (`host_error` code `lot_open`): let its clock finish or Pass it. Then the after-show emails. |
+| `end_show` | host | Ends the show (`end_auction` = phase 1 name). **Refused while a lot is open** (code `lot_open`): let its clock finish or Pass it. Then the after-show emails. |
+| `join_auction { rehearsal? }` | anyone | Joins the room; a live show's joiner also gets `show_state`. A draft needs the admin, or a logged-in account with `rehearsal` = its key. |
 
 | Event (server → client) | Payload |
 |---|---|
-| `item_activated` | `{ item (public lot), you_lead, pre_bid_count, timer_seconds, sudden_death, ends_at, server_now }` (also sent to a viewer who joins mid-lot) |
+| `show_state` | Everything a show screen needs (also `GET /auction/:id/show-state`): `{ auctionId, title, status, on_air, rehearsal, ended, on_air_at, ended_at, starts_at, clock_seconds, auto_pace, on_hold, autostart_at (auto-pace: when the lot on screen starts by itself), shown (the lot on screen: public lot + lot_number), open (the selling lot + leader, sudden_death, ends_at) \| null, last { item_id, lot_number, title, status, amount, winner, passed, can_run_again } \| null, up_next (next 3 lots), stats { sold_count, sold_total, lots_left, lots_total }, server_now, you_lead }` |
+| `item_activated` | `{ item (public lot), lot_number, leader, you_lead, pre_bid_count, timer_seconds, sudden_death, ends_at, server_now }` (also sent to a viewer who joins mid-lot) |
 | `item_timer_tick` | every second: `{ auctionId, item_id, seconds, ends_at, server_now }`. Time left = `ends_at − server_now` (the database's clock). |
-| `new_bid` | `{ auction_id, item_id, amount, bid_count, ends_at, server_now, you_lead }` |
+| `new_bid` | `{ auction_id, item_id, amount, bid_count, username (the leader after this bid), ends_at, server_now, you_lead }` |
 | `item_extended` | `{ auctionId, item_id, ends_at, server_now }` (the host's +N s) |
-| `lot_closed` | `{ auctionId, item_id, status: "sold" \| "unsold", amount, you_won, passed? }` |
+| `lot_closed` | `{ auctionId, item_id, lot_number, status: "sold" \| "unsold", amount, username (the winner) \| null, you_won, passed? }` |
+| `lineup_changed` | `{ auctionId, … }`: refetch the lineup (a Run again copy, a reorder) |
 | `payment_failed` / `payment_ok` | to the buyer only: `{ auctionId, item_id, order_id, amount_cents, lot_number, message }` (declined at the hammer / charged after they saved a new card). `payment_ok { auctionId, charged: false, message }`: their declined lots were all re-run, and the new card lets them bid again |
 | `lot_payment_failed` / `lot_payment_fixed` | to the host only: `{ auctionId, item_id, order_id, amount_cents, lot_number, buyer, item_title, reason?, can_rerun? }` (`can_rerun`: the show is on air, so "Re-run now" works) |
 | `lot_rerun` | to the room: `{ auctionId, item (public lot, `offer_next`), lot_number, next, rerun_of: { item_id, lot_number, status: "unsold" } }`. The buyer also gets `you: true, message: "Your card was declined, so lot N was offered again."`; the host gets `order_id, buyer` (clears the alert). Nobody else learns who it was |
-| `items_finished`, `auction_started`, `auction_ended` | `{ auctionId }` |
+| `items_finished`, `auction_started`, `auction_ended` | `{ auctionId }` (`rehearsal: true` for a rehearsal; `auction_ended.auto: true` for the auto-end) |
+| `host_ok` | `{ action, … }` |
 | `host_error` | `{ message, code? }` |
 
 How a lot sells: the opening price applies the pre-bids by the proxy rule and **never** shows the top max (one
@@ -308,7 +335,22 @@ per buyer (lots, declined ones marked, the one-box or pickup note), sent once ev
 releases its pre-bids (deleted; one email per bidder; a `notifications` row of kind `prebid_released` is the record;
 once per show, `prebids_released_at`); `POST …/prebid` on it is then 400 `{ code: "prebids_released" }`.
 
+Show screens (public for a published show; a draft: the admin, or a logged-in account with `?rehearsal=<key>`; 404 while
+live shows are off):
+- `GET /auction/:id/show-state` → `show_state` above, with the caller's `you_lead`.
+- `GET /auction/:id/lineup` → `{ auction_id, shown_item_id, waiting: [lots in the order they'll be offered], done: [open, then sold / unsold, newest first] }`.
+  Each lot: the public lot + `lot_number`, `thumb_url`; sold: `winner`, `amount`; unsold: `can_run_again`.
+
 Admin (403 for anyone else):
+- `rehearsal_key` is host-only (`public_view.AUCTION_HOST_ONLY`): only the host/admin ever gets it (their whole auction row, and this route); every other response and socket event leaves it out.
+- `POST /admin/live/:id/rehearsal-key` → `{ rehearsal_key, path }`: a new private rehearsal link for a draft live show (400
+  once published). Each call replaces the key; accounts in on the old one are sent out (`auction_error` code `rehearsal_closed`).
+- `GET /admin/live/:id/checklist` → `{ show { …, clock_seconds, auto_pace, rehearsal, has_rehearsal_link }, lots { waiting, total,
+  without_photo }, lineup: [ { id, lot_number, title, starting_bid, image_url, clock_seconds, sudden_death, pre_bid_count } ],
+  buyers_in_room: [ { username, approved, card, card_verified, terms } ] }`: the pre-show checklist.
+- `GET /admin/live/:id/packing` → `{ show, winners: [ { order_id, lot_number, title, amount_cents, payment_status, buyer,
+  fulfillment } ], boxes: [ { buyer, fulfillment: "shipping" | "pickup", group_id, lots: [ … ] } ] }`: the winner list and
+  the packing list, one box per buyer (cancelled orders left out).
 - `GET /admin/live/:id/unpaid` → `{ show, can_rerun (on air), can_reoffer (the show has ended), lots: [ { id (order), item_id, item_title,
   buyer_username, buyer_user_id, total_cents, payment_error, created_at } ] }`: lots whose card was declined and not fixed.
 - `POST /admin/live/orders/:orderId/reoffer { auction_id, next? }` → `{ item_id, auction_id, lot_number }`. Only an

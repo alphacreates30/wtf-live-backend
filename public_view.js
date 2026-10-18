@@ -15,6 +15,9 @@ const AUCTION_PUBLIC = [
 const LOT_PUBLIC = [
   'id', 'auction_id', 'position', 'title', 'description', 'condition', 'image_url', 'thumb_url', 'starting_bid',
   'current_bid', 'bid_count', 'pre_bid_count', 'status', 'ends_at', 'created_at', 'offer_next',
+  // Live shows (phase 2): the lot's clock preset and Sudden death switch, its place in the lineup, and the lot a
+  // Run again copy repeats. Nothing about bidders.
+  'clock_seconds', 'sudden_death', 'run_order', 'run_again_of',
 ];
 
 const pick = (row, keys) => {
@@ -28,4 +31,11 @@ const pick = (row, keys) => {
 const publicAuction = a => (a && typeof a === 'object' ? { pickup_town: null, ...pick(a, AUCTION_PUBLIC) } : a);
 const publicLot = l => pick(l, LOT_PUBLIC);
 
-module.exports = { AUCTION_PUBLIC, LOT_PUBLIC, publicAuction, publicLot };
+// Host-only auction fields: never in AUCTION_PUBLIC, and named here so a check can prove it (live-rehearsal.js).
+//   rehearsal_key   a draft live show's private rehearsal link (migration zd).
+const AUCTION_HOST_ONLY = ['rehearsal_key'];
+if (AUCTION_HOST_ONLY.some(k => AUCTION_PUBLIC.includes(k))) throw new Error('public_view: a host-only field is in AUCTION_PUBLIC');
+// The one rule for a whole auction row: its host and the admin get it all; everyone else the public allow-list.
+const auctionFor = (a, username, adminUsername) => (!!username && (username === adminUsername || username === a?.host_username) ? a : publicAuction(a));
+
+module.exports = { AUCTION_PUBLIC, LOT_PUBLIC, AUCTION_HOST_ONLY, publicAuction, publicLot, auctionFor };

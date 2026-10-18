@@ -50,7 +50,10 @@ process.chdir(BE);
     console.log('\n== LIVE_ENABLED=true ==');
     r = await call(on.url, 'GET', '/config');
     ok(r.s === 200 && r.j.live_enabled === true, `/config live_enabled: ${r.j && r.j.live_enabled}`);
-    r = await call(on.url, 'POST', '/auction', ADMIN, { title: K.P + ' create-on ' + K.TAG, starting_bid: 0, mode: 'live', fulfillment_mode: 'shipping' });
+    // A live show needs a start time (phase 2a: the host sets it; it stays scheduled until Go live).
+    r = await call(on.url, 'POST', '/auction', ADMIN, { title: K.P + ' create-nostart ' + K.TAG, starting_bid: 0, mode: 'live', fulfillment_mode: 'shipping' });
+    ok(r.s === 400 && /start time/.test(r.j && r.j.error), `POST /auction mode live with no start time -> ${r.s} ${r.j && r.j.error}`);
+    r = await call(on.url, 'POST', '/auction', ADMIN, { title: K.P + ' create-on ' + K.TAG, starting_bid: 0, mode: 'live', fulfillment_mode: 'shipping', starts_at: new Date(Date.now() + 3600e3).toISOString() });
     const created = r.j;
     if (created?.id) K.made.auctions.push(created.id);
     ok(r.s === 201 && created.mode === 'live' && Number(created.buyers_premium_pct) === 0 && created.status === 'draft', `POST /auction mode live -> ${r.s}, mode ${created && created.mode}, premium ${created && created.buyers_premium_pct}%, ${created && created.status}`);

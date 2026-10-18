@@ -35,6 +35,19 @@ const KEYS = ['"leading_bidder"', '"username"', '"buyer_username"', '"leader_use
 const future = m => new Date(Date.now() + m * 60e3).toISOString();
 const auctionIds = [];
 
+// Live shows (LIVE_SHOWS_BRIEF.md 'Names'; phase 2): usernames ARE shown on bids and wins, in these socket fields only
+// (a string username or null). Everything else about a bidder (id, email, max) stays private there too.
+const LIVE_NAME_FIELDS = ['username', 'leader', 'winner'];
+function stripLiveNames(v) {
+  if (Array.isArray(v)) return v.map(stripLiveNames);
+  if (!v || typeof v !== 'object') return v;
+  const o = {};
+  for (const [k, x] of Object.entries(v)) if (!(LIVE_NAME_FIELDS.includes(k) && (typeof x === 'string' || x === null))) o[k] = stripLiveNames(x);
+  return o;
+}
+// Every socket event here is the live show V's.
+const leaksAt = (where, body) => leaks(where.includes(' socket: ') ? stripLiveNames(body) : body);
+
 function leaks(body) {
   const text = JSON.stringify(body) || '';
   return [...KEYS.filter(k => text.includes(k)), ...NEEDLES.filter(v => text.includes(v))];
@@ -172,9 +185,12 @@ async function cleanup() {
     const now = await scenario(newS.url, 'new');
     const S = now.F.S.id, SL = now.F.SL;
     const label = w => w.replaceAll(S, 'S').replaceAll(SL, 'SL').replaceAll(now.F.V.id, 'V').replaceAll(now.F.VL, 'VL');
-    const clean = now.seen.filter(([, b]) => leaks(b).length === 0).length;
-    for (const [w, b] of now.seen) { const l = leaks(b); if (l.length) ok(false, `NEW ${label(w)}: LEAKS ${[...new Set(l)].join(', ')}`); }
-    ok(clean === now.seen.length, `NEW: all ${now.seen.length} payloads to anonymous and to another buyer (${new Set(now.seen.map(([w]) => w.split(':')[1])).size} REST reads/socket events) name no bidder and carry no max`);
+    const clean = now.seen.filter(([w, b]) => leaksAt(w, b).length === 0).length;
+    for (const [w, b] of now.seen) { const l = leaksAt(w, b); if (l.length) ok(false, `NEW ${label(w)}: LEAKS ${[...new Set(l)].join(', ')}`); }
+    ok(clean === now.seen.length, `NEW: all ${now.seen.length} payloads to anonymous and to another buyer (${new Set(now.seen.map(([w]) => w.split(':')[1])).size} REST reads/socket events) name no bidder and carry no max (the live show's socket events: a username in username/leader/winner only)`);
+    const liveNamed = now.events.O.filter(e => ['new_bid', 'lot_closed'].includes(e.event));
+    ok(liveNamed.some(e => e.event === 'lot_closed' && e.payload.username === L.username) && liveNamed.every(e => !JSON.stringify(e.payload).includes(L.id) && !/max|top_pre/.test(Object.keys(e.payload).join())),
+      `live show only: the room sees the winner's username on the hammer (@${L.username}), never an id or a max`);
     const anonEvents = new Set(now.events.anon.map(e => e.event));
     ok(['auction_state', 'item_activated', 'new_bid', 'lot_closed', 'auction_ended'].every(e => anonEvents.has(e)) && !anonEvents.has('bid_history'),
       `the socket checks saw state, activation, a bid, the hammer and the end; no bid list for the public (${[...anonEvents].join(', ')})`);

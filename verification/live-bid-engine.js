@@ -67,7 +67,9 @@ const near = (a, b, tol) => Math.abs(a - b) <= tol;
     ok(e && e.event === 'bid_ok' && e.payload.your_status === 'outbid' && Number(row.current_bid) === 31 && row.leading_bidder === A.username,
       `B max $30 vs A's $40: price $${row.current_bid}, A still leads, B told 'outbid'`);
     let nb = await ca.waitFor('new_bid', () => true, 3000, from);
-    ok(nb && nb.payload.you_lead === true && nb.payload.amount === 31 && !('username' in nb.payload) && !('leading_bidder' in nb.payload), `A's room event: $${nb && nb.payload.amount}, you_lead ${nb && nb.payload.you_lead}, no names`);
+    // Live shows name the bid's leader (phase 2: the proxy bid is A's, so '@A $31'), never a max or an id.
+    ok(nb && nb.payload.you_lead === true && nb.payload.amount === 31 && nb.payload.username === A.username && !('leading_bidder' in nb.payload)
+      && !/max|top_pre/.test(Object.keys(nb.payload).join()) && !JSON.stringify(nb.payload).includes(A.id), `A's room event: ${nb && nb.payload.amount} by @${nb && nb.payload.username}, you_lead ${nb && nb.payload.you_lead}, no max, no id`);
     e = await ask(cc, 'place_bid', { max_amount: 60 }, ['bid_ok', 'bid_error']);   // no itemId: the open lot
     row = await K.lot(L1);
     ok(e && e.payload.your_status === 'winning' && Number(row.current_bid) === 41 && row.leading_bidder === C.username, `C max $60 (no itemId = the open lot): leads at $${row.current_bid} = A's 40 + $1`);
@@ -113,7 +115,9 @@ const near = (a, b, tol) => Math.abs(a - b) <= tol;
       `room: sold $${closed && closed.payload.amount}; only C hears "you won"`);
     ok(row.status === 'sold' && orders.length === 1 && orders[0].buyer_username === C.username && orders[0].hammer_cents === 6000 && orders[0].premium_cents === 0 && orders[0].total_cents === 6000,
       `one order for the lot: C, hammer $60, premium $0, total $${orders[0] && orders[0].total_cents / 100}`);
-    ok(!/"username"|"leading_bidder"/.test(JSON.stringify(closed && closed.payload)), 'lot_closed carries no names');
+    // Live shows show the winner's username (phase 2), and nothing else about anyone: no id, no max, no leading_bidder.
+    ok(closed && closed.payload.username === C.username && !/"leading_bidder"|"max_amount"|"top_pre_bid"/.test(JSON.stringify(closed.payload)) && !JSON.stringify(closed.payload).includes(C.id),
+      `lot_closed names the winner by username only (@${closed && closed.payload.username})`);
 
     console.log('\n== One pre-bid / none ==');
     from = anon.mark();

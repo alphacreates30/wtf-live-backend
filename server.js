@@ -15,7 +15,7 @@ const sharp = require('sharp');
 const aiLots = require('./ai_lots');
 const { makeThumb, thumbPathFor } = require('./thumbs');
 const lotRules = require('./lot_rules');
-const { publicAuction, publicLot } = require('./public_view');
+const { publicAuction, publicLot, auctionFor } = require('./public_view');
 const rewardsLib = require('./rewards');
 
 const app = express();
@@ -1708,11 +1708,12 @@ app.get('/auction/:id', optionalAuth, async (req, res) => {
   if (error) return res.status(404).json({ error: 'Auction not found' });
   // A draft is a part-built auction that must stay invisible until published -
   // 404 instead of 403 so its existence isn't confirmed to a non-admin.
-  if (data.status === 'draft' && req.user?.username !== ADMIN_USERNAME) {
+  // (A live show's rehearsal: a logged-in account with the private link's key, ?rehearsal=<key>.)
+  if (data.status === 'draft' && !canSeeAuction(data, req.user, req.query.rehearsal)) {
     return res.status(404).json({ error: 'Auction not found' });
   }
   // B6/B7: the public gets the pickup town, never the street address, and no bidder; the admin the full row.
-  res.json(req.user?.username === ADMIN_USERNAME ? data : publicAuction(data));
+  res.json(auctionFor(data, req.user?.username, ADMIN_USERNAME));   // the host/admin: the whole row (rehearsal_key too)
 });
 
 const FULFILLMENT_MODES = ['shipping', 'pickup', 'both'];
@@ -1721,8 +1722,23 @@ const FULFILLMENT_MODES = ['shipping', 'pickup', 'both'];
 const TERMS_VERSION = '1';
 
 app.patch('/auction/:id', requireAdmin, async (req, res) => {
-  const { title, description, category, buyers_premium_pct, fulfillment_mode, pickup_address, pickup_town, pickup_starts_at, pickup_ends_at } = req.body;
+  const { title, description, category, buyers_premium_pct, fulfillment_mode, pickup_address, pickup_town, pickup_starts_at, pickup_ends_at, clock_seconds, auto_pace, starts_at } = req.body;
   const u = {};
+  // Live shows (phase 2a): the default clock per lot, auto-pace, and the start time (before it goes on air).
+  if (clock_seconds !== undefined || auto_pace !== undefined || starts_at !== undefined) {
+    const { data: cur } = await supabase.from('auctions').select('mode, on_air_at').eq('id', req.params.id).maybeSingle();
+    if (cur?.mode !== 'live') return res.status(400).json({ error: 'clock_seconds, auto_pace and starts_at can only be changed on a live show' });
+    if (clock_seconds !== undefined) {
+      if (!LIVE_CLOCK_PRESETS.includes(Number(clock_seconds))) return res.status(400).json({ error: 'Clock must be 60, 30, 15 or 5 seconds' });
+      u.clock_seconds = Number(clock_seconds);
+    }
+    if (auto_pace !== undefined) u.auto_pace = auto_pace === true;
+    if (starts_at !== undefined) {
+      if (cur.on_air_at) return res.status(400).json({ error: 'The show has already been on air' });
+      if (!starts_at || isNaN(new Date(starts_at).getTime())) return res.status(400).json({ error: 'starts_at is not a valid date' });
+      u.starts_at = new Date(starts_at).toISOString();
+    }
+  }
   if (title !== undefined) {
     if (!title) return res.status(400).json({ error: 'title cannot be empty' });
     u.title = title;
@@ -1779,7 +1795,7 @@ app.patch('/auction/:id', requireAdmin, async (req, res) => {
 });
 
 app.post('/auction', requireAdmin, async (req, res) => {
-  const { title, description, image_url, category, starting_bid, starts_at, ends_at, mode, fulfillment_mode } = req.body;
+  const { title, description, image_url, category, starting_bid, starts_at, ends_at, mode, fulfillment_mode, clock_seconds, auto_pace } = req.body;
     // Live shows only while LIVE_ENABLED is on. Rejected explicitly (not coerced to standard) so a live request
     // surfaces instead of disappearing. A live show has no buyer's premium (brief §1.4).
     if (mode === 'live' && !LIVE_ENABLED) return res.status(400).json({ error: 'Live auctions are not available yet' });
@@ -1794,6 +1810,14 @@ app.post('/auction', requireAdmin, async (req, res) => {
     if (!FULFILLMENT_MODES.includes(fulfillment_mode)) {
       return res.status(400).json({ error: `fulfillment_mode is required and must be one of: ${FULFILLMENT_MODES.join(', ')}` });
     }
+    // A live show (phase 2a): a start time, the default clock per lot, and the auto-pace option. No end time.
+    const live = {};
+    if (auctionMode === 'live') {
+      if (!starts_at || isNaN(new Date(starts_at).getTime())) return res.status(400).json({ error: 'A live show needs a start time' });
+      if (clock_seconds !== undefined && !LIVE_CLOCK_PRESETS.includes(Number(clock_seconds))) return res.status(400).json({ error: 'Clock must be 60, 30, 15 or 5 seconds' });
+      if (clock_seconds !== undefined) live.clock_seconds = Number(clock_seconds);
+      if (auto_pace !== undefined) live.auto_pace = auto_pace === true;
+    }
   // Always created as a draft - never publicly visible until the host
   // explicitly publishes via POST /auction/:id/publish. starts_at is
   // resolved now (not at publish time) so a scheduled start set while
@@ -1803,7 +1827,7 @@ app.post('/auction', requireAdmin, async (req, res) => {
         status: 'draft',
         starts_at: starts_at || new Date().toISOString(), ends_at: ends_at || null,
         mode: auctionMode,
-        ...(auctionMode === 'live' ? { buyers_premium_pct: 0 } : {}),
+        ...(auctionMode === 'live' ? { buyers_premium_pct: 0, ends_at: null, ...live } : {}),
         fulfillment_mode,
         host_username: req.user.username
   }).select().single();
@@ -1840,7 +1864,10 @@ app.post('/auction/:id/publish', requireAdmin, async (req, res) => {
     }
   }
 
-  const newStatus = auction.starts_at && new Date(auction.starts_at) > new Date() ? 'upcoming' : 'live';
+  // A live show stays SCHEDULED ('upcoming') until the host taps Go live (two-step start, review answer 9). A draft
+  // that went on air was a rehearsal: it has sold lots and orders, so it is never published.
+  if (auction.mode === 'live' && auction.on_air_at) return res.status(400).json({ error: 'This show was used for a rehearsal. Create a new show for the real one.', code: 'rehearsed' });
+  const newStatus = auction.mode === 'live' ? 'upcoming' : auction.starts_at && new Date(auction.starts_at) > new Date() ? 'upcoming' : 'live';
   // Guard the transition on status still being 'draft' so a concurrent
   // double-click can't publish twice.
   const { data: updated, error: updateErr } = await supabase
@@ -1874,11 +1901,11 @@ app.post('/auction/:id/terms-acceptance', requireAuth, LIMITS.bidding, async (re
   const { fulfillment_choice } = req.body;
   const { data: auction, error: auctionErr } = await supabase
     .from('auctions')
-    .select('status, fulfillment_mode, buyers_premium_pct, pickup_ends_at')
+    .select('*')   // '*': rehearsal_key exists only after migration zd
     .eq('id', req.params.id)
     .single();
   if (auctionErr || !auction) return res.status(404).json({ error: 'Auction not found' });
-  if (auction.status === 'draft' && req.user.username !== ADMIN_USERNAME) {
+  if (auction.status === 'draft' && !canSeeAuction(auction, req.user, req.query.rehearsal ?? req.body?.rehearsal)) {
     return res.status(404).json({ error: 'Auction not found' });
   }
 
@@ -1974,10 +2001,10 @@ app.patch('/auction/:id/fulfillment-choice', requireAuth, async (req, res) => {
 // buyer, and only the host may publish (video or data).
 app.get('/auction/:id/token', requireAuth, async (req, res) => {
   if (!LIVE_ENABLED) return res.status(404).json({ error: 'Auction not found' });
-  const { data: auction, error } = await supabase.from('auctions').select('host_username, status, mode').eq('id', req.params.id).maybeSingle();
+  const { data: auction, error } = await supabase.from('auctions').select('host_username, status, mode, rehearsal_key').eq('id', req.params.id).maybeSingle();
   if (error) return dbFailure(req, res, error);
   const isAdmin = req.user.username === ADMIN_USERNAME;
-  if (!auction || auction.mode !== 'live' || (auction.status === 'draft' && !isAdmin)) return res.status(404).json({ error: 'Auction not found' });
+  if (!auction || auction.mode !== 'live' || !canSeeAuction(auction, req.user, req.query.rehearsal)) return res.status(404).json({ error: 'Auction not found' });
   const isHost = auction.host_username === req.user.username;
   if (!isHost && !isAdmin) {
     const { data: profile, error: pErr } = await supabase.from('profiles').select('status').eq('user_id', String(req.user.id)).maybeSingle();
@@ -2037,9 +2064,9 @@ app.delete('/auction/:id', requireAdmin, async (req, res) => {
 // A draft's bids and chat stay as private as the draft itself (security review
 // #17): anonymous reads by id used to return them. 404, as for /auction/:id.
 async function hideDraftFromNonAdmin(req, res, next) {
-  const { data: auction, error } = await supabase.from('auctions').select('status').eq('id', req.params.id).maybeSingle();
+  const { data: auction, error } = await supabase.from('auctions').select('*').eq('id', req.params.id).maybeSingle();   // '*': rehearsal_key (zd)
   if (error) return dbFailure(req, res, error);
-  if (auction?.status === 'draft' && req.user?.username !== ADMIN_USERNAME) return res.status(404).json({ error: 'Auction not found' });
+  if (auction?.status === 'draft' && !canSeeAuction(auction, req.user, req.query.rehearsal)) return res.status(404).json({ error: 'Auction not found' });
   next();
 }
 
@@ -2080,7 +2107,8 @@ const LIVE_CLOCK_PRESETS = [60, 30, 15, 5];  // seconds per lot, the host's choi
 const LIVE_DEFAULT_CLOCK = 30;
 // The show is on air from the host's start (or the first lot offered): stops pre-bid expiry (migration zb).
 async function markOnAir(auctionId) {
-  const { error } = await supabase.from('auctions').update({ on_air_at: new Date().toISOString() }).eq('id', auctionId).is('on_air_at', null);
+  await syncDbClock();
+  const { error } = await supabase.from('auctions').update({ on_air_at: new Date(dbNow()).toISOString() }).eq('id', auctionId).is('on_air_at', null);
   if (error && !rewardsLib.notMigrated(error)) console.error('markOnAir failed:', auctionId, error.message);
 }
 const LIVE_EXTEND = { window: 5, by: 5 };    // "a bid in the last 5 s adds 5 s"; Sudden death = by 0
@@ -2149,14 +2177,17 @@ async function closeLiveLot(itemId, force) {
   const sold = lot.status === 'sold';
   const orderId = sold ? await createOrderOnWin(lot.auction_id, lot.leading_bidder, lot.current_bid, lot.id) : null;
   if (orderId) await joinShowBox(orderId);
-  // B7 until the live-names step (§5): the room hears the price and the outcome; only the winner hears "you won".
+  // Live shows show the winner's username ("Sold to @name, $60"; phase 2), never a max; each viewer also hears
+  // whether THEY won.
   await emitPerViewer(lot.auction_id, 'lot_closed', u => ({
-    auctionId: lot.auction_id, item_id: lot.id, status: lot.status, amount: sold ? Number(lot.current_bid) : null,
-    you_won: sold && !!u && u === lot.leading_bidder,
+    auctionId: lot.auction_id, item_id: lot.id, lot_number: lot.position + 1, status: lot.status, amount: sold ? Number(lot.current_bid) : null,
+    username: sold ? lot.leading_bidder : null, you_won: sold && !!u && u === lot.leading_bidder,
   }));
   if (orderId) chargeLiveOrder(orderId);   // not awaited (never throws)
   else if (sold) console.error(`Live lot ${itemId} sold but its order was not created yet; recoverLiveLots retries it`);
   console.log(`Live lot ${itemId} closed: ${lot.status}${sold ? ` at $${lot.current_bid}` : ''}`);
+  await emitShowState(lot.auction_id);
+  autoPaceAfterClose(lot.auction_id);      // not awaited (never throws)
   return lot;
 }
 
@@ -2179,7 +2210,7 @@ async function tellRoomAboutPayment(orderId, r) {
   try {
     const { data: o } = await supabase.from('orders').select('id, auction_id, item_id, item_title, buyer_username, total_cents').eq('id', orderId).maybeSingle();
     if (!o) return;
-    const { data: a } = await supabase.from('auctions').select('host_username, status').eq('id', o.auction_id).maybeSingle();
+    const { data: a } = await supabase.from('auctions').select('*').eq('id', o.auction_id).maybeSingle();
     const { data: lot } = await supabase.from('auction_items').select('position').eq('id', o.item_id).maybeSingle();
     const base = { auctionId: o.auction_id, item_id: o.item_id, order_id: o.id, amount_cents: o.total_cents, lot_number: lot ? lot.position + 1 : null };
     for (const s of await io.in(o.auction_id).fetchSockets()) {
@@ -2192,7 +2223,7 @@ async function tellRoomAboutPayment(orderId, r) {
         // The host is the admin: they see who it is (their orders page already does).
         // can_rerun: the alert's "Re-run now" (rerun_lot), while the show is on air.
         s.emit(r.success ? 'lot_payment_fixed' : 'lot_payment_failed', { ...base, buyer: o.buyer_username, item_title: o.item_title,
-          ...(r.success ? {} : { reason: r.error || null, can_rerun: a?.status === 'live' }) });
+          ...(r.success ? {} : { reason: r.error || null, can_rerun: showOnAir(a) }) });
       }
     }
   } catch (e) {
@@ -2248,11 +2279,11 @@ async function retryLiveOrdersFor(userId) {
     const { data: rerun } = await supabase.from('orders').select('auction_id, buyer_username').eq('buyer_user_id', String(userId))
       .eq('payment_status', 'cancelled').not('reoffered_item_id', 'is', null);
     if (!failed?.length && !rerun?.length) return;
-    const { data: live } = await supabase.from('auctions').select('id, status').eq('mode', 'live')
+    const { data: live } = await supabase.from('auctions').select('*').eq('mode', 'live')   // '*': ended_at (zd)
       .in('id', [...new Set([...(failed || []), ...(rerun || [])].map(o => o.auction_id))]);
     const liveIds = new Set((live || []).map(a => a.id));
     for (const o of failed || []) if (liveIds.has(o.auction_id)) await chargeLiveOrder(o.id, { retry: true });
-    const onAir = new Set((live || []).filter(a => a.status === 'live').map(a => a.id));
+    const onAir = new Set((live || []).filter(showOnAir).map(a => a.id));
     for (const auctionId of new Set((rerun || []).filter(o => onAir.has(o.auction_id)).map(o => o.auction_id))) {
       if ((failed || []).some(o => o.auction_id === auctionId) || await liveUnpaid(userId, auctionId)) continue;   // told by the charge
       const username = rerun.find(o => o.auction_id === auctionId).buyer_username;
@@ -2328,7 +2359,7 @@ async function joinShowBox(orderId) {
 async function sendLiveShowSummaries(auctionId) {
   try {
     const { data: a, error } = await supabase.from('auctions').select('*').eq('id', auctionId).maybeSingle();
-    if (error || !a || a.mode !== 'live' || a.status !== 'ended' || !('live_summary_sent_at' in a) || a.live_summary_sent_at) return false;
+    if (error || !a || a.mode !== 'live' || !showEnded(a) || !('live_summary_sent_at' in a) || a.live_summary_sent_at) return false;
     const { data: orders, error: oErr } = await supabase.from('orders').select('*').eq('auction_id', auctionId).order('created_at');
     if (oErr || (orders || []).some(o => ['unpaid', 'charging'].includes(o.payment_status || 'unpaid'))) return false;
     const { data: claimed } = await supabase.from('auctions').update({ live_summary_sent_at: new Date().toISOString() })
@@ -2423,9 +2454,12 @@ async function releaseExpiredPrebids(now = new Date()) {
 // The 30-second job's live step (after recoverLiveLots): pre-bid expiry, and summaries for ended shows still owed one.
 async function runLiveHousekeeping() {
   await releaseExpiredPrebids();
+  // Ended shows, then rehearsals that ended (still drafts, with ended_at: that query stays silent before migration zd).
   const { data: owed, error } = await supabase.from('auctions').select('id').eq('mode', 'live').eq('status', 'ended').is('live_summary_sent_at', null);
   if (error) { if (!rewardsLib.notMigrated(error)) console.error('runLiveHousekeeping:', error.message); return; }
-  for (const a of owed || []) await sendLiveShowSummaries(a.id);
+  const { data: rehearsed, error: rErr } = await supabase.from('auctions').select('id').eq('mode', 'live').eq('status', 'draft').not('ended_at', 'is', null).is('live_summary_sent_at', null);
+  if (rErr && !rewardsLib.notMigrated(rErr)) console.error('runLiveHousekeeping (rehearsals):', rErr.message);
+  for (const a of [...(owed || []), ...(rehearsed || [])]) await sendLiveShowSummaries(a.id);
 }
 
 // Boot, and every 30 s (the auto-close job): watch every open live lot (a restart mid-lot resumes from ends_at), and
@@ -2463,6 +2497,202 @@ async function recoverLiveLots() {
     console.error('recoverLiveLots error:', e.message);
   }
 }
+// ---- The show (G1 phase 2a, LIVE_SHOWS_PHASE2_BRIEF.md; migration zd) ----
+// A live show is SCHEDULED once published (status 'upcoming'), ON AIR from the host's Go live (status 'live',
+// on_air_at), and ENDED by End show or by the auto-end below (status 'ended', ended_at). A DRAFT live show can also go
+// on air as a REHEARSAL: it stays a draft (hidden from every list) and only invited test accounts get in, with the
+// private link's key (?rehearsal=<key>). While on air the host steps through:
+//   show_lot (lot N on screen) -> start_clock (open, preset + Sudden death) -> add_time / sold_now / pass, or the
+//   clock runs out (the hammer) -> show_lot (the next one) ... -> end_show (refused while a lot is open).
+// The database is the state: auctions.shown_item_id is the lot on screen, an 'open' lot is the one selling. Every
+// change goes out to the room as one `show_state` (the same for everyone except `you_lead`; live shows show
+// usernames on bids and wins, never anyone's max).
+const LIVE_TALK_MS = 15 * 1000;              // auto-pace: talk time before the next lot's clock starts
+const LIVE_IDLE_END_MS = 60 * 60 * 1000;     // a show on air with no host activity this long ends itself
+const LIVE_ADD_SECONDS = 15;                 // the host's "+15 s"
+const showOnAir = a => !!a && a.mode === 'live' && (a.status === 'live' || (a.status === 'draft' && !!a.on_air_at && !a.ended_at));
+const showEnded = a => !!a && (a.status === 'ended' || !!a.ended_at);
+// The private rehearsal link: a draft live show, its current key, compared in constant time.
+function rehearsalOk(auction, key) {
+  if (!auction || auction.mode !== 'live' || auction.status !== 'draft' || !auction.rehearsal_key || typeof key !== 'string' || !key) return false;
+  const a = Buffer.from(key), b = Buffer.from(auction.rehearsal_key);
+  return a.length === b.length && require('crypto').timingSafeEqual(a, b);
+}
+// Who may see an auction by its id: anyone unless it is a draft; a draft, the admin, or (a live show's rehearsal) a
+// logged-in account with the current key. Lists never show drafts.
+const canSeeAuction = (auction, user, key) => !!auction && (auction.status !== 'draft' || user?.username === ADMIN_USERNAME || (!!user && rehearsalOk(auction, key)));
+
+// The lineup: the lots still waiting, in the order they'll be offered: a lot put "next" (a re-run or Run again)
+// first, then the host's drag order (run_order), then lot number. Lot numbers (position + 1) never change.
+const lineupSort = (a, b) => (Number(!!b.offer_next) - Number(!!a.offer_next)) || ((a.run_order ?? Infinity) - (b.run_order ?? Infinity)) || (a.position - b.position);
+const LIVE_LOT_COLS = 'id, auction_id, position, title, description, condition, image_url, starting_bid, current_bid, bid_count, pre_bid_count, status, ends_at, created_at, leading_bidder, offer_next, run_order, clock_seconds, sudden_death, run_again_of, extend_by_seconds';
+async function showLots(auctionId) {
+  const out = [];
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await supabase.from('auction_items').select(LIVE_LOT_COLS).eq('auction_id', auctionId).order('position').range(from, from + 999);
+    if (error) throw error;
+    out.push(...data);
+    if (data.length < 1000) return out;
+  }
+}
+// A lot as the room sees it: the public row, its number, and in a live show the leader's username (never a max).
+const liveLotView = (l, { leader = false } = {}) => (l ? {
+  ...publicLot(l), lot_number: l.position + 1,
+  ...(leader ? { leader: l.bid_count > 0 ? l.leading_bidder || null : null, sudden_death: l.extend_by_seconds === 0 } : {}),
+} : null);
+
+// Everything a host or viewer screen needs about the show, in one object (also GET /auction/:id/show-state).
+async function liveShowState(auctionId) {
+  const { data: a, error } = await supabase.from('auctions').select('*').eq('id', auctionId).maybeSingle();
+  if (error) throw error;
+  if (!a || a.mode !== 'live') return null;
+  const lots = await showLots(auctionId);
+  await syncDbClock();
+  const open = lots.find(l => l.status === 'open') || null;
+  const shown = open || lots.find(l => l.id === a.shown_item_id && l.status === 'pending') || null;
+  const lineup = lots.filter(l => l.status === 'pending').sort(lineupSort);
+  const sold = lots.filter(l => l.status === 'sold');
+  const closed = lots.filter(l => (l.status === 'sold' || l.status === 'unsold') && l.ends_at).sort((x, y) => Date.parse(y.ends_at) - Date.parse(x.ends_at));
+  const last = closed[0] || null;
+  return {
+    auctionId, title: a.title, status: a.status, on_air: showOnAir(a), rehearsal: a.status === 'draft', ended: showEnded(a),
+    on_air_at: a.on_air_at || null, ended_at: a.ended_at || null, starts_at: a.starts_at || null,
+    clock_seconds: a.clock_seconds ?? LIVE_DEFAULT_CLOCK, auto_pace: !!a.auto_pace, on_hold: !!a.on_hold, autostart_at: a.autostart_at || null,
+    shown: liveLotView(shown, { leader: !!open }), open: open ? { ...liveLotView(open, { leader: true }), ends_at: new Date(Date.parse(open.ends_at)).toISOString() } : null,
+    last: last ? { item_id: last.id, lot_number: last.position + 1, title: last.title, status: last.status,
+      amount: last.status === 'sold' ? Number(last.current_bid) : null, winner: last.status === 'sold' ? last.leading_bidder : null,
+      // passed: the host Passed it, or skipped it before its clock started (no bids, no live clock).
+      passed: last.status === 'unsold' && (last.bid_count > 0 || last.extend_by_seconds == null),
+      can_run_again: last.status === 'unsold' && !lots.some(c => c.run_again_of === last.id && c.status === 'pending') } : null,
+    up_next: lineup.filter(l => l.id !== shown?.id).slice(0, 3).map(l => liveLotView(l)),
+    stats: { sold_count: sold.length, sold_total: Math.round(sold.reduce((t, l) => t + Number(l.current_bid || 0) * 100, 0)) / 100,
+      lots_left: lineup.length, lots_total: lots.length },
+    server_now: new Date(dbNow()).toISOString(),
+  };
+}
+const showStateFor = (st, username) => st && ({ ...st, you_lead: !!username && st.open?.leader === username });
+async function emitShowState(auctionId) {
+  try {
+    const st = await liveShowState(auctionId);
+    if (st) await emitPerViewer(auctionId, 'show_state', u => showStateFor(st, u));
+  } catch (e) {
+    console.error('emitShowState error:', auctionId, e.message);
+  }
+}
+
+// Open a lot: blocked buyers' pre-bids dropped (phase 1b), then open_live_lot (pre-bids by the proxy rule, never at
+// the top max; the clock starts), and the room is told. Returns the lot, or { error }.
+async function openLiveLot(auctionId, itemId, secs, suddenDeath) {
+  await dropBlockedPrebids(auctionId, itemId);
+  await syncDbClock();
+  const { data: lot, error } = await supabase.rpc('open_live_lot', {
+    p_item_id: itemId, p_seconds: secs, p_extend_window_seconds: LIVE_EXTEND.window,
+    p_extend_by_seconds: suddenDeath ? 0 : LIVE_EXTEND.by, p_opening_min: OPENING_BID_MIN,
+  });
+  if (error) {
+    if (error.code === 'P0001') return { error: error.message };
+    console.error('open_live_lot failed:', error.code, error.message);
+    return { error: 'Could not open the lot' };
+  }
+  watchLiveLot(lot);
+  await markOnAir(auctionId);
+  await supabase.from('auctions').update({ shown_item_id: lot.id, autostart_at: null }).eq('id', auctionId);
+  const clock = liveClock(auctionId, lot.id, Date.parse(lot.ends_at));
+  await emitPerViewer(auctionId, 'item_activated', u => ({
+    item: publicLot(lot), lot_number: lot.position + 1, you_lead: !!u && u === lot.leading_bidder, pre_bid_count: lot.pre_bid_count || 0,
+    leader: lot.bid_count > 0 ? lot.leading_bidder : null, timer_seconds: secs, sudden_death: !!suddenDeath, ends_at: clock.ends_at, server_now: clock.server_now,
+  }));
+  io.to(auctionId).emit('item_timer_tick', clock);
+  await emitShowState(auctionId);
+  return lot;
+}
+
+// Auto-pace (per show, off by default): after a lot closes on its clock or Sold now, the next lot in the lineup goes
+// on screen and its clock starts after LIVE_TALK_MS, unless the host taps Hold. autostart_at in the database is the
+// plan, so a second server or a restart can carry it out (the 30-second job); clearing it is the claim, so the clock
+// starts once. A Pass doesn't advance (the host is in charge then).
+const autostartTimers = new Map();
+function armAutostart(auctionId, atIso) {
+  clearTimeout(autostartTimers.get(auctionId));
+  const ms = Math.max(0, Date.parse(atIso) - Date.now());
+  autostartTimers.set(auctionId, setTimeout(() => { autostartTimers.delete(auctionId); liveAutostart(auctionId).catch(e => console.error('autostart failed:', auctionId, e.message)); }, ms + 50));
+}
+async function autoPaceAfterClose(auctionId) {
+  try {
+    const { data: a } = await supabase.from('auctions').select('*').eq('id', auctionId).maybeSingle();
+    if (!showOnAir(a) || !a.auto_pace || a.on_hold) return;
+    const { data: pending } = await supabase.from('auction_items').select('id, position, offer_next, run_order').eq('auction_id', auctionId).eq('status', 'pending');
+    const next = (pending || []).sort(lineupSort)[0];
+    if (!next) return;
+    const at = new Date(Date.now() + LIVE_TALK_MS).toISOString();
+    const { data: set } = await supabase.from('auctions').update({ shown_item_id: next.id, autostart_at: at })
+      .eq('id', auctionId).eq('on_hold', false).eq('auto_pace', true).select('id');
+    if (!set?.length) return;
+    armAutostart(auctionId, at);
+    await emitShowState(auctionId);
+  } catch (e) {
+    console.error('autoPaceAfterClose error:', auctionId, e.message);
+  }
+}
+async function liveAutostart(auctionId) {
+  const { data: a } = await supabase.from('auctions').select('*').eq('id', auctionId).maybeSingle();
+  if (!a?.autostart_at || !showOnAir(a) || a.on_hold || !a.shown_item_id) return;
+  if (Date.parse(a.autostart_at) > Date.now()) { armAutostart(auctionId, a.autostart_at); return; }
+  const { data: claimed } = await supabase.from('auctions').update({ autostart_at: null })
+    .eq('id', auctionId).eq('autostart_at', a.autostart_at).eq('on_hold', false).select('id');
+  if (!claimed?.length) return;
+  const { data: lot } = await supabase.from('auction_items').select('id, status, clock_seconds, sudden_death').eq('id', a.shown_item_id).maybeSingle();
+  if (lot?.status !== 'pending') return;
+  const r = await openLiveLot(auctionId, lot.id, lot.clock_seconds ?? a.clock_seconds ?? LIVE_DEFAULT_CLOCK, !!lot.sudden_death);
+  if (r?.error) console.log(`Auto-pace: lot ${lot.id} not opened: ${r.error}`);
+}
+
+// End the show (the host's End show, or the auto-end): refused while a lot is open. A real show becomes 'ended'; a
+// rehearsal stays a draft with ended_at. Then the "your show wins" emails (once every charge has settled).
+// Returns { ok } or { error, code }.
+async function endLiveShow(auctionId, { auto = false } = {}) {
+  const { data: open } = await supabase.from('auction_items').select('id').eq('auction_id', auctionId).eq('status', 'open').limit(1);
+  if (open?.length) return { error: 'A lot is still open. Let its clock finish, or Pass it, then end the show.', code: 'lot_open' };
+  const { data: a } = await supabase.from('auctions').select('*').eq('id', auctionId).maybeSingle();
+  if (!showOnAir(a)) return { error: 'This show is not on air', code: 'not_on_air' };
+  const at = new Date().toISOString();
+  const done = { ended_at: at, shown_item_id: null, autostart_at: null, on_hold: false };
+  const q = a.status === 'draft'
+    ? supabase.from('auctions').update(done).eq('id', auctionId).eq('status', 'draft').is('ended_at', null)
+    : supabase.from('auctions').update({ ...done, status: 'ended' }).eq('id', auctionId).eq('status', 'live');
+  const { data: ended } = await q.select('id');
+  if (!ended?.length) return { error: 'This show is not on air', code: 'not_on_air' };
+  clearTimeout(autostartTimers.get(auctionId));
+  io.to(auctionId).emit('auction_ended', { auctionId, ...(auto ? { auto: true } : {}), ...(a.status === 'draft' ? { rehearsal: true } : {}) });
+  await emitShowState(auctionId);
+  console.log(`- Show ${auctionId} ended${auto ? ' (no host activity for 60 min)' : ''}`);
+  sendLiveShowSummaries(auctionId);   // never throws; the 30-second job retries until every charge has settled
+  return { ok: true };
+}
+
+// The 30-second job's show step: an auto-pace start that is due (its timer was on another server, or lost in a
+// restart), and the auto-end: on air, no host activity for 60 min (counted from Go live if the host never tapped
+// anything since), no lot open, nothing about to start.
+async function runLiveShowHousekeeping(now = Date.now()) {
+  if (!LIVE_ENABLED) return;
+  try {
+    const { data: due, error } = await supabase.from('auctions').select('id').eq('mode', 'live').not('autostart_at', 'is', null)
+      .lte('autostart_at', new Date(now).toISOString());
+    if (error) { if (!rewardsLib.notMigrated(error)) console.error('runLiveShowHousekeeping:', error.message); return; }
+    for (const a of due || []) await liveAutostart(a.id);
+    const cutoff = new Date(now - LIVE_IDLE_END_MS).toISOString();
+    const { data: idle } = await supabase.from('auctions').select('id, status, on_air_at, ended_at, last_host_activity_at, autostart_at')
+      .eq('mode', 'live').in('status', ['live', 'draft']).not('on_air_at', 'is', null).is('ended_at', null).is('autostart_at', null)
+      .or(`last_host_activity_at.lt.${cutoff},and(last_host_activity_at.is.null,on_air_at.lt.${cutoff})`);
+    for (const a of idle || []) {
+      const r = await endLiveShow(a.id, { auto: true });
+      if (r.error && r.code !== 'lot_open') console.log(`Auto-end of show ${a.id} skipped: ${r.error}`);
+    }
+  } catch (e) {
+    console.error('runLiveShowHousekeeping error:', e.message);
+  }
+}
+
 // NOTE: superseded by autoCloseStandardItems(), which is now the single
 // source of truth for closing standard lots. Kept as a no-op so any stray
 // callers don't crash. Do not re-enable: two closers caused a race where
@@ -2548,7 +2778,7 @@ io.on('connection', (socket) => {
 
   console.log(`- User connected: ${socket.id}`);
 
-  on('join_auction', async ({ auctionId, token } = {}) => {
+  on('join_auction', async ({ auctionId, token, rehearsal } = {}) => {
     // Support legacy string-only calls
     if (typeof auctionId === 'string' && !token) { /* auctionId already set */ }
 
@@ -2557,11 +2787,13 @@ io.on('connection', (socket) => {
     // Drafts are private - resolve this BEFORE joining the room or emitting
     // any state (auction_state/bid_history/chat_history). Checking after
     // would already have leaked the auction to anyone who has its id.
+    // A live show's rehearsal: a logged-in account with the private link's key gets into the draft (phase 2a).
     const { data: auction } = await supabase.from('auctions').select('*').eq('id', auctionId).single();
-    if (auction && auction.status === 'draft' && (!user || user.username !== ADMIN_USERNAME)) {
+    if (auction && auction.status === 'draft' && !canSeeAuction(auction, user, rehearsal)) {
       socket.emit('auction_error', { code: 'not_found', message: 'Auction not found.' });
       return;
     }
+    if (auction?.status === 'draft' && user && user.username !== ADMIN_USERNAME) socket.data.rehearsal = auctionId;
 
     // Check approval status for authenticated users
     if (user) {
@@ -2600,7 +2832,8 @@ io.on('connection', (socket) => {
 
     const isAdmin = user?.username === ADMIN_USERNAME;
     if (auction) {
-      socket.emit('auction_state', isAdmin ? auction : { ...publicAuction(auction), you_lead: !!user && auction.leading_bidder === user.username });
+      socket.emit('auction_state', isAdmin ? auctionFor(auction, user.username, ADMIN_USERNAME) : { ...publicAuction(auction), you_lead: !!user && auction.leading_bidder === user.username,
+        ...(auction.mode === 'live' ? { on_air: showOnAir(auction), rehearsal: auction.status === 'draft' } : {}) });
     }
 
     // Who bid what: the admin only (B7).
@@ -2610,11 +2843,12 @@ io.on('connection', (socket) => {
     }
 
     // A live show with a lot open: the joining viewer gets that lot, whether THEY lead, and its clock.
-    if (auction?.mode === 'live' && auction.status === 'live') {
+    if (auction?.mode === 'live' && showOnAir(auction)) {
       const { data: openLot } = await supabase.from('auction_items').select('*').eq('auction_id', auctionId).eq('status', 'open').maybeSingle();
       if (openLot?.ends_at) {
         const clock = liveClock(auctionId, openLot.id, Date.parse(openLot.ends_at));
-        socket.emit('item_activated', { item: isAdmin ? openLot : publicLot(openLot), you_lead: !!user && openLot.leading_bidder === user.username,
+        socket.emit('item_activated', { item: isAdmin ? openLot : publicLot(openLot), lot_number: openLot.position + 1, you_lead: !!user && openLot.leading_bidder === user.username,
+          leader: openLot.bid_count > 0 ? openLot.leading_bidder : null,
           pre_bid_count: openLot.pre_bid_count || 0, ends_at: clock.ends_at, server_now: clock.server_now });
         socket.emit('item_timer_tick', clock);
       }
@@ -2622,6 +2856,11 @@ io.on('connection', (socket) => {
 
     const { data: chatHistory } = await supabase.from('chat_messages').select('*').eq('auction_id', auctionId).eq('flagged', false).order('created_at', { ascending: true }).limit(50);
     if (chatHistory) socket.emit('chat_history', chatHistory);
+    // A live show: everything its screens need, in one object (the same as GET /auction/:id/show-state).
+    if (auction?.mode === 'live' && LIVE_ENABLED) {
+      try { const st = await liveShowState(auctionId); if (st) socket.emit('show_state', showStateFor(st, user?.username || null)); }
+      catch (e) { console.error('show_state on join failed:', auctionId, e.message); }
+    }
 
     console.log(`- ${socket.id} joined auction ${auctionId} - ${viewers[auctionId].size} watching`);
   });
@@ -2637,11 +2876,13 @@ io.on('connection', (socket) => {
     if (!LIVE_ENABLED) return fail(LIVE_OFF, 'live_off');
     const user = await verifySocketToken(token);
     if (!user) return fail('You must be logged in to bid', 'login_required');
-    const { data: auction } = await supabase.from('auctions').select('id, mode, status, host_username').eq('id', auctionId).maybeSingle();
+    const { data: auction } = await supabase.from('auctions').select('id, mode, status, host_username, on_air_at, ended_at').eq('id', auctionId).maybeSingle();
     if (!auction || auction.mode !== 'live') return fail('Bidding on this auction happens lot by lot.');
+    // A rehearsal (a draft on air) only for the accounts that came in through its private link.
+    if (auction.status === 'draft' && socket.data.rehearsal !== auctionId) return fail('Item not found', 'not_found');
     const refusal = await biddingRefusal(user, auction);
     if (refusal) return fail(refusal.error, refusal.code);
-    if (auction.status !== 'live') return fail('This show is not on air', 'not_on_air');
+    if (!showOnAir(auction)) return fail('This show is not on air', 'not_on_air');
     if (!(await hasAcceptedTerms(user.id, auctionId))) return fail('You must accept the auction terms before bidding', 'terms_required');
     if (await liveUnpaid(user.id, auctionId)) return fail(LIVE_UNPAID, 'payment_failed');
     const max = parseMaxBid(max_amount ?? amount);
@@ -2675,10 +2916,10 @@ io.on('connection', (socket) => {
     }
     if (data.ends_at) watchLiveLot(data);   // a late bid may have added time
     socket.emit('bid_ok', bidResult(data, user.username));
-    // B7 until the live-names step (§5): the price, never who or anyone's max; each viewer learns only whether
-    // THEY lead. Outbid = the in-room alert (no outbid email per bid during a show).
+    // Live shows show usernames on bids (phase 2): the leader after this bid ("@name $45"), never anyone's max. Each
+    // viewer also learns whether THEY lead. Outbid = the in-room alert (no outbid email per bid during a show).
     await emitPerViewer(auctionId, 'new_bid', u => ({
-      auction_id: auctionId, item_id: data.id, amount: Number(data.current_bid), bid_count: data.bid_count,
+      auction_id: auctionId, item_id: data.id, amount: Number(data.current_bid), bid_count: data.bid_count, username: data.leading_bidder || null,
       ends_at: data.ends_at, server_now: new Date(dbNow()).toISOString(), you_lead: !!u && u === data.leading_bidder,
     }));
   });
@@ -2693,7 +2934,7 @@ io.on('connection', (socket) => {
     // the token only, so a blocked user kept posting - into any auction, drafts
     // included - just by emitting the event.
     const { data: auction } = await supabase.from('auctions').select('host_username, leading_bidder, status').eq('id', auctionId).maybeSingle();
-    if (!auction || (auction.status === 'draft' && user.username !== ADMIN_USERNAME)) {
+    if (!auction || (auction.status === 'draft' && user.username !== ADMIN_USERNAME && socket.data.rehearsal !== auctionId)) {
       socket.emit('chat_error', { message: 'Auction not found' }); return;
     }
     if (user.username !== ADMIN_USERNAME) {
@@ -2757,60 +2998,209 @@ io.on('connection', (socket) => {
     console.log(`- Admin blocked user ${targetUsername} (${resolvedUserId}) from auction ${auctionId}`);
   });
 
-  // Host events (phase 1: the money path; the phone host screen and its one-button flow are §2). Each one: live
-  // shows switched on, a live-mode auction, and only its host (or the admin).
-  async function liveHost(auctionId, token, cols = 'id, host_username, status, mode') {
+  // Host events (phase 2a, LIVE_SHOWS_PHASE2_BRIEF.md; audit §2). Each one: live shows switched on, a live-mode
+  // auction, and only its host (or the admin). Every accepted event records host activity (the 60-minute auto-end)
+  // and answers the sender with host_ok { action }; a refused one with host_error { message, code }. The state
+  // machine refuses steps out of order (start_clock with no lot on screen, show_lot while a lot sells, and so on).
+  async function liveHost(auctionId, token) {
     if (!LIVE_ENABLED) { socket.emit('host_error', { message: LIVE_OFF, code: 'live_off' }); return null; }
     const user = await verifySocketToken(token);
     if (!user) { socket.emit('host_error', { message: 'Unauthorized' }); return null; }
-    const { data: auction } = await supabase.from('auctions').select(cols).eq('id', auctionId).maybeSingle();
+    const { data: auction } = await supabase.from('auctions').select('*').eq('id', auctionId).maybeSingle();
     if (!auction || (auction.host_username !== user.username && user.username !== ADMIN_USERNAME)) {
       socket.emit('host_error', { message: 'Only the host can run this show' }); return null;
     }
     if (auction.mode !== 'live') { socket.emit('host_error', { message: LIVE_ONLY }); return null; }
     return { user, auction };
   }
+  const hostErr = (message, code, extra = {}) => { socket.emit('host_error', { message, ...(code ? { code } : {}), ...extra }); return null; };
+  const hostOk = (action, extra = {}) => socket.emit('host_ok', { action, ...extra });
+  const touchHost = (auctionId, extra = {}) => supabase.from('auctions').update({ last_host_activity_at: new Date().toISOString(), ...extra }).eq('id', auctionId);
+  const openLotOf = async auctionId => (await supabase.from('auction_items').select(LIVE_LOT_COLS).eq('auction_id', auctionId).eq('status', 'open').limit(1)).data?.[0] || null;
+  // Only on air; a host who isn't gets told why.
+  function needOnAir(a) {
+    if (showOnAir(a)) return true;
+    hostErr(showEnded(a) ? 'This show has ended' : 'Go live first', showEnded(a) ? 'ended' : 'not_on_air');
+    return false;
+  }
 
-  // On air. A show published with a past start time is already 'live' (the two-step start is §2).
-  on('start_auction', async ({ auctionId, token }) => {
+  // Go live: a scheduled show goes on air (status 'live', on_air_at). A draft goes on air as a REHEARSAL (it stays a
+  // draft: hidden, only for the private link's invited accounts).
+  async function goLive(auctionId, token, { legacy = false } = {}) {
     const h = await liveHost(auctionId, token);
     if (!h) return;
-    if (h.auction.status === 'upcoming') {
-      await supabase.from('auctions').update({ status: 'live', starts_at: new Date().toISOString() }).eq('id', auctionId).eq('status', 'upcoming');
-    } else if (h.auction.status !== 'live') {
-      return socket.emit('host_error', { message: 'This show has ended or is not published' });
+    const a = h.auction;
+    if (showEnded(a)) return hostErr('This show has ended', 'ended');
+    if (showOnAir(a) && a.on_air_at && !legacy) return hostErr('The show is already on air', 'already_on_air');
+    await syncDbClock();
+    const at = new Date(dbNow()).toISOString();   // the database's clock, like the lots'
+    let ok = true;
+    if (a.status === 'draft') {
+      const { data } = await supabase.from('auctions').update({ on_air_at: at, last_host_activity_at: at }).eq('id', auctionId).eq('status', 'draft').is('on_air_at', null).select('id');
+      ok = !!data?.length || (legacy && showOnAir(a));
+    } else if (a.status === 'upcoming' || a.status === 'live') {
+      const { data } = await supabase.from('auctions').update({ status: 'live', last_host_activity_at: at }).eq('id', auctionId).in('status', ['upcoming', 'live']).select('id');
+      ok = !!data?.length;
+      if (ok) await markOnAir(auctionId);
+    } else ok = false;
+    if (!ok) return hostErr('This show has ended or is not published', 'not_scheduled');
+    io.to(auctionId).emit('auction_started', { auctionId, ...(a.status === 'draft' ? { rehearsal: true } : {}) });
+    hostOk('go_live');
+    await emitShowState(auctionId);
+    console.log(`- Host ${h.user.username} put show ${auctionId} on air${a.status === 'draft' ? ' (rehearsal)' : ''}`);
+  }
+  on('go_live', ({ auctionId, token }) => goLive(auctionId, token));
+  on('start_auction', ({ auctionId, token }) => goLive(auctionId, token, { legacy: true }));   // phase 1 name
+
+  // Show lot N: puts a waiting lot on screen (no clock yet). { itemId } or the next in the lineup. Refused while a lot
+  // is selling. Showing another lot instead is fine (the host changed their mind).
+  async function showLot(h, auctionId, itemId) {
+    const lots = await showLots(auctionId);
+    if (lots.some(l => l.status === 'open')) { hostErr('A lot is still selling', 'lot_open'); return null; }
+    const lineup = lots.filter(l => l.status === 'pending').sort(lineupSort);
+    const id = itemId ? canonicalUuid(itemId) : null;
+    const lot = id ? lineup.find(l => l.id === id) : lineup[0];
+    if (!lot) {
+      if (id) { hostErr('That lot is not waiting to be offered', 'not_pending'); return null; }
+      io.to(auctionId).emit('items_finished', { auctionId });
+      hostErr('Every lot has been offered', 'no_lots');
+      return null;
     }
-    await markOnAir(auctionId);
-    io.to(auctionId).emit('auction_started', { auctionId });
-    console.log(`- Host ${h.user.username} started show ${auctionId}`);
+    await touchHost(auctionId, { shown_item_id: lot.id, autostart_at: null });
+    clearTimeout(autostartTimers.get(auctionId));
+    return lot;
+  }
+  on('show_lot', async ({ auctionId, itemId, token }) => {
+    const h = await liveHost(auctionId, token);
+    if (!h || !needOnAir(h.auction)) return;
+    const lot = await showLot(h, auctionId, itemId);
+    if (!lot) return;
+    hostOk('show_lot', { item_id: lot.id, lot_number: lot.position + 1 });
+    await emitShowState(auctionId);
   });
 
-  // End the show. Refused while a lot is open (Albert, Oct 15): the host lets its clock finish or Passes it first.
-  // No auction-level order: every sale is a lot. Then the "your show wins" emails (once every charge has settled).
-  on('end_auction', async ({ auctionId, token }) => {
+  // Start the clock on the lot on screen: { seconds: 60 | 30 | 15 | 5, suddenDeath } (default: the lot card's
+  // choice, else the show's default). Its pre-bids apply by the proxy rule, never at the top max (brief §1.2).
+  async function startClock(h, auctionId, seconds, suddenDeath, lot) {
+    const secs = Number(seconds ?? lot.clock_seconds ?? h.auction.clock_seconds ?? LIVE_DEFAULT_CLOCK);
+    if (!LIVE_CLOCK_PRESETS.includes(secs)) return hostErr('Clock must be 60, 30, 15 or 5 seconds', 'bad_clock');
+    await touchHost(auctionId);
+    const r = await openLiveLot(auctionId, lot.id, secs, suddenDeath === undefined ? !!lot.sudden_death : suddenDeath === true);
+    if (r.error) return hostErr(r.error, 'refused');
+    return r;
+  }
+  on('start_clock', async ({ auctionId, seconds, suddenDeath, token }) => {
+    const h = await liveHost(auctionId, token);
+    if (!h || !needOnAir(h.auction)) return;
+    if (await openLotOf(auctionId)) return hostErr('A lot is already selling', 'lot_open');
+    const { data: lot } = h.auction.shown_item_id
+      ? await supabase.from('auction_items').select(LIVE_LOT_COLS).eq('id', h.auction.shown_item_id).maybeSingle() : { data: null };
+    if (!lot || lot.status !== 'pending') return hostErr('Show a lot first', 'no_lot_shown');
+    const r = await startClock(h, auctionId, seconds, suddenDeath, lot);
+    if (r?.id) hostOk('start_clock', { item_id: r.id, ends_at: r.ends_at });
+  });
+  // Phase 1's one step: the lot on screen (or the next in the lineup) is shown and its clock started at once.
+  on('next_item', async ({ auctionId, token, timerSeconds, suddenDeath = false }) => {
     const h = await liveHost(auctionId, token);
     if (!h) return;
-    const { data: open } = await supabase.from('auction_items').select('id').eq('auction_id', auctionId).eq('status', 'open').limit(1);
-    if (open?.length) return socket.emit('host_error', { message: 'A lot is still open. Let its clock finish, or Pass it, then end the show.', code: 'lot_open' });
-    const { data: ended } = await supabase.from('auctions').update({ status: 'ended' }).eq('id', auctionId).eq('status', 'live').select('id');
-    if (!ended?.length) return socket.emit('host_error', { message: 'This show is not on air' });
-    io.to(auctionId).emit('auction_ended', { auctionId });
-    console.log(`- Host ${h.user.username} ended show ${auctionId}`);
-    sendLiveShowSummaries(auctionId);   // never throws; the 30-second job retries until every charge has settled
+    if (!showOnAir(h.auction)) return hostErr('Start the show first', 'not_on_air');
+    const secs = timerSeconds === undefined ? LIVE_DEFAULT_CLOCK : (Number(timerSeconds) || LIVE_DEFAULT_CLOCK);
+    if (!LIVE_CLOCK_PRESETS.includes(secs)) return hostErr('Clock must be 60, 30, 15 or 5 seconds', 'bad_clock');
+    if (await openLotOf(auctionId)) return hostErr('Another lot is still open', 'lot_open');
+    const { data: shown } = h.auction.shown_item_id
+      ? await supabase.from('auction_items').select(LIVE_LOT_COLS).eq('id', h.auction.shown_item_id).maybeSingle() : { data: null };
+    const lot = shown?.status === 'pending' ? shown : await showLot(h, auctionId, null);
+    if (!lot) return;
+    const r = await startClock(h, auctionId, secs, suddenDeath === true, lot);
+    if (r?.id) hostOk('next_item', { item_id: r.id });
   });
 
-  // Pass: the open lot closes with no sale, whatever its bids (`unsold`, no order). It can be offered again later.
-  on('pass_lot', async ({ auctionId, token }) => {
+  // +15 s on the open lot's clock (any 1-120 s with `seconds`; phase 1's extend_auction sends extraSeconds).
+  async function addTime(auctionId, token, seconds) {
     const h = await liveHost(auctionId, token);
     if (!h) return;
-    const { data: open } = await supabase.from('auction_items').select('id').eq('auction_id', auctionId).eq('status', 'open').limit(1);
-    if (!open?.length) return socket.emit('host_error', { message: 'No lot is open' });
-    const { data: lot, error } = await supabase.rpc('pass_live_lot', { p_item_id: open[0].id });
-    if (error) { console.error('pass_live_lot failed:', error.code, error.message); return socket.emit('host_error', { message: 'Could not pass the lot' }); }
-    if (!lot?.id) return socket.emit('host_error', { message: 'The lot just closed' });
-    unwatchLiveLot(lot.id);
-    await emitPerViewer(auctionId, 'lot_closed', () => ({ auctionId, item_id: lot.id, status: 'unsold', passed: true, amount: null, you_won: false }));
-    console.log(`- Host ${h.user.username} passed lot ${lot.id}`);
+    const secs = Number(seconds ?? LIVE_ADD_SECONDS);
+    if (!Number.isInteger(secs) || secs < 1 || secs > 120) return hostErr('Add 1 to 120 seconds', 'bad_seconds');
+    const lot = await openLotOf(auctionId);
+    if (!lot?.ends_at) return hostErr('No lot is open', 'no_lot_open');
+    const newEndsAt = new Date(Date.parse(lot.ends_at) + secs * 1000).toISOString();
+    // Only if nothing moved it since the read (a bid's extension, the hammer): then the host just taps again.
+    const { data: moved } = await supabase.from('auction_items').update({ ends_at: newEndsAt })
+      .eq('id', lot.id).eq('status', 'open').eq('ends_at', lot.ends_at).select('id, auction_id, ends_at');
+    if (!moved?.length) return hostErr('The lot just changed. Try again.', 'changed');
+    await touchHost(auctionId);
+    watchLiveLot(moved[0]);
+    io.to(auctionId).emit('item_extended', { auctionId, item_id: lot.id, ends_at: moved[0].ends_at, server_now: new Date(dbNow()).toISOString() });
+    hostOk('add_time', { item_id: lot.id, ends_at: moved[0].ends_at });
+    console.log(`- Host ${h.user.username} added ${secs}s to lot ${lot.id}`);
+  }
+  on('add_time', ({ auctionId, seconds, token }) => addTime(auctionId, token, seconds));
+  on('extend_auction', ({ auctionId, extraSeconds, token }) => addTime(auctionId, token, extraSeconds ?? NaN));   // phase 1 name
+
+  // Sold now: the open lot sells to its leader at the current bid, before its clock runs out. Needs a bid.
+  on('sold_now', async ({ auctionId, token }) => {
+    const h = await liveHost(auctionId, token);
+    if (!h || !needOnAir(h.auction)) return;
+    const lot = await openLotOf(auctionId);
+    if (!lot) return hostErr('No lot is open', 'no_lot_open');
+    if (!(lot.bid_count > 0) || !lot.leading_bidder) return hostErr('No bids yet. Pass it instead, or wait.', 'no_bids');
+    await touchHost(auctionId);
+    const closed = await closeLiveLot(lot.id, true);
+    if (!closed) return hostErr('The lot just closed', 'changed');
+    hostOk('sold_now', { item_id: lot.id, status: closed.status, amount: Number(closed.current_bid), username: closed.leading_bidder });
+  });
+
+  // Pass: the open lot closes with no sale, whatever its bids ('unsold', no order); a lot on screen whose clock
+  // hasn't started is skipped ('unsold' too). Either can Run again later.
+  async function passLot(auctionId, token) {
+    const h = await liveHost(auctionId, token);
+    if (!h || !needOnAir(h.auction)) return;
+    const open = await openLotOf(auctionId);
+    if (open) {
+      const { data: lot, error } = await supabase.rpc('pass_live_lot', { p_item_id: open.id });
+      if (error) { console.error('pass_live_lot failed:', error.code, error.message); return hostErr('Could not pass the lot'); }
+      if (!lot?.id) return hostErr('The lot just closed', 'changed');
+      unwatchLiveLot(lot.id);
+      await touchHost(auctionId);
+      await emitPerViewer(auctionId, 'lot_closed', () => ({ auctionId, item_id: lot.id, lot_number: lot.position + 1, status: 'unsold', passed: true, amount: null, username: null, you_won: false }));
+      hostOk('pass', { item_id: lot.id });
+      console.log(`- Host ${h.user.username} passed lot ${lot.id}`);
+    } else {
+      const id = h.auction.shown_item_id;
+      // ends_at = when it was skipped (the "last lot" in show_state, which can then Run again).
+      const { data: skipped } = id ? await supabase.from('auction_items').update({ status: 'unsold', ends_at: new Date(dbNow()).toISOString() }).eq('id', id).eq('status', 'pending').select('id, position') : { data: null };
+      if (!skipped?.length) return hostErr('No lot is open', 'no_lot_open');
+      await touchHost(auctionId, { shown_item_id: null, autostart_at: null });
+      clearTimeout(autostartTimers.get(auctionId));
+      await emitPerViewer(auctionId, 'lot_closed', () => ({ auctionId, item_id: id, lot_number: skipped[0].position + 1, status: 'unsold', passed: true, amount: null, username: null, you_won: false }));
+      hostOk('pass', { item_id: id });
+    }
+    await emitShowState(auctionId);
+  }
+  on('pass', ({ auctionId, token }) => passLot(auctionId, token));
+  on('pass_lot', ({ auctionId, token }) => passLot(auctionId, token));   // phase 1b name
+
+  // Run again (a Passed or no-bid lot): a copy with the next free lot number, { itemId, next: true (offered next) |
+  // false (at the end) }. Lot numbers never change.
+  on('run_again', async ({ auctionId, itemId, next = false, token }) => {
+    const h = await liveHost(auctionId, token);
+    if (!h || !needOnAir(h.auction)) return;
+    const id = canonicalUuid(itemId);
+    const { data: lot } = id ? await supabase.from('auction_items').select('id, auction_id, position').eq('id', id).maybeSingle() : { data: null };
+    if (!lot || lot.auction_id !== auctionId) return hostErr('That lot is not in this show', 'not_found');
+    const { data: newId, error } = await supabase.rpc('run_again_live_lot', { p_item_id: lot.id, p_next: next === true });
+    if (error) {
+      if (error.code === 'P0001') return hostErr(error.message, 'refused');
+      console.error('run_again_live_lot failed:', error.code, error.message);
+      return hostErr('Could not run the lot again');
+    }
+    await touchHost(auctionId);
+    const { data: copy } = await supabase.from('auction_items').select('*').eq('id', newId).maybeSingle();
+    await emitPerViewer(auctionId, 'lineup_changed', () => ({ auctionId, item: copy ? publicLot(copy) : null, lot_number: copy ? copy.position + 1 : null,
+      next: next === true, run_again_of: { item_id: lot.id, lot_number: lot.position + 1 } }));
+    hostOk('run_again', { item_id: newId, lot_number: copy ? copy.position + 1 : null, next: next === true });
+    await emitShowState(auctionId);
+    console.log(`- Host ${h.user.username} runs lot ${lot.id} again as ${newId}`);
   });
 
   // "Re-run now" on the host's declined-card alert (Albert, Oct 16): { orderId, next: true (offered next) | false (at
@@ -2823,60 +3213,95 @@ io.on('connection', (socket) => {
     if (!o || o.auction_id !== auctionId) return socket.emit('host_error', { message: 'That lot is not in this show' });
     const r = await reofferLiveOrder(o.id, auctionId, next !== false);
     if (r.error) return socket.emit('host_error', { message: r.error, code: 'rerun_refused' });
+    await touchHost(auctionId);
     socket.emit('rerun_ok', { auctionId, order_id: o.id, item_id: r.item_id, lot_number: r.lot_number, next: next !== false });
+    await emitShowState(auctionId);
     console.log(`- Host ${h.user.username} re-ran order ${o.id} as lot ${r.item_id}`);
   });
 
-  // +N seconds on the open lot's clock (the host's "+15 s").
-  on('extend_auction', async ({ auctionId, extraSeconds, token }) => {
+  // Hold: auto-pace waits (the planned clock start is cancelled) until the host taps it again. { on } or a toggle.
+  // Released with a lot on screen and auto-pace on, that lot's clock starts after the talk time.
+  on('hold', async ({ auctionId, on: wanted, token }) => {
     const h = await liveHost(auctionId, token);
-    if (!h) return;
-    const secs = Number(extraSeconds);
-    if (!Number.isInteger(secs) || secs < 1 || secs > 120) return socket.emit('host_error', { message: 'Add 1 to 120 seconds' });
-    const { data: lot } = await supabase.from('auction_items').select('id, auction_id, ends_at').eq('auction_id', auctionId).eq('status', 'open').maybeSingle();
-    if (!lot?.ends_at) return socket.emit('host_error', { message: 'No lot is open' });
-    const newEndsAt = new Date(Date.parse(lot.ends_at) + secs * 1000).toISOString();
-    // Only if nothing moved it since the read (a bid's extension, the hammer): then the host just taps again.
-    const { data: moved } = await supabase.from('auction_items').update({ ends_at: newEndsAt })
-      .eq('id', lot.id).eq('status', 'open').eq('ends_at', lot.ends_at).select('id, auction_id, ends_at');
-    if (!moved?.length) return socket.emit('host_error', { message: 'The lot just changed. Try again.' });
-    watchLiveLot(moved[0]);
-    io.to(auctionId).emit('item_extended', { auctionId, item_id: lot.id, ends_at: moved[0].ends_at, server_now: new Date(dbNow()).toISOString() });
-    console.log(`- Host ${h.user.username} added ${secs}s to lot ${lot.id}`);
+    if (!h || !needOnAir(h.auction)) return;
+    const hold = typeof wanted === 'boolean' ? wanted : !h.auction.on_hold;
+    let autostart = null;
+    if (!hold && h.auction.auto_pace && h.auction.shown_item_id && !(await openLotOf(auctionId))) {
+      const { data: shown } = await supabase.from('auction_items').select('status').eq('id', h.auction.shown_item_id).maybeSingle();
+      if (shown?.status === 'pending') autostart = new Date(Date.now() + LIVE_TALK_MS).toISOString();
+    }
+    await touchHost(auctionId, { on_hold: hold, autostart_at: autostart });
+    if (autostart) armAutostart(auctionId, autostart); else clearTimeout(autostartTimers.get(auctionId));
+    hostOk('hold', { on: hold });
+    await emitShowState(auctionId);
   });
 
-  // Offer the next lot: its pre-bids apply by the proxy rule (never at the top max: brief §1.2) and its clock
-  // starts. { timerSeconds: 60 | 30 | 15 | 5 (default 30), suddenDeath = false }. Refused while another lot is open.
-  on('next_item', async ({ auctionId, token, timerSeconds = LIVE_DEFAULT_CLOCK, suddenDeath = false }) => {
+  // The show's options from the host screen: { auto_pace, clock_seconds } (either).
+  on('set_show_options', async ({ auctionId, auto_pace, clock_seconds, token }) => {
     const h = await liveHost(auctionId, token);
     if (!h) return;
-    if (h.auction.status !== 'live') return socket.emit('host_error', { message: 'Start the show first' });
-    const secs = Number(timerSeconds) || LIVE_DEFAULT_CLOCK;
-    if (!LIVE_CLOCK_PRESETS.includes(secs)) return socket.emit('host_error', { message: 'Clock must be 60, 30, 15 or 5 seconds' });
-    // A lot the host re-ran "next" (offer_next, migration zb) goes before the rest of the lineup.
-    const { data: next } = await supabase.from('auction_items').select('id').eq('auction_id', auctionId).eq('status', 'pending')
-      .order('offer_next', { ascending: false }).order('position', { ascending: true }).limit(1);
-    if (!next?.length) return io.to(auctionId).emit('items_finished', { auctionId });
-    await dropBlockedPrebids(auctionId, next[0].id);
-    await syncDbClock();
-    const { data: lot, error } = await supabase.rpc('open_live_lot', {
-      p_item_id: next[0].id, p_seconds: secs, p_extend_window_seconds: LIVE_EXTEND.window,
-      p_extend_by_seconds: suddenDeath === true ? 0 : LIVE_EXTEND.by, p_opening_min: OPENING_BID_MIN,
-    });
-    if (error) {
-      if (error.code === 'P0001') return socket.emit('host_error', { message: error.message });
-      console.error('open_live_lot failed:', error.code, error.message);
-      return socket.emit('host_error', { message: 'Could not open the lot' });
+    const u = {};
+    if (typeof auto_pace === 'boolean') u.auto_pace = auto_pace;
+    if (clock_seconds !== undefined) {
+      if (!LIVE_CLOCK_PRESETS.includes(Number(clock_seconds))) return hostErr('Clock must be 60, 30, 15 or 5 seconds', 'bad_clock');
+      u.clock_seconds = Number(clock_seconds);
     }
-    watchLiveLot(lot);
-    await markOnAir(auctionId);
-    const clock = liveClock(auctionId, lot.id, Date.parse(lot.ends_at));
-    await emitPerViewer(auctionId, 'item_activated', u => ({
-      item: publicLot(lot), you_lead: !!u && u === lot.leading_bidder, pre_bid_count: lot.pre_bid_count || 0,
-      timer_seconds: secs, sudden_death: suddenDeath === true, ends_at: clock.ends_at, server_now: clock.server_now,
-    }));
-    io.to(auctionId).emit('item_timer_tick', clock);
+    if (!Object.keys(u).length) return hostErr('Nothing to change', 'bad_request');
+    if (u.auto_pace === false) { u.autostart_at = null; clearTimeout(autostartTimers.get(auctionId)); }
+    await touchHost(auctionId, u);
+    hostOk('set_show_options', u);
+    await emitShowState(auctionId);
   });
+
+  // A lot card's clock: { itemId, seconds: 60 | 30 | 15 | 5 | null (the show's default), suddenDeath }. Waiting lots only.
+  on('set_lot_clock', async ({ auctionId, itemId, seconds, suddenDeath, token }) => {
+    const h = await liveHost(auctionId, token);
+    if (!h) return;
+    const u = {};
+    if (seconds !== undefined) {
+      if (seconds !== null && !LIVE_CLOCK_PRESETS.includes(Number(seconds))) return hostErr('Clock must be 60, 30, 15 or 5 seconds', 'bad_clock');
+      u.clock_seconds = seconds === null ? null : Number(seconds);
+    }
+    if (typeof suddenDeath === 'boolean') u.sudden_death = suddenDeath;
+    if (!Object.keys(u).length) return hostErr('Nothing to change', 'bad_request');
+    const id = canonicalUuid(itemId);
+    const { data: set } = id ? await supabase.from('auction_items').update(u).eq('id', id).eq('auction_id', auctionId).eq('status', 'pending').select('id') : { data: null };
+    if (!set?.length) return hostErr('That lot is not waiting to be offered', 'not_pending');
+    await touchHost(auctionId);
+    hostOk('set_lot_clock', { item_id: id, ...u });
+    await emitShowState(auctionId);
+  });
+
+  // Drag to reorder: { itemIds } = every waiting lot, in the new order. Lot numbers don't change (run_order does).
+  on('reorder_lineup', async ({ auctionId, itemIds, token }) => {
+    const h = await liveHost(auctionId, token);
+    if (!h) return;
+    const ids = Array.isArray(itemIds) ? itemIds.map(canonicalUuid) : [];
+    const { data: pending } = await supabase.from('auction_items').select('id').eq('auction_id', auctionId).eq('status', 'pending');
+    const want = new Set((pending || []).map(l => l.id));
+    if (!ids.length || ids.some(x => !x) || new Set(ids).size !== ids.length || ids.length !== want.size || ids.some(x => !want.has(x))) {
+      return hostErr('The lineup changed. Here it is again.', 'lineup_changed');
+    }
+    for (let i = 0; i < ids.length; i++) {
+      await supabase.from('auction_items').update({ run_order: i, offer_next: false }).eq('id', ids[i]).eq('status', 'pending');
+    }
+    await touchHost(auctionId);
+    io.to(auctionId).emit('lineup_changed', { auctionId });
+    hostOk('reorder_lineup');
+    await emitShowState(auctionId);
+  });
+
+  // End show: refused while a lot is open (Albert, Oct 15). No show-level order: every sale is a lot.
+  async function endShow(auctionId, token) {
+    const h = await liveHost(auctionId, token);
+    if (!h) return;
+    const r = await endLiveShow(auctionId);
+    if (r.error) return hostErr(r.error, r.code);
+    hostOk('end_show');
+    console.log(`- Host ${h.user.username} ended show ${auctionId}`);
+  }
+  on('end_show', ({ auctionId, token }) => endShow(auctionId, token));
+  on('end_auction', ({ auctionId, token }) => endShow(auctionId, token));   // phase 1 name
 
   socket.on('disconnect', () => {
     const auctionId = socket.auctionId;
@@ -3878,14 +4303,14 @@ app.post('/admin/orders/group', requireAdmin, normalizeBodyIds({ list: ['order_i
 // ---- Live shows after the show (brief §1.5, review answer 5) ----
 // A show's lots whose buyer's card was declined and never fixed: what the host may re-offer once the show has ended.
 app.get('/admin/live/:id/unpaid', requireAdmin, async (req, res) => {
-  const { data: show, error } = await supabase.from('auctions').select('id, title, mode, status').eq('id', req.params.id).maybeSingle();
+  const { data: show, error } = await supabase.from('auctions').select('*').eq('id', req.params.id).maybeSingle();
   if (error) return dbFailure(req, res, error);
   if (!show || show.mode !== 'live') return res.status(404).json({ error: 'Live show not found' });
   const { data: orders, error: oErr } = await supabase.from('orders').select('id, item_id, item_title, buyer_username, buyer_user_id, total_cents, payment_error, created_at')
     .eq('auction_id', show.id).eq('payment_status', 'failed').is('invoice_id', null).order('created_at');
   if (oErr) return dbFailure(req, res, oErr);
   // can_rerun: back into this show now (on air); can_reoffer: to a later show or a timed auction (after the show).
-  res.json({ show: { id: show.id, title: show.title, status: show.status }, can_rerun: show.status === 'live', can_reoffer: show.status === 'ended', lots: orders || [] });
+  res.json({ show: { id: show.id, title: show.title, status: show.status }, can_rerun: showOnAir(show), can_reoffer: show.status === 'ended', lots: orders || [] });
 });
 
 // Failed live payments per buyer (answer 5: no automatic strike; the admin sees the count and can block a repeat
@@ -3920,6 +4345,124 @@ app.post('/admin/live/orders/:orderId/reoffer', requireAdmin, async (req, res) =
   if (r.error) return res.status(r.status).json({ error: r.error });
   console.log(`Live order ${orderId} re-offered in auction ${target} as lot ${r.item_id}`);
   res.json({ item_id: r.item_id, auction_id: target, lot_number: r.lot_number });
+});
+
+
+// ---- Live show screens (phase 2a). Contracts in API.md. ----
+// The show's state, as the room gets it in `show_state` (for a first load, a reconnect, or the app). Public for a
+// published show; a draft needs the admin or the rehearsal key. you_lead is the caller's own.
+async function liveShowFor(req, res) {
+  if (!LIVE_ENABLED) { res.status(404).json({ error: 'Auction not found' }); return null; }
+  const { data: a, error } = await supabase.from('auctions').select('*').eq('id', req.params.id).maybeSingle();
+  if (error) { dbFailure(req, res, error); return null; }
+  if (!a || a.mode !== 'live' || !canSeeAuction(a, req.user, req.query.rehearsal)) { res.status(404).json({ error: 'Live show not found' }); return null; }
+  return a;
+}
+app.get('/auction/:id/show-state', optionalAuth, async (req, res) => {
+  const a = await liveShowFor(req, res);
+  if (!a) return;
+  try { res.json(showStateFor(await liveShowState(a.id), req.user?.username || null)); } catch (e) { dbFailure(req, res, e); }
+});
+
+// The lineup: the lots still to be offered in order (`waiting`), then the rest (`done`: open, sold, unsold), each
+// with its lot number. The host's lineup sheet; the room's "Up next" is the first three (show_state.up_next).
+app.get('/auction/:id/lineup', optionalAuth, async (req, res) => {
+  const a = await liveShowFor(req, res);
+  if (!a) return;
+  try {
+    const lots = await showLots(a.id);
+    const thumbs = await thumbsFor(lots.map(l => l.image_url));
+    const view = l => ({ ...liveLotView(l, { leader: l.status !== 'pending' }), thumb_url: thumbs(l.image_url),
+      ...(l.status === 'sold' ? { winner: l.leading_bidder, amount: Number(l.current_bid) } : {}),
+      ...(l.status === 'unsold' ? { can_run_again: !lots.some(c => c.run_again_of === l.id && c.status === 'pending') } : {}) });
+    const order = { open: 0, sold: 1, unsold: 1 };
+    res.json({
+      auction_id: a.id, shown_item_id: showOnAir(a) ? a.shown_item_id || null : null,
+      waiting: lots.filter(l => l.status === 'pending').sort(lineupSort).map(view),
+      done: lots.filter(l => l.status !== 'pending').sort((x, y) => (order[x.status] ?? 2) - (order[y.status] ?? 2) || y.position - x.position).map(view),
+    });
+  } catch (e) {
+    dbFailure(req, res, e);
+  }
+});
+
+// The private rehearsal link (draft live shows): a new random key each call, so rotating it shuts the old link.
+// Accounts already in on the old key are sent out of the room.
+app.post('/admin/live/:id/rehearsal-key', requireAdmin, async (req, res) => {
+  const { data: a, error } = await supabase.from('auctions').select('id, mode, status').eq('id', req.params.id).maybeSingle();
+  if (error) return dbFailure(req, res, error);
+  if (!a || a.mode !== 'live') return res.status(404).json({ error: 'Live show not found' });
+  if (a.status !== 'draft') return res.status(400).json({ error: 'Only a draft show has a rehearsal link (publish makes it public)' });
+  const key = require('crypto').randomBytes(18).toString('base64url');
+  const { error: uErr } = await supabase.from('auctions').update({ rehearsal_key: key }).eq('id', a.id).eq('status', 'draft');
+  if (uErr) return dbFailure(req, res, uErr);
+  for (const s of await io.in(a.id).fetchSockets()) {
+    if (s.data?.rehearsal === a.id) { s.emit('auction_error', { code: 'rehearsal_closed', message: 'This rehearsal link was changed. Ask the host for the new one.' }); s.leave(a.id); s.data.rehearsal = null; }
+  }
+  res.json({ rehearsal_key: key, path: `/auction/${a.id}?rehearsal=${key}` });
+});
+
+// The pre-show checklist (host): the lineup and opening bids, lots without a photo, and the accounts in the room right
+// now with whether each can bid (approved, verified card, terms accepted). Camera, light and sound are checked on the
+// host's device.
+app.get('/admin/live/:id/checklist', requireAdmin, async (req, res) => {
+  const { data: a, error } = await supabase.from('auctions').select('*').eq('id', req.params.id).maybeSingle();
+  if (error) return dbFailure(req, res, error);
+  if (!a || a.mode !== 'live') return res.status(404).json({ error: 'Live show not found' });
+  try {
+    const lots = await showLots(a.id);
+    const waiting = lots.filter(l => l.status === 'pending').sort(lineupSort);
+    const names = [...new Set((await io.in(a.id).fetchSockets()).map(s => s.data?.username).filter(u => u && u !== ADMIN_USERNAME && u !== a.host_username))];
+    let buyers = [];
+    if (names.length) {
+      const { data: users } = await supabase.from('users').select('id, username').in('username', names);
+      const ids = (users || []).map(u => String(u.id));
+      const { data: profs } = ids.length ? await supabase.from('profiles').select('user_id, status, stripe_payment_method_id, card_verified_at').in('user_id', ids) : { data: [] };
+      const { data: terms } = ids.length ? await supabase.from('auction_terms_acceptances').select('user_id').eq('auction_id', a.id).in('user_id', ids) : { data: [] };
+      const prof = new Map((profs || []).map(p => [String(p.user_id), p])), took = new Set((terms || []).map(t => String(t.user_id)));
+      buyers = (users || []).map(u => {
+        const p = prof.get(String(u.id));
+        return { username: u.username, approved: p?.status === 'approved', card: !!p?.stripe_payment_method_id, card_verified: !!p?.card_verified_at, terms: took.has(String(u.id)) };
+      }).sort((x, y) => x.username.localeCompare(y.username));
+    }
+    res.json({
+      show: { id: a.id, title: a.title, status: a.status, starts_at: a.starts_at, clock_seconds: a.clock_seconds ?? LIVE_DEFAULT_CLOCK, auto_pace: !!a.auto_pace, rehearsal: a.status === 'draft', has_rehearsal_link: !!a.rehearsal_key },
+      lots: { waiting: waiting.length, total: lots.length, without_photo: waiting.filter(l => !l.image_url).length },
+      lineup: waiting.map(l => ({ id: l.id, lot_number: l.position + 1, title: l.title, starting_bid: Number(l.starting_bid || 0), image_url: l.image_url || null,
+        clock_seconds: l.clock_seconds ?? null, sudden_death: !!l.sudden_death, pre_bid_count: l.pre_bid_count || 0 })),
+      buyers_in_room: buyers,
+    });
+  } catch (e) {
+    dbFailure(req, res, e);
+  }
+});
+
+// After the show (host): the winner list (every sold lot) and the packing list, one box per buyer (the phase 1b
+// order groups; pickup buyers get one entry each, not boxed). Lot numbers, titles, usernames, ship or pickup.
+app.get('/admin/live/:id/packing', requireAdmin, async (req, res) => {
+  const { data: a, error } = await supabase.from('auctions').select('*').eq('id', req.params.id).maybeSingle();   // '*': ended_at (zd)
+  if (error) return dbFailure(req, res, error);
+  if (!a || a.mode !== 'live') return res.status(404).json({ error: 'Live show not found' });
+  const { data: orders, error: oErr } = await supabase.from('orders').select('id, item_id, item_title, buyer_username, buyer_user_id, hammer_cents, total_cents, payment_status, fulfillment_choice, group_id, status, created_at')
+    .eq('auction_id', a.id).neq('payment_status', 'cancelled').order('created_at');
+  if (oErr) return dbFailure(req, res, oErr);
+  const { data: lots } = (orders || []).length ? await supabase.from('auction_items').select('id, position, title').in('id', orders.map(o => o.item_id)) : { data: [] };
+  const num = new Map((lots || []).map(l => [l.id, l.position + 1])), title = new Map((lots || []).map(l => [l.id, l.title]));
+  const row = o => ({ order_id: o.id, lot_number: num.get(o.item_id) ?? null, title: title.get(o.item_id) ?? o.item_title, amount_cents: o.hammer_cents ?? o.total_cents ?? 0, payment_status: o.payment_status || 'unpaid' });
+  const boxes = new Map();
+  for (const o of orders || []) {
+    const pickup = o.fulfillment_choice === 'pickup';
+    const key = pickup ? `pickup:${o.buyer_user_id}` : (o.group_id ? `box:${o.group_id}` : `buyer:${o.buyer_user_id}`);
+    if (!boxes.has(key)) boxes.set(key, { buyer: o.buyer_username, fulfillment: pickup ? 'pickup' : 'shipping', group_id: pickup ? null : o.group_id || null, lots: [] });
+    boxes.get(key).lots.push(row(o));
+  }
+  const list = [...boxes.values()].map(b => ({ ...b, lots: b.lots.sort((x, y) => (x.lot_number ?? 0) - (y.lot_number ?? 0)) }))
+    .sort((x, y) => x.buyer.localeCompare(y.buyer) || x.fulfillment.localeCompare(y.fulfillment));
+  res.json({
+    show: { id: a.id, title: a.title, status: a.status, on_air_at: a.on_air_at || null, ended_at: a.ended_at || null },
+    winners: (orders || []).map(o => ({ ...row(o), buyer: o.buyer_username, fulfillment: o.fulfillment_choice || 'shipping' })).sort((x, y) => (x.lot_number ?? 0) - (y.lot_number ?? 0)),
+    boxes: list,
+  });
 });
 
 app.post('/admin/orders/:id/ungroup', requireAdmin, async (req, res) => {
@@ -3995,8 +4538,8 @@ function canSeeLotMaxes(user, auction) {
 const bidResult = (row, username) => ({ ...publicLot(row), your_status: row && row.leading_bidder === username ? 'winning' : 'outbid' });
 
 app.get('/auction/:id/items', optionalAuth, async (req, res) => {
-  const { data: auction } = await supabase.from('auctions').select('status, host_username').eq('id', req.params.id).single();
-  if (auction?.status === 'draft' && req.user?.username !== ADMIN_USERNAME) {
+  const { data: auction } = await supabase.from('auctions').select('*').eq('id', req.params.id).single();   // '*': rehearsal_key (zd)
+  if (auction?.status === 'draft' && !canSeeAuction(auction, req.user, req.query.rehearsal)) {
     return res.status(404).json({ error: 'Auction not found' });
   }
   const { data, error } = await supabase
@@ -5811,6 +6354,7 @@ async function autoCloseStandardItems() {
     // after-show summaries (phase 1b). Never throws.
     await recoverLiveLots()
     await runLiveHousekeeping()
+    await runLiveShowHousekeeping()
   } catch (e) {
     console.error('autoCloseStandardItems error:', e)
   } finally {
