@@ -1994,27 +1994,44 @@ app.patch('/auction/:id/fulfillment-choice', requireAuth, async (req, res) => {
   res.json({ accepted: true, ...data });
 });
 
-// LiveKit room token (security review #18). It was issued to any logged-in
-// account for any auction - drafts and standard auctions included - with
-// canPublishData for everyone. Now: live-mode auctions only (the only ones with
-// video), not drafts unless you're the admin, only the host or an approved
-// buyer, and only the host may publish (video or data).
-app.get('/auction/:id/token', requireAuth, async (req, res) => {
+// LiveKit room token (security review #18; live phase 2c, audit §4). Who gets what:
+//   the host (the show's host_username, or the admin): publish video, audio and data; identity "host".
+//   the host's second device (?role=controller): subscribe only, hidden, its own identity (LiveKit allows one
+//     connection per identity, so it would otherwise kick the phone off).
+//   everyone else, logged in or not: subscribe only, hidden (not in the participant list), a random identity, never
+//     the username. Usernames reach the room only through our own socket events.
+// Only for a show that is scheduled or on air (an ended show is 404); a draft needs the admin or, for its rehearsal,
+// a logged-in account with the key. A logged-in buyer needs an approved profile, like the room itself (which shows
+// "Complete your profile" otherwise); blocked: 403. Anonymous tokens: a per-IP limit (20 per 10 minutes).
+// The cap of LIVE_ANON_CAP guests is counted where guests are, in the room (join_auction): past it a guest gets
+// login_to_watch and the page shows "Log in to watch" and never asks for a token. A token request isn't tied to a
+// room connection, so it can't be counted here; the per-IP limit is what holds a direct caller.
+const LIVE_ANON_CAP = 60;
+const LIVE_TOKEN_TTL = '6h';
+const anonTokenLimit = limiter({ windowMs: 10 * 60e3, limit: 20, message: 'Too many tries. Wait a few minutes, or log in to watch.' });
+async function anonViewersIn(auctionId) {
+  return (await io.in(auctionId).fetchSockets()).filter(x => !x.data?.username).length;
+}
+app.get('/auction/:id/token', optionalAuth, (req, res, next) => (req.user ? next() : anonTokenLimit(req, res, next)), async (req, res) => {
   if (!LIVE_ENABLED) return res.status(404).json({ error: 'Auction not found' });
-  const { data: auction, error } = await supabase.from('auctions').select('host_username, status, mode, rehearsal_key').eq('id', req.params.id).maybeSingle();
+  const { data: auction, error } = await supabase.from('auctions').select('host_username, status, mode, rehearsal_key, on_air_at, ended_at').eq('id', req.params.id).maybeSingle();
   if (error) return dbFailure(req, res, error);
-  const isAdmin = req.user.username === ADMIN_USERNAME;
-  if (!auction || auction.mode !== 'live' || !canSeeAuction(auction, req.user, req.query.rehearsal)) return res.status(404).json({ error: 'Auction not found' });
-  const isHost = auction.host_username === req.user.username;
-  if (!isHost && !isAdmin) {
+  if (!auction || auction.mode !== 'live' || showEnded(auction) || !canSeeAuction(auction, req.user, req.query.rehearsal)
+      || !['upcoming', 'live', 'draft'].includes(auction.status)) return res.status(404).json({ error: 'Auction not found' });
+  const isHost = !!req.user && (auction.host_username === req.user.username || req.user.username === ADMIN_USERNAME);
+  const controller = isHost && req.query.role === 'controller';
+  if (req.user && !isHost) {
     const { data: profile, error: pErr } = await supabase.from('profiles').select('status').eq('user_id', String(req.user.id)).maybeSingle();
     if (pErr) return dbFailure(req, res, pErr);
-    if (!profile || profile.status !== 'approved') return res.status(403).json({ error: 'Your account must be approved to join the live stream' });
+    if (profile?.status === 'blocked') return res.status(403).json({ error: 'You have been removed from this auction.', code: 'blocked' });
+    if (profile?.status !== 'approved') return res.status(403).json({ error: 'Your account must be approved to join the live stream', code: 'not_approved' });
   }
   if (!process.env.LIVEKIT_API_KEY || !process.env.LIVEKIT_API_SECRET) return res.status(503).json({ error: 'Live video is not configured' });
-  const at = new AccessToken(process.env.LIVEKIT_API_KEY, process.env.LIVEKIT_API_SECRET, { identity: req.user.username, ttl: '4h' });
-  at.addGrant({ roomJoin: true, room: 'auction-' + req.params.id, canPublish: isHost, canSubscribe: true, canPublishData: isHost });
-  res.json({ token: await at.toJwt(), room: 'auction-' + req.params.id, url: process.env.LIVEKIT_URL, isHost });
+  const publisher = isHost && !controller;
+  const identity = publisher ? 'host' : (controller ? 'ctl-' : 'v-') + require('crypto').randomBytes(9).toString('base64url');
+  const at = new AccessToken(process.env.LIVEKIT_API_KEY, process.env.LIVEKIT_API_SECRET, { identity, ttl: LIVE_TOKEN_TTL });
+  at.addGrant({ roomJoin: true, room: 'auction-' + req.params.id, canSubscribe: true, canPublish: publisher, canPublishData: publisher, hidden: !publisher });
+  res.json({ token: await at.toJwt(), room: 'auction-' + req.params.id, url: process.env.LIVEKIT_URL, isHost: publisher, role: publisher ? 'host' : controller ? 'controller' : 'viewer' });
 });
 
 
@@ -2795,6 +2812,12 @@ io.on('connection', (socket) => {
       return;
     }
     if (auction?.status === 'draft' && user && user.username !== ADMIN_USERNAME) socket.data.rehearsal = auctionId;
+    // Logged-out viewers of a live show: at most LIVE_ANON_CAP at a time, so logged-in buyers always get in.
+    if (!user && auction?.mode === 'live' && LIVE_ENABLED && !(await io.in(auctionId).fetchSockets()).some(x => x.id === socket.id)
+        && await anonViewersIn(auctionId) >= LIVE_ANON_CAP) {
+      socket.emit('auction_error', { code: 'login_to_watch', message: 'This show is full for guests. Log in to watch: buyers with an account always get in.' });
+      return;
+    }
 
     // Check approval status for authenticated users
     if (user) {

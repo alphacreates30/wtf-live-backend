@@ -340,6 +340,16 @@ live shows are off):
 - `GET /auction/:id/show-state` → `show_state` above, with the caller's `you_lead`.
 - `GET /auction/:id/lineup` → `{ auction_id, shown_item_id, waiting: [lots in the order they'll be offered], done: [open, then sold / unsold, newest first] }`.
   Each lot: the public lot + `lot_number`, `thumb_url`; sold: `winner`, `amount`; unsold: `can_run_again`.
+- `GET /auction/:id/token[?rehearsal=<key>][&role=controller]` (login optional; phase 2c) → `{ token, room, url, isHost, role }`:
+  the show's LiveKit token. `url` is the LiveKit address to connect to (the server's `LIVEKIT_URL`; clients have no
+  setting of their own). `role` `host` (the show's host or the admin: publishes video, sound and data, identity
+  `host`), `controller` (the host with `?role=controller`: subscribe only, hidden) or `viewer` (everyone else, logged in
+  or not: subscribe only, hidden, a random identity, never the username). Lasts 6 hours. Only scheduled or on-air live
+  shows (ended, timed or unknown: 404); a draft only for the admin, or a logged-in account with its rehearsal key.
+  A logged-in buyer needs an approved profile (403 `not_approved`; blocked: 403 `blocked`). Logged out: 20 tokens
+  per 10 minutes per address (429 `rate_limited`). 503 when LiveKit isn't configured.
+- The room holds at most 60 logged-out viewers per show: past that, `join_auction` answers
+  `auction_error { code: "login_to_watch" }` (logged-in buyers and the host always get in; a reconnect isn't counted twice).
 
 Admin (403 for anyone else):
 - `rehearsal_key` is host-only (`public_view.AUCTION_HOST_ONLY`): only the host/admin ever gets it (their whole auction row, and this route); every other response and socket event leaves it out.
