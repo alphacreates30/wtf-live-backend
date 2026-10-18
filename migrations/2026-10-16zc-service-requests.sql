@@ -1,5 +1,6 @@
 -- STEP zc: service requests (F5, wtf-handoff SERVICES_BRIEF.md): the Services pages' one request form.
--- NOT YET APPLIED ON PRODUCTION. Applied and verified on wtf-test 2026-10-16. Independent of the other migrations.
+-- APPLIED on production by Cowork 2026-10-16 (SQL editor; byte-identical to this file, sha256 df90ddae…87ef; after:
+-- RLS on, anon/authenticated no access, bucket private 5 MB, 0 public tables with RLS off). Applied and verified on wtf-test 2026-10-16. Independent of the other migrations.
 -- Idempotent.
 --
 --   service_requests          one row per form sent: the service (sell, consign, estates, collection_auction, or
