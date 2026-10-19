@@ -6,6 +6,10 @@
 //            fields (no top_pre_bid, reserve_price or leading bidder, by key or by value); Most wanted is hidden below
 //            3 bid-on lots; the empty-site answer; the 10 s cache (server_now still fresh).
 //   /search  lot titles in live + upcoming auctions only; % and _ are literal; short/long queries.
+//   live     (phase 6) live_now only for a PUBLISHED show on air: never a scheduled show, a rehearsal on air (a
+//            draft), an ended show, or with live shows off; a live show is never an "open auction" and none of its
+//            lots are in the rails; a scheduled show is in upcoming with live: true; live_now carries nothing about
+//            bidders or the rehearsal key.
 //   /signup  one row per address (lowercased), the same answer for new / repeat / honeypot, bad address 400, rate
 //            limited per IP. Needs migration u; before it, 503 is asserted and the suite exits 2.
 const crypto = require('crypto');
@@ -125,8 +129,8 @@ const t = iso => Date.parse(iso);
     console.log('\n== GET /home ==');
     const h = await call(fresh.url, '/home');
     ok(h.s === 200, `200 (${h.s})`);
-    ok(Object.keys(h.j).sort().join() === 'closing_schedule,open_auctions,premium_pct,rails,server_now,timezone,upcoming' && Object.keys(h.j.rails).sort().join() === 'ending_soon,first_bid,most_wanted',
-      'top-level shape: server_now, timezone, open_auctions, closing_schedule, premium_pct, rails { ending_soon, most_wanted, first_bid }, upcoming');
+    ok(Object.keys(h.j).sort().join() === 'closing_schedule,live_now,open_auctions,premium_pct,rails,server_now,timezone,upcoming' && Object.keys(h.j.rails).sort().join() === 'ending_soon,first_bid,most_wanted',
+      'top-level shape: server_now, timezone, live_now (phase 6), open_auctions, closing_schedule, premium_pct, rails { ending_soon, most_wanted, first_bid }, upcoming');
     ok(all0(h.j).every(l => typeof h.j.premium_pct[l.auction_id] === 'number') && h.j.premium_pct[A2] === 12.5 && h.j.premium_pct[A1] === 15 && !(D in h.j.premium_pct) && !(E in h.j.premium_pct),
       `premium_pct: each auction's own buyer's premium for every lot shown (A1 ${h.j.premium_pct[A1]}, A2 ${h.j.premium_pct[A2]}); nothing for the draft or ended one`);
     // Open auctions, from the fixtures: soonest ending first; counts and closing times of OPEN lots.
@@ -218,6 +222,40 @@ const t = iso => Date.parse(iso);
       'no live auction: no open auctions or schedule, upcoming leads with the next to open, rails empty (upcoming lots never go in them)');
 
     // ---- Sign-up ----
+    console.log('\n== Live shows (phase 6) ==');
+    {
+      const liveSrv = await boot('home-live', 3524, src, { env: { LIVE_ENABLED: 'true' }, patch: [['const HOME_CACHE_MS = 10_000;', 'const HOME_CACHE_MS = 0;']] });
+      servers.push(liveSrv);
+      const show = (label, status, extra) => mkAuction(label, status, { mode: 'live', starts_at: min(-5), ...extra });
+      const onAir = await show('show on air', 'live', { on_air_at: min(-3), rehearsal_key: 'zzhomekey' + crypto.randomBytes(4).toString('hex') });
+      const sched = await show('show scheduled', 'upcoming', { starts_at: min(90) });
+      const rehearsal = await show('show rehearsal', 'draft', { on_air_at: min(-2) });
+      const ended = await show('show ended', 'live', { on_air_at: min(-90), ended_at: min(-1) });
+      const [showLot] = await mkLots(onAir, [{ name: 'show open', status: 'open', ends_at: min(1), bid_count: 3, current_bid: 12 }]);
+      const h = (await call(liveSrv.url, '/home')).j;
+      ok(h.live_now && h.live_now.id === onAir && h.live_now.title === `${P} show on air` && h.live_now.on_air_at,
+        `live_now: the published show on air (${h.live_now && h.live_now.title})`);
+      ok(Object.keys(h.live_now || {}).sort().join(',') === 'also_on_air,blurb,id,image_url,on_air_at,thumb_url,title' && !JSON.stringify(h.live_now).includes('zzhomekey'),
+        `live_now carries only id, title, blurb, on_air_at, photo, also_on_air (${Object.keys(h.live_now || {}).sort().join(',')}); no rehearsal key`);
+      const ids = [...h.open_auctions.map(a => a.id), ...all0(h).map(l => l.auction_id)];
+      ok(![onAir, sched, rehearsal, ended].some(id => ids.includes(id)) && !all0(h).some(l => l.id === showLot.id),
+        'no live show is an "open auction", and none of its lots is in a rail (its open lot is not "ending soon")');
+      const up = h.upcoming.find(a => a.id === sched);
+      ok(up && up.live === true && !h.upcoming.some(a => [onAir, rehearsal, ended].includes(a.id)) && h.upcoming.filter(a => a.live).every(a => a.id === sched || !made.includes(a.id)),
+        'Coming next: the scheduled show, marked live: true (with Remind me in the page); not the rehearsal, the ended or the on-air show');
+      ok(!JSON.stringify(h).includes(`${P} show rehearsal`) && !JSON.stringify(h).includes(`${P} show ended`), 'the rehearsal and the ended show are nowhere on /home');
+      die(await s.from('auctions').update({ status: 'ended', ended_at: min(0) }).eq('id', onAir).select());
+      const h2 = (await call(liveSrv.url, '/home')).j;
+      ok(!h2.live_now || !made.includes(h2.live_now.id), 'the show ends: live_now is gone');
+      die(await s.from('auctions').update({ status: 'live', ended_at: null }).eq('id', onAir).select());
+      const off = (await call(fresh.url, '/home')).j;
+      ok(off.live_now === null && ![onAir, sched].some(id => [...off.open_auctions, ...off.upcoming].some(a => a.id === id)),
+        'live shows off (production today): live_now null, and no live show anywhere on /home');
+      const notYet = await show('show not yet on air', 'live', {});
+      const h3 = (await call(liveSrv.url, '/home')).j;
+      ok(!(h3.live_now && h3.live_now.id === notYet), 'a show published as live but not yet on air (no on_air_at) is not live_now');
+    }
+
     console.log('\n== POST /signup ==');
     const probe = await s.from('drop_signups').select('id').limit(1);
     tableMissing = !!probe.error;

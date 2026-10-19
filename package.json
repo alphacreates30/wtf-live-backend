@@ -23,7 +23,8 @@
     "multer": "^2.4.0",
     "sharp": "^0.35.5",
     "socket.io": "^4.8.3",
-    "stripe": "^17.7.0"
+    "stripe": "^17.7.0",
+    "web-push": "3.6.7"
   },
   "devDependencies": {
     "pg": "^8.23.0"

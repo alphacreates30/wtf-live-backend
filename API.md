@@ -32,6 +32,11 @@ full story lives on its own page).
 {
   "server_now": "2026-10-01T17:00:00.000Z",   // count down from this, not the device clock
   "timezone": "America/New_York",             // the site's zone: closing_schedule dates are days in this zone
+  "live_now": {                               // live phase 6: a PUBLISHED live show on air, else null (never a draft,
+    "id": "uuid", "title": "…", "blurb": "…",  // a rehearsal, an ended show, or anything while live shows are off)
+    "on_air_at": "ISO", "image_url": "…" | null, "thumb_url": "…" | null,
+    "also_on_air": 0                          // other shows on air at once (the banner shows the latest)
+  },
   "open_auctions": [                          // every live auction, soonest ending first; [] = nothing open
     {
       "id": "uuid", "title": "…",
@@ -132,7 +137,11 @@ No login. The auction rules a page may put into words, so none are hard-coded:
 `{ "soft_close_minutes": 2 }` (a bid in a lot's last N minutes moves its end to N minutes after that bid; the same
 value as `time.soft_close_minutes` on `GET /lots/:id`). `Cache-Control: public, max-age=300`. Also `points` (G2, see
 "Points and promotions" below) and `live_enabled` (G1: `true` only when the backend runs with `LIVE_ENABLED=true`; a page
-hides every live-show control while it is `false`).
+hides every live-show control while it is `false`). And `push_public_key` (live phase 6): the VAPID public key for phone
+alerts, or `null` while the server has no keys (the page then shows no "Turn on phone alerts" button).
+
+Live shows on `/home` (phase 6): a live show is never an "open auction" and none of its lots are in the rails; a
+scheduled one is in `upcoming` with `"live": true` (the page tags it "Live show" and offers Remind me = Follow).
 
 ## `POST /upload-image` (admin)
 
@@ -413,7 +422,8 @@ with `"available": false`. Rate limited per buyer (60 changes a minute).
   `lot_closed` for a closed lot, 400 `watch_limit` beyond 500 watched lots.
 - `DELETE /watch/:itemId` → `{ "watching": false }`.
 - `POST /follow/:auctionId` → `{ "following": true }`. Idempotent. 404 for a draft, 400 `auction_ended`.
-  Following an auction that is already open (or already inside its last 24 hours) marks that reminder done.
+  Following an auction that is already open (or already inside its last 24 hours) marks that reminder done. A live
+  show counts as open only once it is on air (its "starting now" alert waits for Go live); an ended show is 400.
 - `DELETE /follow/:auctionId` → `{ "following": false }`.
 - `GET /me/watching`:
 
@@ -432,9 +442,23 @@ with `"available": false`. Rate limited per buyer (60 changes a minute).
 
 - `GET /me/notification-prefs` → `{ "lot_closing": true, "auction_open": true, "auction_closing": true }`
   (all on by default). `PUT` the same shape (any subset, booleans) → the full set. Outbid emails are separate.
+- **Live show alerts and phone alerts (phase 6, migration ze).** On Go live (never a rehearsal), the show's followers
+  (their `auction_open` switch applies) and every approved buyer with `live_alerts` on get ONE `show_live` email,
+  and one phone alert per device if they turned phone alerts on: at most one per person per channel per show,
+  through the outbox (Resend's daily limit holds; a slow push service never holds up Go live). The email has a
+  one-click "Stop live show alerts" link (token kind `live_alerts`).
+  - `GET /me/live-alerts` → `{ available, live_alerts, push_available }` (`available: false` before ze);
+    `PUT /me/live-alerts { live_alerts: true | false }` (503 before ze, 404 `no_profile`).
+  - `POST /push/subscribe { endpoint, keys: { p256dh, auth } }` → `{ "subscribed": true }` (the browser's
+    `PushSubscription.toJSON()`). Only the browsers' own push services (Google, Mozilla, Apple, Microsoft): any
+    other endpoint is 400 `bad_endpoint`; bad keys 400 `bad_keys`; no keys on the server 503 `push_off`. One row
+    per endpoint (a browser subscribed under another account moves). The answer never echoes the endpoint or keys.
+  - `DELETE /push/subscribe { endpoint }` → `{ "subscribed": false }` (only your own).
+  - A push is `{ title: "We're live: <show>", body, url: "/auction/<id>", tag }`, TTL 15 min; a 404/410 from the push
+    service deletes that subscription.
 - `GET /unsubscribe?token=` (no login) → `{ "ok": true, "kind": "all", "what": "…" }`: describes the link, changes
   nothing (mail scanners open links). `POST /unsubscribe?token=` (no login) → the same, and switches those reminders
-  off. The token is in every reminder's footer link (`<site>/unsubscribe?token=…`) and its `List-Unsubscribe` /
+  off. Kind `all` also turns live show alerts off; kind `live_alerts` turns only those off. The token is in every reminder's footer link (`<site>/unsubscribe?token=…`) and its `List-Unsubscribe` /
   `List-Unsubscribe-Post: List-Unsubscribe=One-Click` headers (which POST to this route). Tokens are signed and don't
   expire; a bad one is 400.
 - `GET /admin/watch-counts?auction_id=` (admin only) → `{ "followers": 3, "lots": { "<item id>": 2 } }`.

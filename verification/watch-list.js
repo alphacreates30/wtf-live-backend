@@ -14,6 +14,13 @@
 //             tomorrow" for followed auctions, merged into the same email; each preference respected; every email
 //             logged in email_send_log; List-Unsubscribe headers; the unsubscribe link works with no login, GET changes
 //             nothing, a tampered token is refused.
+//   show_live (live phase 6) Go live on a published show emails its followers (their "auctions you follow opening"
+//             switch applies) and every approved buyer with live_alerts on: one email each, at most once per show (a
+//             second queue and a second Go live add nothing), never for a rehearsal or a timed auction. An opted-out
+//             buyer who doesn't follow gets nothing; an opted-out follower still gets it; a follower who is also opted
+//             in gets one. Following a live show whose start time passed but isn't on air leaves it pending; the old
+//             reminders leave live shows out. Every show_live email has "Stop live show alerts": it works with no login
+//             and a token altered to name someone else is refused. (Phone alerts: web-push.js.)
 const crypto = require('crypto');
 const fs = require('fs');
 require('./guard')(__filename);
@@ -217,6 +224,90 @@ const count = (hay, needle) => hay.split(needle).length - 1;
       const zRow = die(await s.from('notifications').select('sent_at, error').eq('user_id', b3.id).eq('kind', 'lot_closing').single());
       ok(mails().filter(x => x.to === b3.email).length === 1 && zRow.sent_at && /nothing still open/.test(zRow.error || ''), 'a lot that closed after being queued is skipped: no email, row closed with the reason');
 
+      console.log('\n== "Show starting now" and live show alerts (live phase 6) ==');
+      {
+        const { io: ioc } = require(require('path').resolve(BE, '..', 'wtf-live-frontend', 'node_modules', 'socket.io-client'));
+        const liveSrv = await boot('watch-live', 3544, src, { ...OPTS, env: { ...OPTS.env, LIVE_ENABLED: 'true' } });
+        servers.push(liveSrv);
+        // The host's Go live over a socket; resolves with host_ok / host_error.
+        const goLive = auctionId => new Promise(resolve => {
+          const c = ioc(liveSrv.url, { transports: ['websocket'], forceNew: true });
+          const t = setTimeout(() => { c.close(); resolve(null); }, 8000);
+          c.on('connect', () => c.emit('join_auction', { auctionId, token: admin }));
+          c.on('auction_state', () => c.emit('go_live', { auctionId, token: admin }));
+          for (const ev of ['host_ok', 'host_error']) c.on(ev, p => { clearTimeout(t); c.close(); resolve({ event: ev, payload: p }); });
+        });
+        // An approved buyer profile; live_alerts as given (the column's default is on).
+        const profile = async (u, liveAlerts) => die(await s.from('profiles').insert({ user_id: u.id, full_name: 'ZZ watch', email: u.email, phone: '0', address_line1: '1 ZZ St',
+          city: 'X', state: 'CA', zip: '94000', status: 'approved', ...(liveAlerts === undefined ? {} : { live_alerts: liveAlerts }) }).select());
+        const f1 = await mkUser('f1'), f2 = await mkUser('f2'), f3 = await mkUser('f3'), late = await mkUser('late');
+        const alertsOn = await mkUser('alon'), optedOut = await mkUser('alout'), outFollower = await mkUser('aloutf'), both = await mkUser('alboth');
+        await profile(alertsOn); await profile(optedOut, false); await profile(outFollower, false); await profile(both, true);
+        ok(die(await s.from('profiles').select('live_alerts').eq('user_id', alertsOn.id).single()).live_alerts === true, 'live_alerts is on by default for a new profile');
+        const mine = [f1, f2, f3, late, alertsOn, optedOut, outFollower, both];
+        const Show = await mkAuction('S show', 'upcoming', { mode: 'live', starts_at: at(-2) });
+        const R = await mkAuction('R rehearsal', 'draft', { mode: 'live' });
+        for (const f of [f1, f2, f3, outFollower, both]) {
+          const fr = await call(liveSrv.url, 'POST', `/follow/${Show}`, f.tok);
+          if (fr.s !== 200) ok(false, `follow the show: ${fr.s}`);
+        }
+        const pend = die(await s.from('auction_follows').select('open_notified_at').eq('auction_id', Show));
+        ok(pend.length === 5 && pend.every(x => !x.open_notified_at), 'following a live show whose start time passed but isn\'t on air yet: the "starting now" email stays pending');
+        die(await s.from('notification_prefs').upsert({ user_id: f3.id, auction_open: false }).select());
+        die(await s.from('auction_follows').insert({ user_id: f1.id, auction_id: R }).select());   // a follow from before (a rehearsal must still send nothing)
+        await call(liveSrv.url, 'POST', `/__test/reminders?now=${encodeURIComponent(new Date().toISOString())}`);
+        ok(!die(await s.from('notifications').select('id').eq('kind', 'auction_open').in('user_id', mine.map(u => u.id))).length,
+          'before Go live, the reminder job sends no "is open" for a live show (live shows are left out of the old reminders)');
+        let g = await goLive(Show);
+        ok(g && g.event === 'host_ok', `Go live on the published show (${g && g.event})`);
+        await sleep(3500);
+        const rows = die(await s.from('notifications').select('user_id, kind, channel, payload, sent_at').eq('kind', 'show_live').in('user_id', mine.map(u => u.id)));
+        const got = u => rows.filter(x => x.user_id === u.id && x.channel === 'email' && x.payload.auction_id === Show).length;
+        ok(got(f1) === 1 && got(f2) === 1 && got(f3) === 0, 'followers get one each (f1, f2); f3, whose "auctions you follow opening" switch is off and who has no live alerts, none');
+        ok(got(alertsOn) === 1 && got(optedOut) === 0, 'an approved buyer with live alerts on who doesn\'t follow: one; one who opted out and doesn\'t follow: nothing');
+        ok(got(outFollower) === 1, 'an opted-out buyer who follows the show still gets it (they asked for that show)');
+        ok(got(both) === 1 && rows.filter(x => x.user_id === both.id).length === 1, 'a follower who is also opted in: one email, not two (and no push row: no phone subscription)');
+        const sm = u => mails().filter(x => x.to === u.email);
+        const m1 = sm(f1)[0] || {};
+        ok([f1, f2, alertsOn, outFollower, both].every(u => sm(u).length === 1) && [f3, optedOut].every(u => sm(u).length === 0)
+          && m1.subject === `${P} S show is live now` && (m1.html || '').includes(`https://site.zztest/auction/${Show}`) && rows.every(x => x.sent_at),
+          `the emails go out within seconds of Go live: "${m1.subject}", linking to the show; rows marked sent`);
+        ok(/no buyer's premium/.test(m1.html || '') && !/premium &middot;|\+ 15%/.test(m1.html || '') && /Stop live show alerts/.test(m1.html || ''), 'its wording (placeholder), no premium line, and "Stop live show alerts"');
+        const again = await s.rpc('queue_show_live', { p_auction_id: Show, p_push: false });
+        g = await goLive(Show);
+        await call(liveSrv.url, 'POST', `/__test/reminders?now=${encodeURIComponent(new Date().toISOString())}`);
+        ok(again.data && again.data.email === 0 && g && g.payload.code === 'already_on_air' && die(await s.from('notifications').select('id').eq('kind', 'show_live').in('user_id', mine.map(u => u.id))).length === rows.length
+          && sm(f1).length === 1, 'at most once per show per person: queueing again adds 0, a second Go live is refused, no second email');
+        await call(liveSrv.url, 'POST', `/follow/${Show}`, late.tok);
+        await call(liveSrv.url, 'POST', `/__test/reminders?now=${encodeURIComponent(new Date().toISOString())}`);
+        ok(!die(await s.from('notifications').select('id').eq('user_id', late.id)).length && sm(late).length === 0, 'following while it is on air: no email (they are watching)');
+        g = await goLive(R);
+        await sleep(1500);
+        ok(g && g.event === 'host_ok' && !die(await s.from('notifications').select('id').eq('kind', 'show_live').contains('payload', { auction_id: R })).length,
+          'a rehearsal goes on air: no show_live for anyone, even a follower or an opted-in buyer');
+        const timed = await s.rpc('queue_show_live', { p_auction_id: Up, p_push: false });
+        ok(timed.data && timed.data.email === 0, 'a timed auction: queue_show_live adds nothing');
+
+        // "Stop live show alerts": no login; bound to that account.
+        const link = ((sm(alertsOn)[0] || {}).html || '').match(/unsubscribe\?token=([^"&]+)"[^>]*>Stop live show alerts/);
+        const ltok = link ? decodeURIComponent(link[1]) : '';
+        let u = await call(liveSrv.url, 'GET', `/unsubscribe?token=${encodeURIComponent(ltok)}`);
+        ok(u.s === 200 && u.j.kind === 'live_alerts' && die(await s.from('profiles').select('live_alerts').eq('user_id', alertsOn.id).single()).live_alerts === true,
+          `the link: GET describes it ("${u.j && u.j.what}") and changes nothing`);
+        const [body, sig] = ltok.split('.');
+        const other = Buffer.from(JSON.stringify({ u: both.id, k: 'live_alerts' })).toString('base64url');
+        u = await call(liveSrv.url, 'POST', `/unsubscribe?token=${encodeURIComponent(other + '.' + sig)}`);
+        ok(u.s === 400 && die(await s.from('profiles').select('live_alerts').eq('user_id', both.id).single()).live_alerts === true, "the same signature with someone else's id: 400, their setting untouched");
+        u = await call(liveSrv.url, 'POST', `/unsubscribe?token=${encodeURIComponent(ltok)}`);
+        ok(u.s === 200 && die(await s.from('profiles').select('live_alerts').eq('user_id', alertsOn.id).single()).live_alerts === false && body,
+          'POST, no login: live alerts off for that buyer only');
+        u = await call(liveSrv.url, 'GET', '/me/live-alerts', alertsOn.tok);
+        const u2 = await call(liveSrv.url, 'PUT', '/me/live-alerts', alertsOn.tok, { live_alerts: true });
+        const u3 = await call(liveSrv.url, 'PUT', '/me/live-alerts', alertsOn.tok, { live_alerts: 'yes' });
+        ok(u.s === 200 && u.j.available === true && u.j.live_alerts === false && u2.s === 200 && u2.j.live_alerts === true && u3.s === 400 && (await call(liveSrv.url, 'GET', '/me/live-alerts')).s === 401,
+          'the profile page switch: GET /me/live-alerts reads it, PUT turns it back on, a non-boolean is 400, no login 401');
+      }
+
       console.log('\n== Unsubscribe (no login) ==');
       const token = decodeURIComponent((h.match(/unsubscribe\?token=([^"&]+)/) || [])[1] || '');
       r = await call(U, 'GET', `/unsubscribe?token=${encodeURIComponent(token)}`);
@@ -233,10 +324,13 @@ const count = (hay, needle) => hay.split(needle).length - 1;
     } catch (e) { console.log('ERR', e); fails++; }
   } finally {
     servers.forEach(x => x.stop());
+    // Live show alerts reach every approved buyer with them on, so a show's show_live rows may name other test accounts.
+    for (const id of made.auctions) await s.from('notifications').delete().eq('kind', 'show_live').contains('payload', { auction_id: id });
     for (const id of made.auctions) await s.rpc('delete_auction_cascade', { p_auction_id: id });
     for (const id of made.users) {
       await s.from('notifications').delete().eq('user_id', id);
       await s.from('notification_prefs').delete().eq('user_id', id);
+      await s.from('profiles').delete().eq('user_id', id);
       await s.from('auction_follows').delete().eq('user_id', id);
       await s.from('lot_watches').delete().eq('user_id', id);
       await s.from('users').delete().eq('id', id);
@@ -246,7 +340,8 @@ const count = (hay, needle) => hay.split(needle).length - 1;
     const left = (await s.from('auctions').select('id').like('title', P + '%')).data.length
       + (await s.from('users').select('id').like('username', 'zztest_watch_%')).data.length
       + (await s.from('lot_watches').select('user_id').in('user_id', made.users)).data.length
-      + (await s.from('notifications').select('id').in('user_id', made.users)).data.length;
+      + (await s.from('notifications').select('id').in('user_id', made.users)).data.length
+      + (await s.from('profiles').select('id').in('user_id', made.users)).data.length;
     console.log('\nleftover throwaway rows:', left);
     if (left) fails++;
   }

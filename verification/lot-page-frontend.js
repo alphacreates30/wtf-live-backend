@@ -102,6 +102,15 @@ const auctionIds = [];
 
     process.env.SHARE_META_API_URL = srv.url;
     const fn = await import(pathToFileURL(path.join(FE, 'api', 'share-meta.js')).href + '?t=' + Date.now());
+    // Live phase 6: a live show's card says so (live now, or when it starts); a timed auction's is unchanged.
+    const SITE = 'https://whatthefind.live';
+    const onAirCard = fn.auctionCard({ id: 'x1', title: 'Saturday Night Finds', mode: 'live', status: 'live', description: 'A story.' }, null, SITE);
+    const schedCard = fn.auctionCard({ id: 'x2', title: 'Saturday Night Finds', mode: 'live', status: 'upcoming', starts_at: '2026-10-24T23:00:00Z' }, null, SITE);
+    const timedCard = fn.auctionCard({ id: 'x3', title: 'Tin toys', mode: 'standard', status: 'live', description: 'A shelf of wind-up robots. More.' }, null, SITE);
+    ok(onAirCard.title === 'Live now: Saturday Night Finds' && /^Live now on What The Find/.test(onAirCard.description)
+      && schedCard.title === 'Live show: Saturday Night Finds' && /A live show on What The Find, Sat, Oct 24, 7:00 PM EDT\./.test(schedCard.description)
+      && timedCard.title === 'Tin toys' && timedCard.description === 'A shelf of wind-up robots.',
+      `a live show's share card: "${onAirCard.title}" / "${schedCard.description}"; a timed auction's unchanged (a draft never gets one: the public answer is a 404)`);
     const indexHtml = fs.readFileSync(path.join(FE, 'index.html'), 'utf8');
     const realFetch = global.fetch;
     global.fetch = (url, opts) => (String(url).endsWith('/index.html') ? Promise.resolve(new Response(indexHtml)) : realFetch(url, opts));
@@ -164,8 +173,9 @@ const auctionIds = [];
     console.log('\n== Preview: sample lots ==');
     const sample = await import(pathToFileURL(path.join(FE, 'src', 'preview', 'sampleData.js')).href);
     const home = sample.sampleHome(5);
-    ok(home.open_auctions.every(a => { const d = new Date(a.ends_at); return d.getHours() === 20 && d.getMinutes() === 0; }) && new Date(home.upcoming[0].starts_at).getHours() === 10,
-      'every sample auction ends at 8:00 PM local (upcoming opens 10:00 AM)');
+    ok(home.open_auctions.every(a => { const d = new Date(a.ends_at); return d.getHours() === 20 && d.getMinutes() === 0; }) && new Date(home.upcoming.find(a => !a.live).starts_at).getHours() === 10
+      && new Date(home.upcoming.find(a => a.live).starts_at).getHours() === 19,
+      'every sample auction ends at 8:00 PM local (upcoming opens 10:00 AM; the sample live show starts at 7:00 PM)');
     ok(Object.values(home.rails).flat().every(l => Date.parse(l.ends_at) > Date.now()), 'every sample lot is still open (after 8 PM the days move to tomorrow)');
     const late = new Date(); late.setHours(21, 30, 0, 0);
     const lateHome = sample.sampleHome(1, late.getTime());

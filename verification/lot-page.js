@@ -164,8 +164,9 @@ async function cleanup() {
     // G2 added `points` (on/off and the public rate only; nothing per buyer); G1 added `live_enabled` (true/false).
     const pointsOk = cfg && cfg.points && typeof cfg.points.enabled === 'boolean'
       && Object.keys(cfg.points).every(k => ['enabled', 'points_per_dollar', 'points_per_reward', 'reward_cents'].includes(k));
-    ok(cfg && cfg.soft_close_minutes === L.time.soft_close_minutes && JSON.stringify(Object.keys(cfg)) === '["soft_close_minutes","live_enabled","points"]' && pointsOk && typeof cfg.live_enabled === 'boolean',
-      `GET /config: the same soft-close setting the lot page uses, plus the public live and points switches (${JSON.stringify(cfg)}), nothing else`);
+    ok(cfg && cfg.soft_close_minutes === L.time.soft_close_minutes && JSON.stringify(Object.keys(cfg)) === '["soft_close_minutes","live_enabled","push_public_key","points"]' && pointsOk && typeof cfg.live_enabled === 'boolean'
+      && (cfg.push_public_key === null || /^[A-Za-z0-9_-]{80,100}$/.test(cfg.push_public_key)),
+      `GET /config: the same soft-close setting the lot page uses, plus the public live and points switches and the phone-alert PUBLIC key (${JSON.stringify(cfg)}), nothing else`);
     ok(L.fulfilment && L.fulfilment.pickup && L.fulfilment.pickup.town === 'Miami, FL' && L.fulfilment.pickup.free === true && L.fulfilment.shipping && L.fulfilment.shipping.priced === 'after_auction' && L.fulfilment.shipping.estimate === null,
       'fulfilment: pickup town (its own column) only, shipping priced after the auction, no estimate (lots have no weight/size)');
     ok(L.nav && L.nav.prev === null && L.nav.next && L.nav.next.id === lot1.id && L.nav.next.number === 2, 'nav: first lot has no prev; next = lot 2');

@@ -16,6 +16,7 @@ const aiLots = require('./ai_lots');
 const { makeThumb, thumbPathFor } = require('./thumbs');
 const lotRules = require('./lot_rules');
 const chatFilter = require('./chat_filter');
+const webpush = require('web-push');
 const { publicAuction, publicLot, auctionFor } = require('./public_view');
 const rewardsLib = require('./rewards');
 
@@ -2158,6 +2159,94 @@ const userSockets = {}; // userId (string) -> Set of socket IDs
 const LIVE_CLOCK_PRESETS = [60, 30, 15, 5];  // seconds per lot, the host's choice (Albert, Oct 15); the database allows 5-600
 const LIVE_DEFAULT_CLOCK = 30;
 // The show is on air from the host's start (or the first lot offered): stops pre-bid expiry (migration zb).
+// "Show starting now" (phase 6, audit §6; LIVE_SHOWS_PHASE5_BRIEF.md §2). When a published show goes on air, ONE
+// place decides who hears about it: migration ze's queue_show_live writes the outbox rows for the show's followers
+// (their "auctions you follow opening" switch applies) plus every approved buyer with live_alerts on: an email row
+// each, and a push row for each who has a phone-alert subscription (only when push is configured). At most one per
+// person per channel per show; never a rehearsal, a timed auction, the host or the admin. The outbox jobs send them
+// (the email within Resend's daily limit, the push in the background), started now so nobody waits for the next
+// 30-second run, and a slow push service never holds up Go live. The phone app's push channel plugs in here later.
+async function notifyShowLive(show) {
+  try {
+    const { data, error } = await supabase.rpc('queue_show_live', { p_auction_id: show.id, p_push: pushReady });
+    if (error) { console.error('queue_show_live failed:', show.id, error.code, error.message); return; }
+    const n = data || {};
+    if (n.email || n.push) {
+      console.log(`Show ${show.id} on air: ${n.email || 0} email(s) and ${n.push || 0} phone alert(s) queued`);
+      runReminders().catch(e => console.error('reminders after go live failed:', e.message));
+      runPushes().catch(e => console.error('phone alerts after go live failed:', e.message));
+    }
+  } catch (e) { console.error('notifyShowLive failed:', show.id, e.message); }
+}
+
+// ---- Phone alerts by web push (phase 6). Quietly off until VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY are set: no
+// button (GET /config push_public_key is null), no push rows, and the email still goes out. The keys are Albert's
+// to set on Railway; never logged.
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:whatthefind.co@gmail.com';
+let pushReady = false;
+if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
+  try { webpush.setVapidDetails(VAPID_SUBJECT, process.env.VAPID_PUBLIC_KEY, process.env.VAPID_PRIVATE_KEY); pushReady = true; }
+  catch (e) { console.error('Phone alerts stay off: the VAPID keys were not accepted (' + e.message.split('.')[0] + ')'); }
+}
+// Only the browsers' own push services: a subscription is a URL this server will POST to, so anything else (an
+// internal address, any other site) is refused. PUSH_TEST_HOSTS adds hosts for the local suites only.
+const PUSH_HOSTS = [/(^|\.)fcm\.googleapis\.com$/, /^android\.googleapis\.com$/, /(^|\.)push\.services\.mozilla\.com$/, /(^|\.)push\.apple\.com$/, /(^|\.)notify\.windows\.com$/];
+const PUSH_TEST_HOSTS = (process.env.PUSH_TEST_HOSTS || '').split(',').map(x => x.trim()).filter(Boolean);
+function pushEndpointOk(endpoint) {
+  if (typeof endpoint !== 'string' || endpoint.length > 1000) return false;
+  let u; try { u = new URL(endpoint); } catch { return false; }
+  if (u.protocol !== 'https:' || u.username || u.password) return false;
+  return PUSH_HOSTS.some(re => re.test(u.hostname)) || PUSH_TEST_HOSTS.includes(u.host);
+}
+const B64U = /^[A-Za-z0-9_-]+={0,2}$/;
+// Before migration ze profiles.live_alerts doesn't exist: PostgREST says PGRST204 (a payload column), Postgres 42703.
+const columnMissing = e => !!e && ['42703', 'PGRST204'].includes(e.code);
+let pushRunning = false;
+// Sends the unsent push rows (claim_notifications 'push'): each to every subscription of that buyer. A 404/410 from
+// the push service means the subscription is gone: deleted. Another failure: the row is retried (3 attempts at most).
+async function runPushes() {
+  if (!pushReady || pushRunning) return { skipped: true };
+  pushRunning = true;
+  const out = { sent: 0, gone: 0, failed: 0, skipped: 0 };
+  try {
+    const { data: rows, error } = await supabase.rpc('claim_notifications', { p_channel: 'push', p_limit: 500 });
+    if (error) { if (!watchMissing(error)) console.error('claim_notifications (push) failed:', error.code, error.message); return out; }
+    const shows = new Map();
+    for (const r of rows || []) {
+      const done = patch => supabase.from('notifications').update(patch).eq('id', r.id);
+      const id = r.payload && r.payload.auction_id;
+      if (r.kind !== 'show_live' || !id) { await done({ sent_at: new Date().toISOString(), error: 'not a phone alert' }); out.skipped++; continue; }
+      if (!shows.has(id)) shows.set(id, (await supabase.from('auctions').select('*').eq('id', id).maybeSingle()).data);
+      const a = shows.get(id);
+      if (!a || a.mode !== 'live' || a.status !== 'live' || a.ended_at) { await done({ sent_at: new Date().toISOString(), error: 'the show is not on air any more' }); out.skipped++; continue; }
+      const { data: subs, error: sErr } = await supabase.from('push_subscriptions').select('id, endpoint, p256dh, auth').eq('user_id', r.user_id);
+      if (sErr) { await done({ claimed_at: null, error: 'could not read subscriptions' }); out.failed++; continue; }
+      if (!subs.length) { await done({ sent_at: new Date().toISOString(), error: 'no subscription' }); out.skipped++; continue; }
+      const payload = JSON.stringify({ title: `We're live: ${a.title}`, body: 'Tap to watch and bid.', url: `/auction/${a.id}`, tag: `show-${a.id}` });
+      let delivered = 0, retry = false;
+      for (const sub of subs) {
+        if (!pushEndpointOk(sub.endpoint)) { await supabase.from('push_subscriptions').delete().eq('id', sub.id); out.gone++; continue; }
+        try {
+          await webpush.sendNotification({ endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } }, payload, { TTL: 900, urgency: 'high', timeout: 10000 });
+          delivered++;
+          await supabase.from('push_subscriptions').update({ last_ok_at: new Date().toISOString() }).eq('id', sub.id);
+        } catch (e) {
+          if (e.statusCode === 404 || e.statusCode === 410) { await supabase.from('push_subscriptions').delete().eq('id', sub.id); out.gone++; }
+          else { retry = true; console.error('phone alert failed:', e.statusCode || '', String(e.message).slice(0, 120)); }
+        }
+      }
+      if (delivered) { await done({ sent_at: new Date().toISOString(), error: null }); out.sent++; }
+      else if (retry) { await done({ claimed_at: null, error: 'push service did not accept it' }); out.failed++; }
+      else { await done({ sent_at: new Date().toISOString(), error: 'every subscription was gone' }); out.skipped++; }
+    }
+    if (out.sent || out.failed || out.gone) console.log(`Phone alerts: ${out.sent} sent, ${out.failed} failed, ${out.gone} subscriptions gone`);
+    return out;
+  } catch (e) {
+    console.error('runPushes failed:', e.message);
+    return out;
+  } finally { pushRunning = false; }
+}
+
 async function markOnAir(auctionId) {
   await syncDbClock();
   const { error } = await supabase.from('auctions').update({ on_air_at: new Date(dbNow()).toISOString() }).eq('id', auctionId).is('on_air_at', null);
@@ -3253,6 +3342,7 @@ io.on('connection', (socket) => {
     if (!ok) return hostErr('This show has ended or is not published', 'not_scheduled');
     io.to(auctionId).emit('auction_started', { auctionId, ...(a.status === 'draft' ? { rehearsal: true } : {}) });
     hostOk('go_live');
+    if (a.status !== 'draft') notifyShowLive({ id: auctionId, title: a.title });   // never for a rehearsal; not awaited (never throws)
     await emitShowState(auctionId);
     console.log(`- Host ${h.user.username} put show ${auctionId} on air${a.status === 'draft' ? ' (rehearsal)' : ''}`);
   }
@@ -4923,7 +5013,7 @@ app.get('/config', async (req, res) => {
   // G2: whether points are on and the one-sentence numbers ("a point for every $1 you win; every 250 is $25 off"),
   // so public pages can show the points line. Nothing per buyer.
   const p = await rewards.settings();
-  res.json({ soft_close_minutes: SOFT_CLOSE_MINUTES, live_enabled: LIVE_ENABLED,
+  res.json({ soft_close_minutes: SOFT_CLOSE_MINUTES, live_enabled: LIVE_ENABLED, push_public_key: pushReady ? process.env.VAPID_PUBLIC_KEY : null,
     points: p.enabled ? { enabled: true, points_per_dollar: p.points_per_dollar, points_per_reward: p.points_per_reward, reward_cents: p.reward_cents } : { enabled: false } });
 });
 
@@ -5134,12 +5224,18 @@ async function lotsOf(auctionIds, columns) {
 
 async function buildHome() {
   const nowMs = Date.now(), now = new Date(nowMs).toISOString();
-  const { data: auctions, error } = await supabase.from('auctions')
-    .select('id, title, description, status, starts_at, ends_at, image_url, buyers_premium_pct')
+  const { data: rows, error } = await supabase.from('auctions')
+    .select('*')   // '*': mode, on_air_at, ended_at (live shows; ended_at only after migration zd)
     .in('status', ['live', 'upcoming']);
   if (error) throw error;
-  const live = [], upcoming = [];
-  for (const a of auctions || []) (auctionPhase(a, nowMs) === 'live' ? live : upcoming).push(a);
+  // Live shows (phase 6, audit §6) are not timed auctions: no "Open now" card, none of their lots in the rails. A
+  // published show on air is live_now (the "Live now" banner); a scheduled one is in Coming next (live: true), with
+  // Remind me. Drafts never (the query above), rehearsals never (drafts), and nothing of either with live shows off.
+  const auctions = (rows || []).filter(a => a.mode !== 'live');
+  const shows = LIVE_ENABLED ? (rows || []).filter(a => a.mode === 'live' && !a.ended_at) : [];
+  const onAir = shows.filter(a => a.status === 'live' && a.on_air_at).sort((a, b) => Date.parse(b.on_air_at) - Date.parse(a.on_air_at));
+  const live = [], upcoming = shows.filter(a => a.status === 'upcoming');
+  for (const a of auctions) (auctionPhase(a, nowMs) === 'live' ? live : upcoming).push(a);
   const liveIds = live.map(a => a.id);
   const titles = Object.fromEntries((auctions || []).map(a => [a.id, a.title]));
 
@@ -5175,7 +5271,7 @@ async function buildHome() {
   const collage = Object.fromEntries(live.map(a => [a.id, [...new Set([a.image_url, ...per[a.id].photos].filter(Boolean))].slice(0, OPEN_AUCTION_IMAGES)]));
   const wantedLots = (wanted.data || []).length >= MOST_WANTED_MIN_LOTS ? wanted.data : [];
   const upcomingOut = upcoming.filter(a => a.starts_at).slice(0, HOME_UPCOMING_MAX);
-  const thumb = await thumbsFor([...(ending.data || []), ...wantedLots, ...(first.data || []), ...upcomingOut]
+  const thumb = await thumbsFor([...(ending.data || []), ...wantedLots, ...(first.data || []), ...upcomingOut, ...onAir.slice(0, 1)]
     .map(x => x.image_url).concat(...Object.values(collage)));
   const lot = homeLot(thumb, titles);
 
@@ -5194,8 +5290,11 @@ async function buildHome() {
   }
   closing_schedule.sort((x, y) => Date.parse(x.first_close) - Date.parse(y.first_close));
 
+  const show = onAir[0];
   return {
     timezone: SITE_TIMEZONE,
+    live_now: show ? { id: show.id, title: show.title, blurb: blurbOf(show.description), on_air_at: isoOrNull(show.on_air_at),
+      image_url: show.image_url || null, thumb_url: thumb(show.image_url), also_on_air: onAir.length - 1 } : null,
     open_auctions: live.map(a => {
       const p = per[a.id];
       return {
@@ -5217,6 +5316,7 @@ async function buildHome() {
       id: a.id, title: a.title, blurb: blurbOf(a.description),
       starts_at: isoOrNull(a.starts_at), ends_at: isoOrNull(a.ends_at),
       image_url: a.image_url || null, thumb_url: thumb(a.image_url),
+      ...(a.mode === 'live' ? { live: true } : {}),
     })),
   };
 }
@@ -5340,15 +5440,18 @@ app.delete('/watch/:itemId', requireAuth, LIMITS.watch, async (req, res) => {
 });
 
 app.post('/follow/:auctionId', requireAuth, LIMITS.watch, async (req, res) => {
-  const { data: auction } = await supabase.from('auctions').select('id, status, starts_at').eq('id', req.params.auctionId).maybeSingle();
+  const { data: auction } = await supabase.from('auctions').select('id, status, starts_at, mode, on_air_at, ended_at').eq('id', req.params.auctionId).maybeSingle();
   if (!auction || auction.status === 'draft') return res.status(404).json({ error: 'Auction not found' });
-  if (auction.status === 'ended') return res.status(400).json({ error: 'This auction has ended', code: 'auction_ended' });
+  if (auction.status === 'ended' || auction.ended_at) return res.status(400).json({ error: 'This auction has ended', code: 'auction_ended' });
   // Following an auction that is already open (or already inside its last 24
   // hours) marks that reminder as done: the buyer is looking at it right now.
   const nowMs = Date.now(), nowIso = new Date(nowMs).toISOString();
-  const open = auctionPhase(auction, nowMs) === 'live';
+  // A live show is open once it is on air (its start time passing isn't enough: its "starting now" email waits for
+  // Go live). Its lots have no 24-hour close, so no "closing" reminder either.
+  const live = auction.mode === 'live';
+  const open = live ? auction.status === 'live' && !!auction.on_air_at : auctionPhase(auction, nowMs) === 'live';
   let closingSoon = false;
-  if (open) {
+  if (open && !live) {
     const { data: first } = await supabase.from('auction_items').select('ends_at').eq('auction_id', auction.id)
       .not('status', 'in', '("sold","unsold")').gt('ends_at', nowIso).order('ends_at', { ascending: true }).limit(1);
     closingSoon = !!(first && first[0] && Date.parse(first[0].ends_at) - nowMs <= 24 * 3600e3);
@@ -5462,6 +5565,48 @@ async function prefsFor(userId) {
   return { prefs: { lot_closing: data?.lot_closing ?? true, auction_open: data?.auction_open ?? true, auction_closing: data?.auction_closing ?? true } };
 }
 
+// Phone alerts (phase 6): this browser's push subscription for the logged-in buyer. The answer never echoes the
+// endpoint or the keys. A browser that was subscribed under another account moves to this one (one endpoint, one row).
+app.post('/push/subscribe', requireAuth, LIMITS.watch, async (req, res) => {
+  if (!pushReady) return res.status(503).json({ error: 'Phone alerts are not available yet.', code: 'push_off' });
+  const { endpoint, keys } = req.body || {};
+  if (!pushEndpointOk(endpoint)) return res.status(400).json({ error: 'This browser\'s push address is not one we can use.', code: 'bad_endpoint' });
+  const p256dh = keys && keys.p256dh, auth = keys && keys.auth;
+  if (typeof p256dh !== 'string' || typeof auth !== 'string' || !B64U.test(p256dh) || !B64U.test(auth) || p256dh.length > 200 || auth.length > 100) {
+    return res.status(400).json({ error: 'The subscription keys are missing or not valid.', code: 'bad_keys' });
+  }
+  const { error } = await supabase.from('push_subscriptions').upsert({ user_id: req.user.id, endpoint, p256dh, auth,
+    user_agent: String(req.get('user-agent') || '').slice(0, 200) || null }, { onConflict: 'endpoint' });
+  if (watchMissing(error)) return res.status(503).json({ error: 'Phone alerts are not available yet.', code: 'push_off' });
+  if (error) return dbFailure(req, res, error);
+  res.json({ subscribed: true });
+});
+app.delete('/push/subscribe', requireAuth, LIMITS.watch, async (req, res) => {
+  const endpoint = (req.body || {}).endpoint;
+  if (typeof endpoint !== 'string' || !endpoint) return res.status(400).json({ error: 'endpoint is required' });
+  const { error } = await supabase.from('push_subscriptions').delete().eq('user_id', req.user.id).eq('endpoint', endpoint);
+  if (watchMissing(error)) return res.json({ subscribed: false });
+  if (error) return dbFailure(req, res, error);
+  res.json({ subscribed: false });
+});
+
+// "Tell me when any show goes live" (profiles.live_alerts, migration ze; on by default). available: false before ze.
+app.get('/me/live-alerts', requireAuth, async (req, res) => {
+  const { data, error } = await supabase.from('profiles').select('*').eq('user_id', String(req.user.id)).maybeSingle();
+  if (error) return dbFailure(req, res, error);
+  const has = !!data && 'live_alerts' in data;
+  res.json({ available: has, live_alerts: has ? !!data.live_alerts : null, push_available: pushReady });
+});
+app.put('/me/live-alerts', requireAuth, LIMITS.watch, async (req, res) => {
+  const v = (req.body || {}).live_alerts;
+  if (typeof v !== 'boolean') return res.status(400).json({ error: 'live_alerts must be true or false' });
+  const { data, error } = await supabase.from('profiles').update({ live_alerts: v }).eq('user_id', String(req.user.id)).select('live_alerts');
+  if (columnMissing(error)) return res.status(503).json({ error: 'Live show alerts are not available yet.' });
+  if (error) return dbFailure(req, res, error);
+  if (!data.length) return res.status(404).json({ error: 'Complete your buyer profile first.', code: 'no_profile' });
+  res.json({ available: true, live_alerts: data[0].live_alerts, push_available: pushReady });
+});
+
 app.get('/me/notification-prefs', requireAuth, async (req, res) => {
   const { prefs, error } = await prefsFor(req.user.id);
   if (watchMissing(error)) return watchUnavailable(res);
@@ -5505,11 +5650,12 @@ function readUnsubscribeToken(token) {
   if (got.length !== want.length || !crypto.timingSafeEqual(got, want)) return null;
   try {
     const { u, k } = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
-    if (!canonicalUuid(u) || !(k === 'all' || REMINDER_KINDS.includes(k))) return null;
+    if (!canonicalUuid(u) || !(k === 'all' || k === 'live_alerts' || REMINDER_KINDS.includes(k))) return null;
     return { userId: canonicalUuid(u), kind: k };
   } catch { return null; }
 }
-const unsubscribeWhat = kind => (kind === 'all' ? 'reminder emails (watched lots and followed auctions)' : REMINDER_LABELS[kind]);
+const unsubscribeWhat = kind => (kind === 'all' ? 'reminder emails (watched lots, followed auctions and live show alerts)'
+  : kind === 'live_alerts' ? 'live show alerts (an email whenever any show goes live)' : REMINDER_LABELS[kind]);
 
 app.get('/unsubscribe', (req, res) => {
   const t = readUnsubscribeToken(req.query.token);
@@ -5520,6 +5666,12 @@ app.get('/unsubscribe', (req, res) => {
 app.post('/unsubscribe', async (req, res) => {
   const t = readUnsubscribeToken(req.query.token || req.body?.token);
   if (!t) return res.status(400).json({ error: 'This unsubscribe link is not valid.' });
+  // Live show alerts live on the profile (migration ze). Before ze the column doesn't exist: nothing to turn off.
+  if (t.kind === 'live_alerts' || t.kind === 'all') {
+    const { error: lErr } = await supabase.from('profiles').update({ live_alerts: false }).eq('user_id', t.userId);
+    if (lErr && !columnMissing(lErr)) return dbFailure(req, res, lErr);
+    if (t.kind === 'live_alerts') return res.json({ ok: true, kind: t.kind, what: unsubscribeWhat(t.kind) });
+  }
   const off = t.kind === 'all' ? Object.fromEntries(REMINDER_KINDS.map(k => [k, false])) : { [t.kind]: false };
   const { error } = await supabase.from('notification_prefs').upsert({ user_id: t.userId, ...off, updated_at: new Date().toISOString() }, { onConflict: 'user_id' });
   if (watchMissing(error)) return watchUnavailable(res);
@@ -5902,10 +6054,11 @@ async function sendReminderEmail(user, rows, nowMs) {
   const lotIds = [...new Set(rows.filter(r => r.kind === 'lot_closing').map(r => r.payload.item_id))];
   const openIds = [...new Set(rows.filter(r => r.kind === 'auction_open').map(r => r.payload.auction_id))];
   const closingIds = [...new Set(rows.filter(r => r.kind === 'auction_closing').map(r => r.payload.auction_id))];
-  const auctionIds = [...new Set([...openIds, ...closingIds])];
+  const showIds = [...new Set(rows.filter(r => r.kind === 'show_live').map(r => r.payload.auction_id))];
+  const auctionIds = [...new Set([...openIds, ...closingIds, ...showIds])];
   const [{ data: lotsRaw }, { data: auctions }] = await Promise.all([
     lotIds.length ? supabase.from('auction_items').select('id, auction_id, position, title, current_bid, bid_count, ends_at, status, leading_bidder').in('id', lotIds) : { data: [] },
-    auctionIds.length ? supabase.from('auctions').select('id, title, description, status, starts_at, ends_at, image_url, buyers_premium_pct').in('id', auctionIds) : { data: [] },
+    auctionIds.length ? supabase.from('auctions').select('*').in('id', auctionIds) : { data: [] },   // '*': mode, ended_at (live shows)
   ]);
   const isOpenLot = l => !['sold', 'unsold'].includes(l.status) && l.ends_at && Date.parse(l.ends_at) > nowMs;
   const closingLots = (lotsRaw || []).filter(isOpenLot).sort((a, b) => Date.parse(a.ends_at) - Date.parse(b.ends_at));
@@ -5928,6 +6081,17 @@ async function sendReminderEmail(user, rows, nowMs) {
   }
 
   const parts = [], subjects = [];
+  // A show that is on air right now comes first (it won't wait). Already over by the time this goes: nothing.
+  for (const id of showIds) {
+    const a = aById[id];
+    if (!a || a.mode !== 'live' || a.status !== 'live' || a.ended_at) continue;
+    subjects.push(`${a.title} is live now`);
+    parts.push({ title: `${escapeHtml(a.title)} is live now`, body: `
+      <p style="margin:0 0 8px;color:#444;">The show has started. Come watch and bid: each lot sells on a short clock, and there's no buyer's premium.</p>
+      <p><a href="${SITE_URL}/auction/${a.id}" style="background:#9E2B20;color:#fff;padding:9px 16px;border-radius:6px;text-decoration:none;">Watch the show</a></p>
+      <p style="margin:12px 0 0;font-size:12px;color:#666;">You get this because you follow this show or asked to hear when any show goes live.
+        <a href="${SITE_URL}/unsubscribe?token=${encodeURIComponent(unsubscribeToken(user.id, 'live_alerts'))}" style="color:#666;">Stop live show alerts</a></p>` });
+  }
   if (closingLots.length) {
     subjects.push(closingLots.length === 1 ? `"${closingLots[0].title}" closes within the hour` : `${closingLots.length} lots you're watching close within the hour`);
     parts.push({ title: 'Closing within the hour', body: `
@@ -5991,7 +6155,8 @@ async function runReminders(now = new Date()) {
       try {
         const { data: user } = await supabase.from('users').select('id, username, email, deleted_at').eq('id', userId).maybeSingle();
         const { prefs } = await prefsFor(userId);
-        const wanted = list.filter(r => !prefs || prefs[r.kind] !== false);
+        // show_live follows the "auctions you follow opening" switch.
+        const wanted = list.filter(r => !prefs || prefs[r.kind === 'show_live' ? 'auction_open' : r.kind] !== false);
         if (!user || user.deleted_at || !user.email || !wanted.length) {
           await done({ sent_at: new Date().toISOString(), error: !user || user.deleted_at ? 'account deleted' : !user.email ? 'no email on file' : 'reminder switched off' });
           out.skipped++; continue;
@@ -6556,8 +6721,10 @@ async function autoCloseStandardItems() {
     // Step 3: bill any orders an earlier bug left without an invoice.
     await invoiceStrandedOrders()
 
-    // Step 4: watch-list reminders (F3). Never throws; does nothing before migration w.
+    // Step 4: watch-list reminders (F3). Never throws; does nothing before migration w. Then the phone alerts (phase
+    // 6; nothing without the VAPID keys or before migration ze).
     await runReminders()
+    await runPushes()
 
     // Step 5: points expiry + reminders (G2). Hourly; never throws; does nothing with points off.
     await runPointsHousekeeping()

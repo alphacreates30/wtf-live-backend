@@ -160,8 +160,15 @@ global.SRV = srv;
       hammer_cents: 800, premium_cents: 0, total_cents: 800, status: 'pending', payment_status: 'unpaid', fulfillment_choice: 'shipping', created_at: dbAt(-120e3) }).select());
     const srv3 = await boot('live-hammer-3', 3633, src, { env: ENV, preload: STUBS, patch: PATCH, timers: 'real' });
     servers.push(srv3);
-    await sleep(4000);
-    const r1 = (await orderOf(R1))[0], r2 = (await orderOf(R2))[0];
+    // Wait on the real condition (both orders paid), not a fixed delay: recovery charges them one after the other
+    // (800 ms each at the fake Stripe) and a fixed 4 s failed once under a full run's load (2026-10-19, "charging").
+    let r1, r2;
+    for (let i = 0; i < 40; i++) {
+      r1 = (await orderOf(R1))[0]; r2 = (await orderOf(R2))[0];
+      if (r1 && r2 && r1.payment_status === 'paid' && r2.payment_status === 'paid') break;
+      await sleep(500);
+    }
+    await sleep(1000);   // and nothing charges either one a second time
     ok(r1 && r1.payment_status === 'paid' && charges().some(c => c.md.order_id === r1.id && c.amount === 600), `a sold live lot with no order: order created and charged $6 (${r1 && r1.payment_status})`);
     ok(r2 && r2.payment_status === 'paid' && charges().filter(c => c.md.order_id === r2.id).length === 1, `a live order never charged: charged once (${r2 && r2.payment_status})`);
   } catch (e) {

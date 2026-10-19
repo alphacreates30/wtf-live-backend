@@ -353,6 +353,17 @@ alone, like the phase 1 live suites.
 | `live-before-ze.js` | New. The server with every ze name renamed away (as production before ze), live shows off: boot and the 30-second job log nothing bad; timed chat sent, heard, stored, in GET /chat and the history; the filters apply to timed chat; a timed bid; /home and /config; every host chat event answers live_off. |
 | `chat-standing.js` | Unchanged and green. |
 
+
+**Live shows (G1) phase 6: discovery, live show alerts, phone alerts** (2026-10-18). Migration ze (with phase 5).
+
+| Suite | Proves |
+|---|---|
+| `web-push.js` | New. A fake HTTPS push service on this machine that decrypts each push with the subscription's own keys (RFC 8291). /config's public key (null without keys); subscribe: login, only the browsers' push hosts (http, another site, an internal address, credentials refused), valid keys, nothing echoed, one row per endpoint, moving between accounts, unsubscribe only your own; Go live: one push per device to the follower, the opted-in buyer (two devices) and the follower who is also opted in, none for an opted-out non-follower or a pending account; the alert's words and link; the VAPID header; a 410 deletes that subscription; once per show per person; none for a rehearsal; no keys = email only; endpoints, keys and the private key in no answer and no log; delete_account removes them. The site's code: permission only from a tap, the iPhone how-to, the service worker's same-site links, the standalone manifest, where the button is. |
+| `watch-list.js` | Extended: show_live to followers (their switch applies) and opted-in approved buyers, one each, at most once per show, never a rehearsal or a timed auction; an opted-out non-follower gets nothing, an opted-out follower still gets it, a follower who is also opted in gets one; a live show isn't marked open by a follow before Go live; the old reminders leave live shows out; "Stop live show alerts" works with no login and a token re-pointed at someone else is refused; GET/PUT /me/live-alerts. |
+| `home.js` | Extended: live_now only for a published show on air (never scheduled, a rehearsal, ended, not yet on air, or with live shows off), and only its public fields; no live show among the open auctions or in the rails; a scheduled show in upcoming with live: true. |
+| `preview-sample.js`, `lot-page-frontend.js` | Extended: a sample live show on air (1/3/5 open) and one in Coming next, "Sample:" titles, no uuid; the live show's share card ("Live now" / when it starts), timed cards unchanged. |
+| `live-before-ze.js` | Extended: before ze the profile page's live alerts are "not available", PUT 503, phone alerts 503 push_off, an "unsubscribe from all" link still works. |
+
 ## Not covered
 
 - **Before live shows are switched on (parked 2026-09-27).** The opening-price leak is fixed (live phase 1,

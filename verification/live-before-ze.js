@@ -6,15 +6,22 @@
 // LIVE_ENABLED unset (production). Checked: the server boots and its 30-second job (with the reminders) runs with
 // nothing in the log; a timed auction's chat works (sent, heard by the room, stored, in GET /chat and in the history
 // on join) and the new filters apply to it; a timed bid; /home and /config; the new host chat events answer live_off.
+// Phase 6: the profile page's live alerts answer "not available" (GET) and 503 (PUT); subscribing to phone alerts
+// answers 503 push_off (the keys may be set before ze); an "unsubscribe from all" link still works.
 // THROWAWAY rows only (live-kit, ZZTEST_live_noze*), cleaned up.
 require('./guard')(__filename);
 const K = require('./live-kit')('noze');
 const { s, ok, die, ADMIN, mkUser, mkStandard, terms, client, ask, call, boot, BE, sleep } = K;
 process.chdir(BE);
-const WORDS = ['live_moderation', 'slow_mode_seconds', 'deleted_by', 'pinned', 'queue_show_live', 'show_live'];
-// [text in the source, how many times, its replacement]: the chat's own uses of deleted_at.
+const WORDS = ['live_moderation', 'slow_mode_seconds', 'deleted_by', 'pinned', 'queue_show_live', 'show_live', 'push_subscriptions'];
+// [text in the source, how many times, its replacement]: the chat's own uses of deleted_at, and the uses of the
+// profiles.live_alerts column.
 const CHAT_DELETED_AT = [[".is('deleted_at', null)", 3, ".is('zz_noze_deleted_at', null)"], ['{ deleted_at: new Date().toISOString(), deleted_by', 1, '{ zz_noze_deleted_at: new Date().toISOString(), deleted_by'],
-  ['m.deleted_at', 1, 'm.zz_noze_deleted_at']];
+  ['m.deleted_at', 1, 'm.zz_noze_deleted_at'],
+  // profiles.live_alerts: the column's own uses only (the API's field and the unsubscribe kind keep their names).
+  ["'live_alerts' in data", 1, "'zz_noze_live_alerts' in data"], ['!!data.live_alerts', 1, '!!data.zz_noze_live_alerts'],
+  ['update({ live_alerts: v })', 1, 'update({ zz_noze_live_alerts: v })'], [".select('live_alerts')", 1, ".select('zz_noze_live_alerts')"],
+  ['data[0].live_alerts', 1, 'data[0].zz_noze_live_alerts'], ['update({ live_alerts: false })', 1, 'update({ zz_noze_live_alerts: false })']];
 function withoutZe(src) {
   let t = src;
   for (const [a, n, b] of CHAT_DELETED_AT) { if (t.split(a).length - 1 !== n) throw new Error(`expected ${n}x ${a}`); t = t.split(a).join(b); }
@@ -64,6 +71,17 @@ const BAD = /error|failed|unhandled|exception|does not exist|PGRST|42703|42P01/i
       ok(e && e.payload.code === 'live_off', `host chat event ${ev}: live_off`);
     }
     cb.close(); cw.close();
+    let la = await call(u, 'GET', '/me/live-alerts', B);
+    const la2 = await call(u, 'PUT', '/me/live-alerts', B, { live_alerts: false });
+    ok(la.s === 200 && la.j.available === false && la.j.live_alerts === null && la2.s === 503, `the profile page's live alerts: not available (${la.s}), PUT 503 (${la2.s})`);
+    la = await call(u, 'POST', '/push/subscribe', B, { endpoint: 'https://fcm.googleapis.com/fcm/send/zz-before-ze', keys: { p256dh: 'BAAA', auth: 'AAAA' } });
+    ok(la.s === 503 && la.j.code === 'push_off', `subscribing to phone alerts: 503 push_off (${la.s} ${la.j && la.j.code})`);
+    const crypto = require('crypto');
+    const key = crypto.createHmac('sha256', process.env.JWT_SECRET).update('wtf-unsubscribe-v1').digest();
+    const body = Buffer.from(JSON.stringify({ u: B.id, k: 'all' })).toString('base64url');
+    la = await call(u, 'POST', `/unsubscribe?token=${encodeURIComponent(body + '.' + crypto.createHmac('sha256', key).update(body).digest('base64url'))}`);
+    ok(la.s === 200 && la.j.kind === 'all', `an "unsubscribe from all" link still works (${la.s})`);
+    await s.from('notification_prefs').delete().eq('user_id', B.id);
     const bad = srv.log().split('\n').filter(l => BAD.test(l));
     ok(bad.length === 0, `the server's log: ${bad.length ? bad.length + ' bad lines: ' + bad.slice(0, 5).join(' | ') : 'nothing went wrong (boot, the 30-second job, every request above)'}`);
   } catch (e) {

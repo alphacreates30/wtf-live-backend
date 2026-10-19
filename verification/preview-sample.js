@@ -28,20 +28,29 @@ const FE = path.join(BE, '..', 'wtf-live-frontend', 'src');
     for (const n of [0, 1, 3, 5]) {
       const h = mod.sampleHome(n);
       const lots = Object.values(h.rails).flat();
-      const titles = [...h.open_auctions.map(a => a.title), ...h.upcoming.map(a => a.title), ...lots.map(l => l.title)];
-      const ids = [...h.open_auctions.map(a => a.id), ...h.upcoming.map(a => a.id), ...lots.map(l => l.id), ...lots.map(l => l.auction_id)];
-      ok(h.sample === true && h.open_auctions.length === n && h.upcoming.length === 1 && titles.every(t => t.startsWith('Sample: ')) && ids.every(id => id.startsWith('sample-'))
+      const shows = h.live_now ? [h.live_now] : [];
+      const titles = [...h.open_auctions.map(a => a.title), ...h.upcoming.map(a => a.title), ...lots.map(l => l.title), ...shows.map(a => a.title)];
+      const ids = [...h.open_auctions.map(a => a.id), ...h.upcoming.map(a => a.id), ...lots.map(l => l.id), ...lots.map(l => l.auction_id), ...shows.map(a => a.id)];
+      ok(h.sample === true && h.open_auctions.length === n && h.upcoming.length === 2 && titles.every(t => t.startsWith('Sample: ')) && ids.every(id => id.startsWith('sample-'))
         && lots.every(l => !l.image_url && !l.thumb_url) && h.open_auctions.every(a => a.images.length === 0),
         `${n} open: marked sample, every title "Sample: ...", every id "sample-...", no photos (${titles.length} titles)`);
     }
     const three = mod.sampleHome(3), now = Date.now();
+    const UUIDISH = /[0-9a-f]{8}-[0-9a-f]{4}-/i;
+    ok(three.live_now && three.live_now.title.startsWith('Sample: Live show') && three.live_now.id.startsWith('sample-') && !UUIDISH.test(three.live_now.id) && !three.live_now.image_url
+      && mod.sampleHome(0).live_now === null,
+      `a sample live show on air ("${three.live_now && three.live_now.title}") for 1/3/5 open auctions; none for 0 (the "asleep" page)`);
+    const nextShow = three.upcoming.find(a => a.live);
+    ok(nextShow && nextShow.title.startsWith('Sample: Live show') && nextShow.id.startsWith('sample-') && !UUIDISH.test(nextShow.id) && Date.parse(nextShow.starts_at) > now,
+      `a sample live show in Coming next, marked live ("${nextShow && nextShow.title}")`);
     // Since F2 (LOT_PAGE_BRIEF.md 9) sample auctions end at 8:00 PM local on their days, not at times counted from now.
     ok(three.open_auctions.every(a => new Date(a.ends_at).getHours() === 20 && new Date(a.ends_at).getMinutes() === 0)
       && three.rails.ending_soon.every(l => Date.parse(l.ends_at) > now) && three.rails.first_bid.length > 0 && three.rails.most_wanted.length >= 3,
       '3 open: each ends at 8:00 PM local, every lot still open, lots with no bids, enough bids for Most wanted');
     ok(new Set(three.open_auctions.map(a => new Date(a.ends_at).toDateString())).size === 3, '3 open: ending on three different days');
     const list = mod.sampleAuctions(3);
-    ok(list.length === 4 && list.every(a => a.title.startsWith('Sample: ') && a.id.startsWith('sample-') && !a.image_url), '/auctions sample: 3 open + 1 upcoming, all "Sample:"');
+    ok(list.length === 5 && list.every(a => a.title.startsWith('Sample: ') && a.id.startsWith('sample-') && !a.image_url) && list.filter(a => a.mode === 'live').length === 1,
+      '/auctions sample: 3 open + 1 upcoming + 1 live show, all "Sample:"');
 
     console.log('\n== Loaded only for the admin, only on demand ==');
     const grepSrc = (dir, re) => {
