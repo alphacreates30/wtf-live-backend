@@ -1,5 +1,6 @@
 -- STEP zf: at an equal max, the bidder who reached that max FIRST leads (timed lots and live shows alike).
--- NOT YET APPLIED on production. Runs after migrations n, y and za. Idempotent.
+-- APPLIED on production by Cowork 2026-10-19 (SQL editor; byte-identical, sha256 91bb69ef…58ea; the past-ties check
+-- found 0 lots beforehand (no lot had a max yet); after: trigger present, function not public, 0 tables with RLS off). Runs after migrations n, y and za. Idempotent.
 --
 -- The engine picks the leader with `order by max_amount desc, created_at asc` on pre_bids: the earlier max wins a
 -- tie. But a buyer's pre_bids row is upserted when they raise their max, and the upsert kept the row's ORIGINAL
