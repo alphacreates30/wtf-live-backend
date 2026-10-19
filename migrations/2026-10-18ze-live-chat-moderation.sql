@@ -1,6 +1,8 @@
 -- STEP ze: live shows, phase 5/6 (G1, wtf-handoff LIVE_SHOWS_PHASE5_BRIEF.md; LIVE_SHOWS_PHASE0_AUDIT.md §5-6):
 -- chat moderation for the host, and the "show starting now" email and phone alert.
--- NOT YET APPLIED on production. Runs after migrations w (watch list), z (points), zb and zd. Idempotent.
+-- APPLIED on production by Cowork 2026-10-19 (SQL editor; byte-identical to this file, sha256 68214002…901b; queue_reminders
+-- and delete_account on production matched migrations w and z before; after: both new tables RLS on and service_role only,
+-- functions service_role only, 0 public tables with RLS off, show_live index present). Runs after migrations w (watch list), z (points), zb and zd. Idempotent.
 --
 --   live_moderation              the host's mute / block of one account for ONE show (the site-wide block stays
 --                                admin-only, on profiles.status). mute = can't chat, can still bid; block = can't
