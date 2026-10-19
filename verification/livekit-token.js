@@ -5,7 +5,7 @@
 // token is signed locally with a throwaway key/secret given to these servers only, and decoded here.
 //
 // Live phase 2c (wtf-handoff LIVE_SHOWS_PHASE2_BRIEF.md step 2c, audit §4) extends it: who gets which rights.
-//   viewers (logged out, or an approved buyer): subscribe only, hidden, a random identity (never the username), ~6 h;
+//   viewers (logged out, or any logged-in account that isn't blocked; phase 5 §0): subscribe only, hidden, a random identity (never the username), ~6 h;
 //   the host / admin: publish video, audio and data, identity "host"; the host's second device (?role=controller):
 //   subscribe only, hidden, its own identity; only scheduled or on-air shows (ended: 404); a draft only for the admin
 //   or a logged-in tester with its rehearsal key; blocked: 403; a per-IP limit on logged-out tokens; the cap of 60
@@ -66,7 +66,8 @@ const watchOnly = t => !!t.g && t.g.roomJoin === true && t.g.canSubscribe === tr
     console.log('\n== SAME on the FIXED code ==');
     ok((await token(newSrv.url, draftLive, pending)).s === 404, 'NEW: draft -> 404 for a buyer');
     ok((await token(newSrv.url, standard, approved)).s === 404, 'NEW: standard auction (no video) -> 404');
-    ok((await token(newSrv.url, live, pending)).s === 403 && (await token(newSrv.url, live, none)).s === 403, 'NEW: live-mode auction, pending / no profile -> 403 (the room asks them to complete their profile too)');
+    r = await token(newSrv.url, live, pending); const r2 = await token(newSrv.url, live, none);
+    ok([r, r2].every(x => x.s === 200 && x.grants.canSubscribe && !x.grants.canPublish && !x.grants.canPublishData), 'NEW: live-mode auction, pending / no profile -> 200, watch only (phase 5 §0: they watch like guests; bidding still needs approval)');
     r = await token(newSrv.url, live, approved);
     ok(r.s === 200 && r.grants.roomJoin && r.grants.canSubscribe && !r.grants.canPublish && !r.grants.canPublishData, `NEW: approved buyer -> 200, watch only (canPublish ${r.grants && r.grants.canPublish}, canPublishData ${r.grants && r.grants.canPublishData})`);
     r = await token(newSrv.url, live, host);
@@ -120,8 +121,41 @@ const watchOnly = t => !!t.g && t.g.roomJoin === true && t.g.canSubscribe === tr
     ok(dr.admin.s === 200 && dr.admin.g.canPublish === true, 'a draft: the admin (the host\'s phone in the rehearsal) publishes');
     t = await tokenFor(newSrv.url, onair.id, blocked);
     ok(t.s === 403 && t.j.code === 'blocked' && !t.j.token, `a blocked account: 403 blocked, no token (${t.s} ${t.j.code})`);
-    const pend = await tokenFor(newSrv.url, onair.id, await K.mkUser('pending', { status: 'pending' }));
-    ok(pend.s === 403 && pend.j.code === 'not_approved', `a pending account: 403 not_approved (${pend.s} ${pend.j.code})`);
+
+    console.log('\n== Phase 5 §0: accounts without an approved profile watch like guests ==');
+    const pendU = await K.mkUser('pending', { status: 'pending', card: false }), noProf = await K.mkUser('noprof', { profile: false }), rejU = await K.mkUser('rejected', { status: 'rejected', card: false });
+    for (const [label, u] of [['pending', pendU], ['no profile', noProf], ['rejected', rejU]]) {
+      t = await tokenFor(newSrv.url, onair.id, u);
+      ok(t.s === 200 && watchOnly(t) && /^v-/.test(t.id) && t.j.role === 'viewer' && !JSON.stringify(t.j).includes(u.username) && !JSON.stringify(t.c).includes(u.username),
+        `${label}: 200, the guest token (subscribe only, hidden, random identity ${t.id}, no username)`);
+    }
+    t = await tokenFor(newSrv.url, sched.id, pendU);
+    ok(t.s === 200 && watchOnly(t), 'pending, a scheduled show: the same');
+    const pendSock = await K.client(newSrv.url, onair.id, pendU).catch(e => ({ err: e.message }));
+    const wo = pendSock.err ? null : await pendSock.waitFor('watch_only', () => true, 2000);
+    ok(!pendSock.err && wo && wo.payload.code === 'pending' && /approv/i.test(wo.payload.message), `pending: joins the live room and is told watch_only (${pendSock.err || JSON.stringify(wo && wo.payload)})`);
+    const npSock = await K.client(newSrv.url, onair.id, noProf).catch(e => ({ err: e.message }));
+    const wo2 = npSock.err ? null : await npSock.waitFor('watch_only', () => true, 2000);
+    ok(!npSock.err && wo2 && wo2.payload.code === 'no_profile' && wo2.payload.message === 'Finish your profile to bid.', `no profile: joins and is told "Finish your profile to bid." (${npSock.err || JSON.stringify(wo2 && wo2.payload)})`);
+    const buyerSock = await K.client(newSrv.url, onair.id, buyer);
+    await K.sleep(300);
+    ok(!buyerSock.events.some(e => e.event === 'watch_only'), 'an approved buyer gets no watch_only');
+    if (!pendSock.err) {
+      const b = await K.ask(pendSock, 'place_bid', { max_amount: 5 }, ['bid_ok', 'bid_error']);
+      ok(b && b.event === 'bid_error' && b.payload.code === 'not_approved', `pending: a bid is still refused (${b && b.event} ${b && b.payload.code})`);
+      const c = await K.ask(pendSock, 'send_chat', { text: 'hello' }, ['chat_error', 'new_chat']);
+      ok(c && c.event === 'chat_error' && /approved/.test(c.payload.message), `pending: chat is still refused (${c && c.event})`);
+    }
+    if (!npSock.err) {
+      const b = await K.ask(npSock, 'place_bid', { max_amount: 5 }, ['bid_ok', 'bid_error']);
+      ok(b && b.event === 'bid_error' && b.payload.code === 'no_profile', `no profile: a bid is still refused (${b && b.event} ${b && b.payload.code})`);
+    }
+    const blockedSock = await K.client(newSrv.url, onair.id, blocked).then(c => { c.close(); return null; }, e => e.message);
+    ok(/"blocked"/.test(blockedSock || ''), 'blocked: still refused at the door (auction_error blocked)');
+    const timedId = await mkAuction('timed for pending', 'live', 'standard');
+    const timedSock = await K.client(newSrv.url, timedId, pendU).then(c => { c.close(); return null; }, e => e.message);
+    ok(/"pending"/.test(timedSock || ''), 'a timed auction: unchanged (a pending account is still told it is pending)');
+    for (const c of [pendSock, npSock, buyerSock]) c.close?.();
     ok((await tokenFor(newSrv.url, standard, null)).s === 404, 'logged out, a timed auction: 404 (no video)');
 
     console.log('\n== 2c: the per-IP limit on logged-out tokens ==');
@@ -148,6 +182,11 @@ const watchOnly = t => !!t.g && t.g.roomJoin === true && t.g.canSubscribe === tr
     ok(!inBuyer.err, 'a logged-in buyer still gets in');
     const hostSock = await K.client(capped.url, onair.id, seller).catch(e => ({ err: e.message }));
     ok(!hostSock.err, 'the host still gets in');
+    const pendIn = await K.client(capped.url, onair.id, pendU).catch(e => ({ err: e.message }));
+    ok(!pendIn.err, 'a pending account still gets in (logged in: not a guest)');
+    let refused2 = null;
+    try { (await K.client(capped.url, onair.id)).close(); } catch (e) { refused2 = e.message; }
+    ok(/login_to_watch/.test(refused2 || ''), 'and it is not counted toward the cap: a 4th guest is still the one asked to log in');
     const again = await K.ask(guests[0], 'join_auction', {}, ['auction_state', 'auction_error']);
     ok(again && again.event === 'auction_state', 'a guest already in the room who joins again (a reconnect) is not turned away');
     let otherShow = await K.client(capped.url, sched.id).catch(e => ({ err: e.message }));
@@ -156,7 +195,7 @@ const watchOnly = t => !!t.g && t.g.roomJoin === true && t.g.canSubscribe === tr
     await K.sleep(500);
     const late = await K.client(capped.url, onair.id).catch(e => ({ err: e.message }));
     ok(!late.err, 'when a guest leaves, the next one gets in');
-    for (const c of [...guests.slice(1), inBuyer, hostSock, otherShow, late]) c.close?.();
+    for (const c of [...guests.slice(1), inBuyer, hostSock, pendIn, otherShow, late]) c.close?.();
 
     console.log('\n== 2c: the client ==');
     const FE = require('path').resolve(BE, '..', 'wtf-live-frontend');

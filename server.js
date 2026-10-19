@@ -2001,8 +2001,9 @@ app.patch('/auction/:id/fulfillment-choice', requireAuth, async (req, res) => {
 //   everyone else, logged in or not: subscribe only, hidden (not in the participant list), a random identity, never
 //     the username. Usernames reach the room only through our own socket events.
 // Only for a show that is scheduled or on air (an ended show is 404); a draft needs the admin or, for its rehearsal,
-// a logged-in account with the key. A logged-in buyer needs an approved profile, like the room itself (which shows
-// "Complete your profile" otherwise); blocked: 403. Anonymous tokens: a per-IP limit (20 per 10 minutes).
+// a logged-in account with the key. A logged-in account without an approved profile watches like a guest (phase 5
+// §0; bidding still needs approval, a verified card and the terms); blocked: 403. Anonymous tokens: a per-IP limit
+// (20 per 10 minutes).
 // The cap of LIVE_ANON_CAP guests is counted where guests are, in the room (join_auction): past it a guest gets
 // login_to_watch and the page shows "Log in to watch" and never asks for a token. A token request isn't tied to a
 // room connection, so it can't be counted here; the per-IP limit is what holds a direct caller.
@@ -2024,7 +2025,6 @@ app.get('/auction/:id/token', optionalAuth, (req, res, next) => (req.user ? next
     const { data: profile, error: pErr } = await supabase.from('profiles').select('status').eq('user_id', String(req.user.id)).maybeSingle();
     if (pErr) return dbFailure(req, res, pErr);
     if (profile?.status === 'blocked') return res.status(403).json({ error: 'You have been removed from this auction.', code: 'blocked' });
-    if (profile?.status !== 'approved') return res.status(403).json({ error: 'Your account must be approved to join the live stream', code: 'not_approved' });
   }
   if (!process.env.LIVEKIT_API_KEY || !process.env.LIVEKIT_API_SECRET) return res.status(503).json({ error: 'Live video is not configured' });
   const publisher = isHost && !controller;
@@ -2801,6 +2801,7 @@ io.on('connection', (socket) => {
     if (typeof auctionId === 'string' && !token) { /* auctionId already set */ }
 
     const user = token ? await verifySocketToken(token) : null;
+    let watchOnly = null;   // a live show's logged-in viewer without an approved profile: { code, message }
 
     // Drafts are private - resolve this BEFORE joining the room or emitting
     // any state (auction_state/bid_history/chat_history). Checking after
@@ -2829,26 +2830,31 @@ io.on('connection', (socket) => {
       if (!userSockets[socket.userId]) userSockets[socket.userId] = new Set();
       userSockets[socket.userId].add(socket.id);
 
-      // Hosts (whatthefind) skip the buyer approval check
+      // Hosts (whatthefind) skip the buyer approval check. A live show: an account without an approved profile
+      // watches like a guest (phase 5 §0): it joins, gets watch_only, and the room shows "Finish your profile to
+      // bid"; bidding and chat check the profile themselves. It is logged in, so it isn't counted in the guest cap.
       if (user.username !== ADMIN_USERNAME) {
-        const { data: profile } = await supabase.from('profiles').select('status').eq('user_id', socket.userId).single();
-        if (!profile) {
-          socket.emit('auction_error', { code: 'no_profile', message: 'You must complete your buyer profile before joining an auction.' });
-          return;
-        }
-        if (profile.status === 'blocked') {
+        const { data: profile } = await supabase.from('profiles').select('status').eq('user_id', socket.userId).maybeSingle();
+        if (profile?.status === 'blocked') {
           socket.emit('auction_error', { code: 'blocked', message: 'You have been removed from this auction.' });
           return;
         }
-        if (profile.status !== 'approved') {
-          socket.emit('auction_error', { code: 'pending', message: 'Your account is pending admin approval before you can participate.' });
-          return;
+        if (profile?.status !== 'approved') {
+          const code = profile ? 'pending' : 'no_profile';
+          if (auction?.mode !== 'live') {
+            socket.emit('auction_error', code === 'no_profile'
+              ? { code, message: 'You must complete your buyer profile before joining an auction.' }
+              : { code, message: 'Your account is pending admin approval before you can participate.' });
+            return;
+          }
+          watchOnly = { code, message: code === 'no_profile' ? 'Finish your profile to bid.' : 'Your profile is waiting for approval. You can bid once it is approved.' };
         }
       }
     }
 
     socket.join(auctionId);
     socket.auctionId = auctionId;
+    if (watchOnly) socket.emit('watch_only', watchOnly);
 
     if (!viewers[auctionId]) viewers[auctionId] = new Set();
     viewers[auctionId].add(socket.id);

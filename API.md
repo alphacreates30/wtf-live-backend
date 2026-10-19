@@ -346,10 +346,14 @@ live shows are off):
   `host`), `controller` (the host with `?role=controller`: subscribe only, hidden) or `viewer` (everyone else, logged in
   or not: subscribe only, hidden, a random identity, never the username). Lasts 6 hours. Only scheduled or on-air live
   shows (ended, timed or unknown: 404); a draft only for the admin, or a logged-in account with its rehearsal key.
-  A logged-in buyer needs an approved profile (403 `not_approved`; blocked: 403 `blocked`). Logged out: 20 tokens
+  A logged-in account without an approved profile gets the viewer token like a guest (phase 5 §0); blocked: 403
+  `blocked`. Logged out: 20 tokens
   per 10 minutes per address (429 `rate_limited`). 503 when LiveKit isn't configured.
 - The room holds at most 60 logged-out viewers per show: past that, `join_auction` answers
-  `auction_error { code: "login_to_watch" }` (logged-in buyers and the host always get in; a reconnect isn't counted twice).
+  `auction_error { code: "login_to_watch" }` (logged-in accounts and the host always get in and aren't counted; a reconnect isn't counted twice).
+- A live show, logged in without an approved profile: `join_auction` lets them in to watch and sends `watch_only { code:
+  "no_profile" | "pending", message }` (the room shows "Finish your profile to bid"). Bidding and chat still refuse them
+  (`no_profile` / `not_approved`). Blocked: `auction_error blocked`. Timed auctions are unchanged (`no_profile` / `pending`).
 
 Admin (403 for anyone else):
 - `rehearsal_key` is host-only (`public_view.AUCTION_HOST_ONLY`): only the host/admin ever gets it (their whole auction row, and this route); every other response and socket event leaves it out.

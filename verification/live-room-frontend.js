@@ -94,6 +94,21 @@ const OK_STRIPE = [['const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(proce
     ok(/declined \? <p className="error-msg">Your card was declined\./.test(cardForm) && /payment_failed: p => \{ cardDeclined\.current = true/.test(viewer),
       'after a declined charge the card sheet says so (never "on file and verified")');
     ok(/if \(!confirmed \|\| kind === 'max'\) \{ setConfirm/.test(viewer), 'the first bid in a show asks to confirm; after that, one tap');
+
+    console.log('\n== Logged in, not approved: watch like a guest (phase 5 §0) ==');
+    const P = await mkUser('pend', { status: 'pending', card: false }), N = await mkUser('noprof', { profile: false });
+    for (const [label, u, code] of [['pending', P, 'pending'], ['no profile', N, 'no_profile']]) {
+      const c = await client(srv.url, show.id, u).catch(e => ({ err: e.message }));
+      const w = c.err ? null : await c.waitFor('watch_only', () => true, 3000);
+      const s2 = c.err ? null : await c.waitFor('show_state', () => true, 3000);
+      ok(!c.err && w && w.payload.code === code && s2, `${label}: joins the show (show_state) and gets watch_only ${code} (${c.err || ''})`);
+      c.close?.();
+    }
+    ok(/watch_only: w => setWatchOnly\(w\)/.test(viewer) && /\{watchOnly \? \(/.test(viewer) && /<Link className="btn-bid vr-bid vr-finish" to="\/profile-setup">Finish your profile to bid<\/Link>/.test(viewer),
+      'the room shows "Finish your profile to bid" (to the profile page) instead of Bid and Max bid');
+    ok(/watchOnly \? navigate\('\/profile-setup'\) : setMaxOpen/.test(viewer) && /watchOnly \? navigate\('\/profile-setup'\) : setChatOpen/.test(viewer),
+      'Pre-bid and Chat send them to finish the profile too (the server refuses both anyway)');
+    ok(/<LiveVideo auctionId=\{auction\.id\}/.test(viewer) && !/watchOnly &&[^\n]*<LiveVideo/.test(viewer), 'the video plays for them like for a guest');
   } catch (e) {
     console.log('ERR', e); K.state.fails++;
   } finally {
