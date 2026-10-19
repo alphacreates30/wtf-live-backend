@@ -317,6 +317,32 @@ Out-of-order steps are refused with a code: `not_on_air`, `ended`, `already_on_a
 | `host_ok` | `{ action, … }` |
 | `host_error` | `{ message, code? }` |
 
+**Chat and moderation (phase 5, migration ze).** Chat rows everywhere (`chat_history`, `new_chat`, `GET /auction/:id/chat`):
+`{ id, type: "msg", auction_id, username, text, role: "host" | "viewer", created_at, pinned? }`. Never `flagged` or
+`deleted_*`; deleted and flagged messages are left out; the history is the last 50 (REST: 100), oldest first. (The old
+`bidder` role is gone: in a timed auction it named the leader.)
+
+| Event (client → server) | Who | What |
+|---|---|---|
+| `send_chat { text, pin? }` | logged in, approved | 1–200 characters, 5 per 10 s per connection. Refused (only the sender hears `chat_error { message, code }`, nothing stored or shown): `chat_link`, `chat_email`, `chat_phone`, `chat_word` (the filters, every auction); in a live show also `muted`, `show_blocked`, `slow_mode` (+ `wait_seconds`; the host isn't held by it). The host's `pin: true` pins their message (the one-tap pinned replies). |
+| `delete_message { messageId }` | host | Removed for everyone (`chat_deleted`); the row keeps `deleted_at` / `deleted_by`. |
+| `pin_message { messageId | null }` | host | Pins one message (the old one is unpinned); `null` unpins. |
+| `set_slow_mode { seconds: 0 | 10 | 30 }` | host | The show's slow mode (`auctions.slow_mode_seconds`). |
+| `mute_user { username, on = true }` | host | This show only: no chat, bids still fine. |
+| `block_user_show { username, on = true }` | host | This show only: no chat, no bid, no pre-bid (`show_blocked`); they can still watch. The site-wide `block_user` stays admin-only. |
+| `get_moderation` | host | Answers `moderation_list`. |
+
+"host" = the show's host or the admin, and only for that show; anyone else gets `host_error` "Only the host can run
+this show". Before migration ze these answer `host_error` code `not_available`.
+
+| Event (server → client) | Payload |
+|---|---|
+| `chat_settings` | on join and on every change, to the room: `{ auction_id, slow_mode_seconds, pinned: chat row | null, pinned_replies: [3 built-in texts] }` |
+| `chat_deleted` | `{ auction_id, id }` |
+| `chat_error` | to the sender only: `{ message, code?, wait_seconds? }` |
+| `you_moderated` | to that account, in that show (also on rejoin): `{ auction_id, mute, block, message }` |
+| `moderation_list` | to the host: `{ auction_id, mute: [usernames], block: [usernames] }` |
+
 How a lot sells: the opening price applies the pre-bids by the proxy rule and **never** shows the top max (one
 pre-bid: the opening minimum, $1 or the starting bid; two or more: `least(top, second + increment)`, the top pre-bidder
 leading). A bid with 5 s or less left adds 5 s (Sudden death: nothing). At 0 the database closes the lot

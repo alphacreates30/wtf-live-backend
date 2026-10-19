@@ -15,6 +15,7 @@ const sharp = require('sharp');
 const aiLots = require('./ai_lots');
 const { makeThumb, thumbPathFor } = require('./thumbs');
 const lotRules = require('./lot_rules');
+const chatFilter = require('./chat_filter');
 const { publicAuction, publicLot, auctionFor } = require('./public_view');
 const rewardsLib = require('./rewards');
 
@@ -1994,6 +1995,40 @@ app.patch('/auction/:id/fulfillment-choice', requireAuth, async (req, res) => {
   res.json({ accepted: true, ...data });
 });
 
+// Chat and moderation (live phase 5, LIVE_SHOWS_PHASE5_BRIEF.md; audit §5; migration ze).
+// A chat row as rooms see it: what was said, by whom (a username), never the bookkeeping (flagged, deleted_*).
+const chatView = m => ({ id: m.id, type: 'msg', auction_id: m.auction_id, username: m.username, text: m.text, role: m.role, created_at: m.created_at,
+  ...(m.pinned ? { pinned: true } : {}) });
+// The last `limit` messages, oldest first, without the flagged (admin block) or deleted (host) ones. '*': deleted_at
+// only exists after migration ze, so the deleted ones are left out here, not in the query.
+async function chatHistory(auctionId, limit) {
+  const { data, error } = await supabase.from('chat_messages').select('*').eq('auction_id', auctionId).eq('flagged', false)
+    .order('created_at', { ascending: false }).limit(limit);
+  if (error) return { error };
+  return { rows: data.filter(m => !m.deleted_at).reverse().map(chatView) };
+}
+// A live show's chat settings, for everyone in the room: slow mode, the pinned message, the host's built-in replies.
+async function chatSettings(auctionId) {
+  const [{ data: a }, { data: pins }] = await Promise.all([
+    supabase.from('auctions').select('*').eq('id', auctionId).maybeSingle(),
+    supabase.from('chat_messages').select('*').eq('auction_id', auctionId).eq('pinned', true).is('deleted_at', null).limit(1),
+  ]);
+  return { auction_id: auctionId, slow_mode_seconds: a?.slow_mode_seconds || 0, pinned: pins?.[0] ? chatView(pins[0]) : null, pinned_replies: chatFilter.PINNED_REPLIES };
+}
+async function emitChatSettings(auctionId) {
+  try { io.to(auctionId).emit('chat_settings', await chatSettings(auctionId)); } catch (e) { console.error('chat_settings failed:', auctionId, e.message); }
+}
+// The host's mute / block of one account for one show (live_moderation). { mute, block } or { error }: callers fail
+// closed. mute = no chat (bids still fine); block = no chat, no bids, no pre-bids in this show.
+async function showModeration(auctionId, userId) {
+  const { data, error } = await supabase.from('live_moderation').select('kind').eq('auction_id', auctionId).eq('user_id', String(userId));
+  if (error) return { error };
+  return { mute: data.some(r => r.kind === 'mute'), block: data.some(r => r.kind === 'block') };
+}
+const SHOW_BLOCKED = "The host has blocked you from bidding and chatting in this show.";
+const SHOW_MUTED = "The host has muted you in this show. You can still bid.";
+const moderationNote = m => (m.block ? SHOW_BLOCKED : m.mute ? SHOW_MUTED : null);
+
 // LiveKit room token (security review #18; live phase 2c, audit §4). Who gets what:
 //   the host (the show's host_username, or the admin): publish video, audio and data; identity "host".
 //   the host's second device (?role=controller): subscribe only, hidden, its own identity (LiveKit allows one
@@ -2100,9 +2135,9 @@ app.get('/auction/:id/bids', optionalAuth, hideDraftFromNonAdmin, async (req, re
 });
 
 app.get('/auction/:id/chat', optionalAuth, hideDraftFromNonAdmin, async (req, res) => {
-  const { data, error } = await supabase.from('chat_messages').select('*').eq('auction_id', req.params.id).eq('flagged', false).order('created_at', { ascending: true }).limit(100);
+  const { rows, error } = await chatHistory(req.params.id, 100);
   if (error) return dbFailure(req, res, error);
-  res.json(data);
+  res.json(rows);
 });
 
 // ------------------------------------------------------------
@@ -2142,7 +2177,8 @@ async function syncDbClock({ force = false } = {}) {
   const t0 = Date.now();
   const { data, error } = await supabase.rpc('live_db_now');
   const t1 = Date.now();
-  if (error || !data) return;
+  // Logged (it used to fail silently): until it works, live clocks run on this server's own time.
+  if (error || !data) { console.error('syncDbClock failed; live clocks use this server\'s own clock until the next try:', error ? error.message : 'no answer'); return; }
   dbOffsetMs = Date.parse(data) - Math.round((t0 + t1) / 2);
   dbOffsetAt = t1;
 }
@@ -2884,8 +2920,16 @@ io.on('connection', (socket) => {
       }
     }
 
-    const { data: chatHistory } = await supabase.from('chat_messages').select('*').eq('auction_id', auctionId).eq('flagged', false).order('created_at', { ascending: true }).limit(50);
-    if (chatHistory) socket.emit('chat_history', chatHistory);
+    const { rows: chatRows } = await chatHistory(auctionId, 50);
+    if (chatRows) socket.emit('chat_history', chatRows);
+    if (auction?.mode === 'live' && LIVE_ENABLED) {
+      socket.emit('chat_settings', await chatSettings(auctionId));
+      // An account the host muted or blocked in this show hears so when it (re)joins.
+      if (user && user.username !== ADMIN_USERNAME) {
+        const m = await showModeration(auctionId, user.id);
+        if (!m.error && (m.mute || m.block)) socket.emit('you_moderated', { auction_id: auctionId, mute: m.mute, block: m.block, message: moderationNote(m) });
+      }
+    }
     // A live show: everything its screens need, in one object (the same as GET /auction/:id/show-state).
     if (auction?.mode === 'live' && LIVE_ENABLED) {
       try { const st = await liveShowState(auctionId); if (st) socket.emit('show_state', showStateFor(st, user?.username || null)); }
@@ -2912,6 +2956,9 @@ io.on('connection', (socket) => {
     if (auction.status === 'draft' && socket.data.rehearsal !== auctionId) return fail('Item not found', 'not_found');
     const refusal = await biddingRefusal(user, auction);
     if (refusal) return fail(refusal.error, refusal.code);
+    const mod = await showModeration(auctionId, user.id);
+    if (mod.error) return fail('Could not check your account. Try again in a moment.');
+    if (mod.block) return fail(SHOW_BLOCKED, 'show_blocked');
     if (!showOnAir(auction)) return fail('This show is not on air', 'not_on_air');
     if (!(await hasAcceptedTerms(user.id, auctionId))) return fail('You must accept the auction terms before bidding', 'terms_required');
     if (await liveUnpaid(user.id, auctionId)) return fail(LIVE_UNPAID, 'payment_failed');
@@ -2955,8 +3002,13 @@ io.on('connection', (socket) => {
     }));
   });
 
-  on('send_chat', async ({ auctionId, text, token }) => {
+  // Chat (live phase 5 adds, on top of the login, standing, length and rate checks): the host's mute / block for this
+  // show, slow mode, and the filters (links, email addresses, phone numbers, the banned words). A refused message is
+  // never stored or broadcast; only the sender hears why (chat_error { code, message }). The host's `pin: true`
+  // pins their own message (the one-tap pinned replies).
+  on('send_chat', async ({ auctionId, text, token, pin }) => {
     const user = await verifySocketToken(token);
+    const refuse = (message, code, extra = {}) => socket.emit('chat_error', { message, ...(code ? { code } : {}), ...extra });
     if (!user) { socket.emit('chat_error', { message: 'You must be logged in to chat' }); return; }
     if (typeof text !== 'string' || !text.trim()) return;
     const clean = text.trim().slice(0, 200);
@@ -2964,7 +3016,8 @@ io.on('connection', (socket) => {
     // Same standing as joining the room (security review #7): this used to check
     // the token only, so a blocked user kept posting - into any auction, drafts
     // included - just by emitting the event.
-    const { data: auction } = await supabase.from('auctions').select('host_username, leading_bidder, status').eq('id', auctionId).maybeSingle();
+    // '*': slow_mode_seconds only exists after migration ze.
+    const { data: auction } = await supabase.from('auctions').select('*').eq('id', auctionId).maybeSingle();
     if (!auction || (auction.status === 'draft' && user.username !== ADMIN_USERNAME && socket.data.rehearsal !== auctionId)) {
       socket.emit('chat_error', { message: 'Auction not found' }); return;
     }
@@ -2976,15 +3029,45 @@ io.on('connection', (socket) => {
       }
     }
 
-    let role = 'viewer';
-    if (auction.host_username === user.username) role = 'host';
-    else if (auction.leading_bidder === user.username) role = 'bidder';
+    const isHost = auction.host_username === user.username || user.username === ADMIN_USERNAME;
+    if (auction.mode === 'live' && !isHost) {
+      const m = await showModeration(auctionId, user.id);
+      if (m.error) { refuse('Could not check your account. Try again in a moment.'); return; }
+      if (m.block) { refuse(SHOW_BLOCKED, 'show_blocked'); return; }
+      if (m.mute) { refuse(SHOW_MUTED, 'muted'); return; }
+      const slow = Number(auction.slow_mode_seconds) || 0;
+      if (slow > 0) {
+        const { data: last } = await supabase.from('chat_messages').select('created_at').eq('auction_id', auctionId).eq('username', user.username)
+          .order('created_at', { ascending: false }).limit(1);
+        const wait = last?.[0] ? Math.ceil(slow - (dbNow() - Date.parse(last[0].created_at)) / 1000) : 0;
+        if (wait > 0) { refuse(`Slow mode is on: one message every ${slow} seconds. Wait ${wait} s.`, 'slow_mode', { wait_seconds: wait }); return; }
+      }
+    }
+    const bad = chatFilter.refuse(clean);
+    if (bad) { refuse(bad.message, bad.code); return; }
 
+    // Who said it: the host, or a viewer. (No "bidder" role: in a timed auction it named the leader.)
+    const role = isHost ? 'host' : 'viewer';
     const { data: msg, error } = await supabase.from('chat_messages').insert({ auction_id: auctionId, username: user.username, text: clean, role }).select().single();
     if (error) { console.error('Chat save error:', error); return; }
 
-    io.to(auctionId).emit('new_chat', { id: msg.id, type: 'msg', auction_id: auctionId, username: user.username, text: clean, role, created_at: msg.created_at });
+    io.to(auctionId).emit('new_chat', chatView(msg));
+    if (pin === true && isHost && auction.mode === 'live') await pinMessage(auctionId, msg.id);
   });
+
+  // Pin one message for the show (null = unpin): the old pinned one is unpinned first (one at a time). Then the room
+  // hears chat_settings. Returns an error or null.
+  async function pinMessage(auctionId, id) {
+    const un = await supabase.from('chat_messages').update({ pinned: false }).eq('auction_id', auctionId).eq('pinned', true);
+    if (un.error) return un.error;
+    if (id) {
+      const { data, error } = await supabase.from('chat_messages').update({ pinned: true }).eq('id', id).eq('auction_id', auctionId).is('deleted_at', null).select('id');
+      if (error) return error;
+      if (!data.length) return { message: 'That message is gone', code: 'not_found' };
+    }
+    await emitChatSettings(auctionId);
+    return null;
+  }
 
   // -- Admin: block user mid-auction --
     on('block_user', async ({ targetUserId, targetUsername, auctionId, token }) => {
@@ -3054,6 +3137,99 @@ io.on('connection', (socket) => {
     hostErr(showEnded(a) ? 'This show has ended' : 'Go live first', showEnded(a) ? 'ended' : 'not_on_air');
     return false;
   }
+
+  // Chat moderation (live phase 5, audit §5): the show's host or the admin, for THIS show only (the site-wide block
+  // stays admin-only: block_user). No moderator role in v1. Each answers host_ok / host_error like the other host
+  // events. Before migration ze they answer host_error (the columns and table don't exist yet).
+  const MOD_UNAVAILABLE = 'Chat moderation is not available yet.';
+  async function moderationTarget(h, username) {
+    const name = typeof username === 'string' ? username.trim().replace(/^@/, '') : '';
+    if (!name) return hostErr('Choose an account', 'bad_user');
+    if (name === ADMIN_USERNAME || name === h.auction.host_username) return hostErr("The host can't be muted or blocked", 'is_host');
+    const { data: u, error } = await supabase.from('users').select('id, username').eq('username', name).maybeSingle();
+    if (error) return hostErr('Could not find that account. Try again.');
+    if (!u) return hostErr('No account with that username', 'not_found');
+    return u;
+  }
+  // Who is muted or blocked in this show (usernames), for the host's chat sheet.
+  async function moderationList(auctionId) {
+    const { data, error } = await supabase.from('live_moderation').select('user_id, kind').eq('auction_id', auctionId);
+    if (error) return { error };
+    const ids = [...new Set(data.map(r => r.user_id))];
+    const { data: users } = ids.length ? await supabase.from('users').select('id, username').in('id', ids) : { data: [] };
+    const name = id => (users || []).find(u => u.id === id)?.username;
+    return { auction_id: auctionId, mute: data.filter(r => r.kind === 'mute').map(r => name(r.user_id)).filter(Boolean).sort(),
+      block: data.filter(r => r.kind === 'block').map(r => name(r.user_id)).filter(Boolean).sort() };
+  }
+  async function moderate(kind, { auctionId, username, on: wanted, token }) {
+    const action = kind === 'mute' ? 'mute_user' : 'block_user_show';
+    const h = await liveHost(auctionId, token);
+    if (!h) return;
+    const u = await moderationTarget(h, username);
+    if (!u) return;
+    const on = wanted !== false;
+    const { error } = on
+      ? await supabase.from('live_moderation').upsert({ auction_id: auctionId, user_id: u.id, kind, by: h.user.username, at: new Date().toISOString() }, { onConflict: 'auction_id,user_id,kind' })
+      : await supabase.from('live_moderation').delete().eq('auction_id', auctionId).eq('user_id', u.id).eq('kind', kind);
+    if (error) { console.error(`${action} failed:`, auctionId, error.code, error.message); return hostErr(MOD_UNAVAILABLE, 'not_available'); }
+    await touchHost(auctionId);
+    // The account itself hears it, in this show's room only.
+    const m = await showModeration(auctionId, u.id);
+    if (!m.error) {
+      for (const sid of userSockets[String(u.id)] || []) {
+        const x = io.sockets.sockets.get(sid);
+        if (x && x.auctionId === auctionId) x.emit('you_moderated', { auction_id: auctionId, mute: m.mute, block: m.block, message: moderationNote(m) });
+      }
+    }
+    hostOk(action, { username: u.username, on });
+    const list = await moderationList(auctionId);
+    if (!list.error) socket.emit('moderation_list', list);
+    console.log(`- Host ${h.user.username} ${on ? '' : 'un'}${kind === 'mute' ? 'muted' : 'blocked'} ${u.username} in show ${auctionId}`);
+  }
+  on('mute_user', payload => moderate('mute', payload));
+  on('block_user_show', payload => moderate('block', payload));
+  on('get_moderation', async ({ auctionId, token }) => {
+    const h = await liveHost(auctionId, token);
+    if (!h) return;
+    const list = await moderationList(auctionId);
+    if (list.error) return hostErr(MOD_UNAVAILABLE, 'not_available');
+    socket.emit('moderation_list', list);
+  });
+  // Delete one message: removed for everyone (chat_deleted); the row stays, with who deleted it.
+  on('delete_message', async ({ auctionId, messageId, token }) => {
+    const h = await liveHost(auctionId, token);
+    if (!h) return;
+    const id = canonicalUuid(messageId);
+    if (!id) return hostErr('That message is gone', 'not_found');
+    const { data, error } = await supabase.from('chat_messages').update({ deleted_at: new Date().toISOString(), deleted_by: h.user.username, pinned: false })
+      .eq('id', id).eq('auction_id', auctionId).is('deleted_at', null).select('id');
+    if (error) { console.error('delete_message failed:', auctionId, error.code, error.message); return hostErr(MOD_UNAVAILABLE, 'not_available'); }
+    if (!data.length) return hostErr('That message is gone', 'not_found');
+    await touchHost(auctionId);
+    io.to(auctionId).emit('chat_deleted', { auction_id: auctionId, id });
+    hostOk('delete_message', { id });
+    await emitChatSettings(auctionId);   // it may have been the pinned one
+  });
+  on('pin_message', async ({ auctionId, messageId, token }) => {
+    const h = await liveHost(auctionId, token);
+    if (!h) return;
+    const id = messageId == null ? null : canonicalUuid(messageId);
+    if (messageId != null && !id) return hostErr('That message is gone', 'not_found');
+    const err = await pinMessage(auctionId, id);
+    if (err) return err.code === 'not_found' ? hostErr(err.message, 'not_found') : hostErr(MOD_UNAVAILABLE, 'not_available');
+    await touchHost(auctionId);
+    hostOk('pin_message', { id });
+  });
+  on('set_slow_mode', async ({ auctionId, seconds, token }) => {
+    const h = await liveHost(auctionId, token);
+    if (!h) return;
+    const secs = Number(seconds);
+    if (![0, 10, 30].includes(secs)) return hostErr('Slow mode is off, 10 s or 30 s', 'bad_seconds');
+    const { error } = await touchHost(auctionId, { slow_mode_seconds: secs });
+    if (error) { console.error('set_slow_mode failed:', auctionId, error.code, error.message); return hostErr(MOD_UNAVAILABLE, 'not_available'); }
+    hostOk('set_slow_mode', { seconds: secs });
+    await emitChatSettings(auctionId);
+  });
 
   // Go live: a scheduled show goes on air (status 'live', on_air_at). A draft goes on air as a REHEARSAL (it stays a
   // draft: hidden, only for the private link's invited accounts).
@@ -4684,6 +4860,11 @@ app.post('/auction/:id/items/:itemId/prebid', requireAuth, LIMITS.bidding, async
   if (auctionRow.mode === 'live' && !LIVE_ENABLED) return res.status(400).json({ error: LIVE_OFF, code: 'live_off' });
   if (auctionRow.mode === 'live' && auctionRow.prebids_released_at) return res.status(400).json({ error: "This show didn't start on time, so its pre-bids were released. Pre-bidding is closed.", code: 'prebids_released' });
   if (auctionRow.mode === 'live' && await liveUnpaid(req.user.id, req.params.id)) return res.status(403).json({ error: LIVE_UNPAID, code: 'payment_failed' });
+  if (auctionRow.mode === 'live') {
+    const mod = await showModeration(req.params.id, req.user.id);
+    if (mod.error) return res.status(503).json({ error: 'Could not check your account. Try again in a moment.' });
+    if (mod.block) return res.status(403).json({ error: SHOW_BLOCKED, code: 'show_blocked' });
+  }
   if (hostCannotBid(req.user, auctionRow)) return res.status(403).json({ error: HOST_CANNOT_BID.error, code: HOST_CANNOT_BID.code });
 
   // A pre-bid is equally binding as a live bid - it commits the buyer to

@@ -213,11 +213,22 @@ const near = (a, b, tol) => Math.abs(a - b) <= tol;
     srv.stop(); servers.length = 0;
     const srv2 = await boot('live-engine-2', 3612, src, { env: ON, timers: 'real', patch: OK_STRIPE, log: true });
     servers.push(srv2);
-    await sleep(15000);   // a 5 s lot: the bid itself, inside the last 5 s, added 5 s
-    const l7 = (await s.from('auction_items').select('status').eq('auction_id', show2.id).single()).data;
-    const o7 = (await s.from('orders').select('hammer_cents').eq('auction_id', show2.id)).data;
-    ok(l7.status === 'sold' && o7.length === 1 && o7[0].hammer_cents === 100, `the lot's server stopped; a new one sold it at ends_at (${l7.status}, ${o7.length} order)`);
-    if (l7.status !== 'sold' || o7.length !== 1) console.log('--- second server log ---' + srv2.log().slice(-3000));
+    // Wait on the real condition (the lot sold and its order written), not a fixed delay: this used to sleep 15 s of
+    // this machine's time, for about 8.7 s of work, and failed twice in full runs (2026-10-18; never alone, never in
+    // 12 runs under load). Then judge by the DATABASE clock: the hammer (the order's created_at) within 5 s of the
+    // later of the lot's ends_at and the moment the new server was up.
+    const upAt = Date.parse((await s.rpc('live_db_now')).data);
+    let l7 = null, o7 = [];
+    for (let i = 0; i < 90; i++) {
+      l7 = (await s.from('auction_items').select('status, ends_at').eq('auction_id', show2.id).single()).data;
+      o7 = (await s.from('orders').select('hammer_cents, created_at').eq('auction_id', show2.id)).data;
+      if (l7.status === 'sold' && o7.length) break;
+      await sleep(500);
+    }
+    const lateBy = o7.length ? (Date.parse(o7[0].created_at) - Math.max(Date.parse(l7.ends_at), upAt)) / 1000 : null;
+    ok(l7.status === 'sold' && o7.length === 1 && o7[0].hammer_cents === 100 && lateBy !== null && lateBy <= 5,
+      `the lot's server stopped; a new one sold it at ends_at by the database clock (${l7.status}, ${o7.length} order, ${lateBy === null ? 'no hammer' : lateBy.toFixed(1) + ' s after ends_at or its boot'})`);
+    if (l7.status !== 'sold' || o7.length !== 1 || !(lateBy <= 5)) console.log('--- second server log ---' + srv2.log().slice(-3000));
     srv2.stop(); servers.length = 0;
 
     console.log('\n== The timed close job leaves live lots alone ==');

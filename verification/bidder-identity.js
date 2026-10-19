@@ -7,6 +7,10 @@
 // key (leading_bidder, username, buyer_username, leader_username, top_pre_bid, max_amount, winner).
 // OLD = PINNED to 905066d (the lot page, before B7): leaks reproduced. NEW = working tree: none.
 // Also: each bidder sees only their own standing, max and bids; the admin sees everything.
+// Split (live phase 5, LIVE_SHOWS_PHASE5_BRIEF.md): this suite is the TIMED rule, no names anywhere, sockets included
+// (a guest and O in a timed auction's room while L and C bid: no allowance at all). The live show here is only the
+// pinned commit's reproduction and the "no max, no id" part; what a live show may show (the username, nothing else)
+// is bidder-identity-live.js.
 const crypto = require('crypto');
 const path = require('path');
 const guard = require('./guard');
@@ -111,6 +115,27 @@ function socketRun(url, V) {
   });
 }
 
+// A timed auction's room: a guest and O join S, then C bids twice and L raises (REST). Every event they get.
+function timedSocketRun(url, S, SL) {
+  return new Promise(resolve => {
+    const socks = { anon: null, O: tok(O) };
+    const got = [];
+    const conns = Object.entries(socks).map(([k, t]) => {
+      const c = ioc(url, { transports: ['websocket'], forceNew: true });
+      c.onAny((event, payload) => got.push({ who: k, event, payload }));
+      c.on('connect', () => c.emit('join_auction', { auctionId: S, token: t || undefined }));
+      return c;
+    });
+    const call = caller(url);
+    setTimeout(async () => {
+      await call('POST', `/auction/${S}/items/${SL}/bid`, tok(C), { max_amount: 6 });
+      await call('POST', `/auction/${S}/items/${SL}/bid`, tok(C), { max_amount: 7 });
+      await call('POST', `/auction/${S}/items/${SL}/bid`, tok(L), { max_amount: 510.11 });
+      setTimeout(() => { conns.forEach(c => c.close()); resolve(got); }, 1500);
+    }, 1500);
+  });
+}
+
 async function scenario(url, label) {
   const call = caller(url);
   const F = await fixtures(label);
@@ -188,6 +213,10 @@ async function cleanup() {
     const clean = now.seen.filter(([w, b]) => leaksAt(w, b).length === 0).length;
     for (const [w, b] of now.seen) { const l = leaksAt(w, b); if (l.length) ok(false, `NEW ${label(w)}: LEAKS ${[...new Set(l)].join(', ')}`); }
     ok(clean === now.seen.length, `NEW: all ${now.seen.length} payloads to anonymous and to another buyer (${new Set(now.seen.map(([w]) => w.split(':')[1])).size} REST reads/socket events) name no bidder and carry no max (the live show's socket events: a username in username/leader/winner only)`);
+    const timedEvents = await timedSocketRun(newS.url, S, SL);
+    const timedLeaks = timedEvents.filter(e => leaks(e.payload).length);
+    ok(timedEvents.some(e => e.event === 'auction_state') && timedLeaks.length === 0,
+      `timed auction, sockets: ${timedEvents.length} events to a guest and O while L and C bid (${[...new Set(timedEvents.map(e => e.event))].join(', ')}): none names a bidder or carries a max, with no live allowance${timedLeaks.length ? ' LEAKS: ' + timedLeaks.map(e => e.event + ' ' + leaks(e.payload).join('/')).join('; ') : ''}`);
     const liveNamed = now.events.O.filter(e => ['new_bid', 'lot_closed'].includes(e.event));
     ok(liveNamed.some(e => e.event === 'lot_closed' && e.payload.username === L.username) && liveNamed.every(e => !JSON.stringify(e.payload).includes(L.id) && !/max|top_pre/.test(Object.keys(e.payload).join())),
       `live show only: the room sees the winner's username on the hammer (@${L.username}), never an id or a max`);

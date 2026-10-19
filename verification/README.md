@@ -335,6 +335,24 @@ alone, like the phase 1 live suites.
 |---|---|
 | `livekit-token.js` | Extended (audit §4). Logged out and approved buyers: subscribe only, hidden, a random `v-` identity (two viewers never share one; the username is nowhere in the answer or the token), about 6 hours, the server's LIVEKIT_URL. The host and the admin publish (identity `host`); the host's `?role=controller` is subscribe only, hidden, `ctl-`; a buyer asking for it is a viewer. Ended shows (status or `ended_at`) 404 for everyone; a draft 404 logged out (even with the key), without the key or with a wrong one, 200 watch-only for a tester with the key, publish for the admin; blocked 403, pending 403, a timed auction 404. A server with the loopback exemption off: 20 logged-out tokens then 429, a logged-in buyer unaffected. A server with the cap patched to 3: 3 guests join, the 4th gets `login_to_watch`, a buyer and the host still get in, a guest rejoining isn't refused, the cap is per show, a guest leaving lets the next one in; the source says 60. Client, read from disk: no VITE_LIVEKIT_URL anywhere, connects with the server's url, the controller asks for its role, simulcast, Flip with restartTrack, every room handler named and removed, reconnect / Tap for sound / Back in a moment, sound only for viewers, each screen mounts LiveVideo with its role. |
 
+
+**Live shows (G1) phase 5 §0: unapproved accounts watch** (2026-10-18). No migration.
+
+| Suite | Proves |
+|---|---|
+| `livekit-token.js` | Extended: pending, no-profile and rejected accounts get the guest token (subscribe only, hidden, random identity, no username); pending and no-profile accounts join a live room and get `watch_only`; their bids and chat are still refused; blocked is still refused at the door; a timed auction still tells a pending account it is pending; a pending account isn't counted toward the guest cap. |
+| `live-room-frontend.js` | Extended: the same joins over sockets; the room shows "Finish your profile to bid" instead of Bid and Max bid, and Pre-bid and Chat go to the profile page; only a timed auction's room is behind ProfileGate. |
+
+**Live shows (G1) phase 5: chat and moderation** (2026-10-18). Migration ze.
+
+| Suite | Proves |
+|---|---|
+| `live-chat-moderation.js` | New. The filters on `send_chat` (a link, a web address, www., an email address, a phone number, a +country number, a banned word): refused with their code and message, never seen by the room, never stored; ordinary messages and a question pass. The chat rows rooms get (history, `new_chat`, GET /chat): type, username, role, never flagged / deleted_*. Slow mode: only 0/10/30; everyone hears `chat_settings`; a buyer's second message within 10 s is refused with the wait; the host isn't held by it; it is per show. Mute vs block: muted = chat refused, bids fine; blocked = chat, bid and pre-bid refused, still watching; a block is per show; the site-wide standing is untouched; a rejoin is told again; the rows record the host; unmute / unblock; the host and the admin can't be muted; an unknown name is not_found. Delete: everyone hears `chat_deleted`; the row stays with `deleted_by`; gone from the history and GET /chat. Pin: one at a time, unpin, a one-tap pinned reply, a buyer's `pin: true` pins nothing, deleting the pinned message unpins it. Only the show's host or the admin: every moderation event refused for a buyer and a guest, and for this host on another host's show. The rooms' code: the host's controls and the viewer's handlers. |
+| `bidder-identity-live.js` | New (split from `bidder-identity.js`). A live show with a pre-bid max, a room bid, a hammer, a pass and chat: every socket event a guest and another buyer get, and every public live read, carries no user id, email, max, top_pre_bid or bidder key; a username only in username / leader / winner. `new_bid`, `lot_closed`, `show_state.last.winner`, chat and `item_activated` carry the username; only the winner's copy says you_won; C's bid answer never shows L's max. |
+| `bidder-identity.js` | Now the timed rule only, sockets included: a guest and another buyer in a timed auction's room while bids land get no name at all (no live allowance). |
+| `live-before-ze.js` | New. The server with every ze name renamed away (as production before ze), live shows off: boot and the 30-second job log nothing bad; timed chat sent, heard, stored, in GET /chat and the history; the filters apply to timed chat; a timed bid; /home and /config; every host chat event answers live_off. |
+| `chat-standing.js` | Unchanged and green. |
+
 ## Not covered
 
 - **Before live shows are switched on (parked 2026-09-27).** The opening-price leak is fixed (live phase 1,

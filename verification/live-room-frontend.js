@@ -113,6 +113,8 @@ const OK_STRIPE = [['const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(proce
     ok(/<Route path="\/auction\/:id" element=\{<AuctionRoomGate \/>\} \/>/.test(app) && /mode === 'standard'\) return <ProfileGate><StandardAuctionRoom /.test(gate)
       && !/ProfileGate[^\n]*LiveViewerRoom|LiveViewerRoom[^\n]*ProfileGate/.test(gate),
       'the page in front: only a timed auction\'s room is behind ProfileGate (it used to stop a pending account before the live room loaded)');
+    ok(/vr-loading[\s\S]{0,200}<Link to="\/" className="vr-loading-out">/.test(viewer) && /lh-loading[\s\S]{0,200}<Link to="\/host" className="lh-loading-out">/.test(host),
+      'opened from the Home Screen there is no browser Back: even "Connecting…" has a way out (viewer: the homepage; host: the dashboard)');
   } catch (e) {
     console.log('ERR', e); K.state.fails++;
   } finally {
