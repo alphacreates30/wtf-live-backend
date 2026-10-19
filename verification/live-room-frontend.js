@@ -109,6 +109,10 @@ const OK_STRIPE = [['const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(proce
     ok(/watchOnly \? navigate\('\/profile-setup'\) : setMaxOpen/.test(viewer) && /watchOnly \? navigate\('\/profile-setup'\) : setChatOpen/.test(viewer),
       'Pre-bid and Chat send them to finish the profile too (the server refuses both anyway)');
     ok(/<LiveVideo auctionId=\{auction\.id\}/.test(viewer) && !/watchOnly &&[^\n]*<LiveVideo/.test(viewer), 'the video plays for them like for a guest');
+    const app = read('App.jsx');
+    ok(/<Route path="\/auction\/:id" element=\{<AuctionRoomGate \/>\} \/>/.test(app) && /mode === 'standard'\) return <ProfileGate><StandardAuctionRoom /.test(gate)
+      && !/ProfileGate[^\n]*LiveViewerRoom|LiveViewerRoom[^\n]*ProfileGate/.test(gate),
+      'the page in front: only a timed auction\'s room is behind ProfileGate (it used to stop a pending account before the live room loaded)');
   } catch (e) {
     console.log('ERR', e); K.state.fails++;
   } finally {
