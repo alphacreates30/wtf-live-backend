@@ -364,6 +364,16 @@ alone, like the phase 1 live suites.
 | `preview-sample.js`, `lot-page-frontend.js` | Extended: a sample live show on air (1/3/5 open) and one in Coming next, "Sample:" titles, no uuid; the live show's share card ("Live now" / when it starts), timed cards unchanged. |
 | `live-before-ze.js` | Extended: before ze the profile page's live alerts are "not available", PUT 503, phone alerts 503 push_off, an "unsubscribe from all" link still works. |
 
+
+**Live shows (G1) phase 8: load** (2026-10-19). Migration zf (ties).
+
+| Suite | Proves |
+|---|---|
+| `live-load.js` | New. One local server, 56 clients in one show (45 guests, 5 logged-in viewers, 5 bidders, the host). One bid at a time (30 bids) and five taps at once (10 rounds): bid -> bid_ok, bid -> new_bid at every client, Sold tap -> lot_closed, clock -> lot_closed (from ends_at by the database clock); no client misses a new_bid or the hammer; at most one tap told "winning" per round; the server's own time (patched in for the run): a bid's lookups + engine, and emitPerViewer (fetchSockets and the emit loop over 56 sockets). Targets: p95 600 / 600 / 600 / 1000 ms. |
+| `bid-ties.js` | New (migration zf; exits 2 without it, after reproducing the bug). Timed: A $5, B $10, A raises to $10 -> B keeps the lead; the same max from two buyers -> the first leads; the leader's own raise keeps the lead against a challenger who reaches it later. Live: pre-bids through the route (A $10, B $20, A raises to $20 -> the lot opens with B); five taps at once, 8 rounds: at most one told "winning", and it is the leader the room hears. |
+| `live-bid-engine.js` | The restart check waits for the lot sold with its order (it slept a fixed 15 s and failed twice in full runs) and judges by the database clock: the hammer within 5 s of ends_at or the new server's boot. |
+| `live-hammer-charge.js` | The recovery check waits for both orders paid (it slept a fixed 4 s). |
+
 ## Not covered
 
 - **Before live shows are switched on (parked 2026-09-27).** The opening-price leak is fixed (live phase 1,

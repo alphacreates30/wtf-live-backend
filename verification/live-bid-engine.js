@@ -110,7 +110,9 @@ const near = (a, b, tol) => Math.abs(a - b) <= tol;
     const closed = await anon.waitFor('lot_closed', p => p.item_id === L1, 30000, from);
     row = await K.lot(L1);
     const won = await cc.waitFor('lot_closed', p => p.item_id === L1, 2000, fromC);
-    let orders = (await s.from('orders').select('*').eq('item_id', L1)).data;
+    // The room hears the hammer before the order is written (phase 8): wait for the order.
+    let orders = [];
+    for (let i = 0; i < 40 && !orders.length; i++) { orders = (await s.from('orders').select('*').eq('item_id', L1)).data; if (!orders.length) await sleep(250); }
     ok(closed && closed.payload.status === 'sold' && closed.payload.amount === 60 && closed.payload.you_won === false && won && won.payload.you_won === true,
       `room: sold $${closed && closed.payload.amount}; only C hears "you won"`);
     ok(row.status === 'sold' && orders.length === 1 && orders[0].buyer_username === C.username && orders[0].hammer_cents === 6000 && orders[0].premium_cents === 0 && orders[0].total_cents === 6000,
@@ -244,7 +246,9 @@ const near = (a, b, tol) => Math.abs(a - b) <= tol;
     };
     const oldF = await fenceRun('old', 3613, require('./guard').sourceAt(OLD_COMMIT, BE));
     ok(oldF.live === 'unsold' && oldF.timed === 'unsold', `OLD ${OLD_COMMIT}: the timed job closed the live lot ('${oldF.live}')  <- TWO CLOSERS`);
-    const newF = await fenceRun('new', 3614, src);
+    // The live hammer's timers are off here as on the old commit (setInterval stubbed; since phase 8 also its one-shot
+    // close timer), so only the timed job could close the live lot.
+    const newF = await fenceRun('new', 3614, src.replace('function armLiveClose(itemId, w) {', 'function armLiveClose(itemId, w) { return;'));
     ok(newF.live === 'open' && newF.timed === 'unsold', `NEW: live lot left '${newF.live}' for the live hammer; the timed control lot was closed ('${newF.timed}')`);
   } catch (e) {
     console.log('ERR', e); K.state.fails++;

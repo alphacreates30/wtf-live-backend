@@ -2272,17 +2272,24 @@ async function syncDbClock({ force = false } = {}) {
   dbOffsetAt = t1;
 }
 
+// The 1-second tick sends the clock to the room; a one-shot timer at ends_at (re-armed when a late bid moves it)
+// closes the lot on time instead of up to a second late (live phase 8, the load test).
+function armLiveClose(itemId, w) {
+  clearTimeout(w.at);
+  w.at = setTimeout(() => liveTick(itemId).catch(e => console.error('live tick failed:', itemId, e.message)), Math.max(0, w.endsAt - dbNow()) + 15);
+}
 function watchLiveLot(lot) {
   const endsAt = Date.parse(lot.ends_at);
   const w = liveLots.get(lot.id);
-  if (w) { w.endsAt = endsAt; return; }
+  if (w) { if (w.endsAt !== endsAt) { w.endsAt = endsAt; armLiveClose(lot.id, w); } return; }
   const entry = { auctionId: lot.auction_id, endsAt, closing: false };
   entry.interval = setInterval(() => liveTick(lot.id).catch(e => console.error('live tick failed:', lot.id, e.message)), 1000);
   liveLots.set(lot.id, entry);
+  armLiveClose(lot.id, entry);
 }
 function unwatchLiveLot(itemId) {
   const w = liveLots.get(itemId);
-  if (w) { clearInterval(w.interval); liveLots.delete(itemId); }
+  if (w) { clearInterval(w.interval); clearTimeout(w.at); liveLots.delete(itemId); }
 }
 // Every clock message carries ends_at and the server's time, so a client counts down on its own between ticks.
 // server_now is the database's time, the one ends_at is measured against: time left = ends_at - server_now.
@@ -2308,23 +2315,25 @@ async function liveTick(itemId) {
   }
 }
 
-// The hammer (brief §1.4): the database closes the lot (open -> sold/unsold, the claim), then the order is created
-// (idempotent per lot), then the room is told. The CHARGE runs off this path, so the host moves on at once and a
-// slow or declined card never holds up the show. No reserve and no premium in live shows.
+// The hammer (brief §1.4): the database closes the lot (open -> sold/unsold, the claim, which is the record), then
+// the room is told at once (live phase 8, the load test: telling it after the order and the box cost viewers up to
+// 1.2 s of a frozen "0"), then the order is created (idempotent per lot) and joins the buyer's box. If that fails,
+// recoverLiveLots creates it (every 30 s and at boot: "a sold live lot with no order"). The CHARGE runs off this
+// path, so the host moves on at once and a slow or declined card never holds up the show. No reserve and no premium.
 async function closeLiveLot(itemId, force) {
   const { data: lot, error } = await supabase.rpc('close_live_lot', { p_item_id: itemId, p_force: !!force });
   if (error) { console.error('close_live_lot failed:', itemId, error.code, error.message); return null; }
   if (!lot || !lot.id) return null;
   unwatchLiveLot(itemId);
   const sold = lot.status === 'sold';
-  const orderId = sold ? await createOrderOnWin(lot.auction_id, lot.leading_bidder, lot.current_bid, lot.id) : null;
-  if (orderId) await joinShowBox(orderId);
   // Live shows show the winner's username ("Sold to @name, $60"; phase 2), never a max; each viewer also hears
   // whether THEY won.
   await emitPerViewer(lot.auction_id, 'lot_closed', u => ({
     auctionId: lot.auction_id, item_id: lot.id, lot_number: lot.position + 1, status: lot.status, amount: sold ? Number(lot.current_bid) : null,
     username: sold ? lot.leading_bidder : null, you_won: sold && !!u && u === lot.leading_bidder,
   }));
+  const orderId = sold ? await createOrderOnWin(lot.auction_id, lot.leading_bidder, lot.current_bid, lot.id) : null;
+  if (orderId) await joinShowBox(orderId);
   if (orderId) chargeLiveOrder(orderId);   // not awaited (never throws)
   else if (sold) console.error(`Live lot ${itemId} sold but its order was not created yet; recoverLiveLots retries it`);
   console.log(`Live lot ${itemId} closed: ${lot.status}${sold ? ` at $${lot.current_bid}` : ''}`);
@@ -3039,24 +3048,31 @@ io.on('connection', (socket) => {
     if (!LIVE_ENABLED) return fail(LIVE_OFF, 'live_off');
     const user = await verifySocketToken(token);
     if (!user) return fail('You must be logged in to bid', 'login_required');
-    const { data: auction } = await supabase.from('auctions').select('id, mode, status, host_username, on_air_at, ended_at').eq('id', auctionId).maybeSingle();
+    // Every lookup a bid needs, at once (live phase 8, the load test: one after another they were 6 database round
+    // trips before the engine, ~400 ms from a slow link). They are still judged in the same order below, so every
+    // refusal and its code is unchanged.
+    let q = supabase.from('auction_items').select('id, auction_id, status, current_bid, starting_bid, bid_count, leading_bidder, ends_at');
+    q = itemId ? q.eq('id', canonicalUuid(itemId) || '00000000-0000-0000-0000-000000000000') : q.eq('auction_id', auctionId).eq('status', 'open');
+    const [{ data: auction }, profileRefusal, mod, termsOk, unpaid, { data: lots }] = await Promise.all([
+      supabase.from('auctions').select('id, mode, status, host_username, on_air_at, ended_at').eq('id', auctionId).maybeSingle(),
+      biddingRefusal(user),
+      showModeration(auctionId, user.id),
+      hasAcceptedTerms(user.id, auctionId),
+      liveUnpaid(user.id, auctionId),
+      q.limit(1),
+    ]);
     if (!auction || auction.mode !== 'live') return fail('Bidding on this auction happens lot by lot.');
     // A rehearsal (a draft on air) only for the accounts that came in through its private link.
     if (auction.status === 'draft' && socket.data.rehearsal !== auctionId) return fail('Item not found', 'not_found');
-    const refusal = await biddingRefusal(user, auction);
+    const refusal = hostCannotBid(user, auction) ? HOST_CANNOT_BID : profileRefusal;
     if (refusal) return fail(refusal.error, refusal.code);
-    const mod = await showModeration(auctionId, user.id);
     if (mod.error) return fail('Could not check your account. Try again in a moment.');
     if (mod.block) return fail(SHOW_BLOCKED, 'show_blocked');
     if (!showOnAir(auction)) return fail('This show is not on air', 'not_on_air');
-    if (!(await hasAcceptedTerms(user.id, auctionId))) return fail('You must accept the auction terms before bidding', 'terms_required');
-    if (await liveUnpaid(user.id, auctionId)) return fail(LIVE_UNPAID, 'payment_failed');
+    if (!termsOk) return fail('You must accept the auction terms before bidding', 'terms_required');
+    if (unpaid) return fail(LIVE_UNPAID, 'payment_failed');
     const max = parseMaxBid(max_amount ?? amount);
-    if (max == null) return fail(`Max bid must be between $1 and $${MAX_BID_DOLLARS.toLocaleString('en-US')}`, 'bad_amount');
-
-    let q = supabase.from('auction_items').select('id, auction_id, status, current_bid, starting_bid, bid_count, leading_bidder, ends_at');
-    q = itemId ? q.eq('id', canonicalUuid(itemId) || '00000000-0000-0000-0000-000000000000') : q.eq('auction_id', auctionId).eq('status', 'open');
-    const { data: lots } = await q.limit(1);
+    if (max == null) return fail(`Max bid must be between $1 and ${MAX_BID_DOLLARS.toLocaleString('en-US')}`, 'bad_amount');
     const lot = lots?.[0];
     if (!lot || !lotBelongsToAuction(lot, auctionId)) return fail('Item not found', 'not_found');
     if (lot.status !== 'open') return fail('No lot is open for bidding right now', 'lot_not_open');

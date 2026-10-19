@@ -354,10 +354,19 @@ this show". Before migration ze these answer `host_error` code `not_available`.
 
 How a lot sells: the opening price applies the pre-bids by the proxy rule and **never** shows the top max (one
 pre-bid: the opening minimum, $1 or the starting bid; two or more: `least(top, second + increment)`, the top pre-bidder
-leading). A bid with 5 s or less left adds 5 s (Sudden death: nothing). At 0 the database closes the lot
-(`close_live_lot`, one closer only), the order is created (one per lot), `lot_closed` goes out, and **then** the card
-is charged in the background (`chargeOrder`, with the lot's G2 discount): the hammer price, no premium. No per-lot
-win email; a declined card emails the buyer and the admin at once.
+leading). A bid with 5 s or less left adds 5 s (Sudden death: nothing). At 0 (a timer set for ends_at, besides the
+1-second tick) the database closes the lot (`close_live_lot`, one closer only), `lot_closed` goes out at once, then
+the order is created (one per lot; if that fails, the 30-second job creates it) and **then** the card is charged in the
+background (`chargeOrder`, with the lot's G2 discount): the hammer price, no premium. No per-lot win email; a declined
+card emails the buyer and the admin at once.
+
+**Ties (every auction, migration zf):** at an equal max, the buyer who reached that max first leads. A raised max takes
+the time it was raised (a database trigger on `pre_bids`), so an old bidder raising to the leader's max later doesn't
+take the lead; of two taps at the same amount, the one the engine processes first leads and is the only one told
+`winning`.
+
+**Speed (phase 8, `verification/live-load.js`, 56 clients, from a slow link to the database):** a bid reaches every
+client in about 160 ms (its lookups run at once); "sold" about 215 ms after ends_at and 300 ms after the host's Sold.
 
 After a decline (phase 1b, migration `2026-10-16zb`): the buyer can't bid or pre-bid in that show (`payment_failed`)
 until they save a card that passes the $1 check (`POST /save-payment-method`); that charges their declined live lots
