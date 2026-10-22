@@ -77,8 +77,10 @@ const OK_STRIPE = [['const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(proce
     const premium = viewer.match(/premium/gi) || [];
     const noPremiumPhrases = viewer.match(/[Nn]o buyer's premium/g) || [];
     ok(!/buyers_premium_pct|withPremium|premiumCents/.test(viewer) && premium.length === noPremiumPhrases.length, `no premium in the live room: every mention says "no buyer's premium" (${noPremiumPhrases.length})`);
-    ok(/Everything you win in this show ships together in one box\. Postage is charged once, after packing\./.test(viewer) && /showShipLine && <p className="vr-ship">/.test(viewer),
-      'the shipping line, before the first bid');
+    ok(/We combine your wins from this show into as few boxes as possible\. Postage is charged at cost after packing\./.test(viewer) && /showShipLine && <p className="vr-ship">\{shipLine\}/.test(viewer)
+      && /fulfillment_mode === 'pickup'\) return `Pickup only for this show/.test(viewer) && /fulfillment_mode === 'both'\) return `Ship or pick up/.test(viewer) && !/pickup_address/.test(viewer)
+      && /HOW_LIVE = '\/how-it-works#live-shows'/.test(viewer) && />How live shows work<\/Link>/.test(viewer),
+      'the shipping line before the first bid: as few boxes as possible, or the show\'s pickup (town only, never the street); "How live shows work" link');
     ok(/You're winning/.test(viewer) && /You've been outbid/.test(viewer) && /state-outbid\.svg/.test(viewer) && /You won lot/.test(viewer) && /state-won\.svg/.test(viewer) && /Update card/.test(viewer),
       'banners: you\'re winning, outbid (the mark), you won (the Glint), card declined with Update card');
     ok(/prefers-reduced-motion: reduce\)'\)\.matches/.test(viewer) && /!still && <div className="vr-confetti"/.test(viewer) && /@media \(prefers-reduced-motion: reduce\)\s*\{\s*\.vr-confetti \{ display: none; \}/.test(css),

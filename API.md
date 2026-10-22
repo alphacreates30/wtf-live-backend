@@ -372,9 +372,10 @@ After a decline (phase 1b, migration `2026-10-16zb`): the buyer can't bid or pre
 until they save a card that passes the $1 check (`POST /save-payment-method`); that charges their declined live lots
 at once. **Re-run now** (`rerun_lot`): the host can put a declined lot straight back in the show instead of waiting;
 the buyer is told in the room and by email ("Lot N was offered again"), that order is never charged, and the buyer
-still can't bid in the show until they save a new card. **One box per buyer per show:** every lot a buyer wins in a show (not pickup) joins one `orders.group_id`,
-so the label and postage go through the existing group flow once. **After the show:** one "Your wins from …" email
-per buyer (lots, declined ones marked, the one-box or pickup note), sent once every charge has settled
+still can't bid in the show until they save a new card. **One box group per buyer per show:** every lot a buyer wins in a show (not pickup) joins one `orders.group_id`,
+so the packing list keeps them together; the host ships them in as few boxes as possible, each box one label and one
+postage charge (`/admin/orders/shipping-quote` + `/admin/orders/label` with that box's `order_ids`). **After the show:** one "Your wins from …" email
+per buyer (lots, declined ones marked, the "as few boxes as possible" or pickup note), sent once every charge has settled
 (`auctions.live_summary_sent_at`). **Pre-bid expiry:** a live show with no `on_air_at` 24 h after its `starts_at`
 releases its pre-bids (deleted; one email per bidder; a `notifications` row of kind `prebid_released` is the record;
 once per show, `prebids_released_at`); `POST …/prebid` on it is then 400 `{ code: "prebids_released" }`.
@@ -407,8 +408,9 @@ Admin (403 for anyone else):
   without_photo }, lineup: [ { id, lot_number, title, starting_bid, image_url, clock_seconds, sudden_death, pre_bid_count } ],
   buyers_in_room: [ { username, approved, card, card_verified, terms } ] }`: the pre-show checklist.
 - `GET /admin/live/:id/packing` → `{ show, winners: [ { order_id, lot_number, title, amount_cents, payment_status, buyer,
-  fulfillment } ], boxes: [ { buyer, fulfillment: "shipping" | "pickup", group_id, lots: [ … ] } ] }`: the winner list and
-  the packing list, one box per buyer (cancelled orders left out).
+  fulfillment, label_made } ], boxes: [ { buyer, fulfillment: "shipping" | "pickup", group_id, still_to_ship, lots: [ … ] } ] }`:
+  the winner list and the packing list by buyer (cancelled orders left out). `label_made`: the lot is already in a
+  labelled box; `still_to_ship`: the buyer's shipping lots not yet in one.
 - `GET /admin/live/:id/unpaid` → `{ show, can_rerun (on air), can_reoffer (the show has ended), lots: [ { id (order), item_id, item_title,
   buyer_username, buyer_user_id, total_cents, payment_error, created_at } ] }`: lots whose card was declined and not fixed.
 - `POST /admin/live/orders/:orderId/reoffer { auction_id, next? }` → `{ item_id, auction_id, lot_number }`. Only an
@@ -535,8 +537,8 @@ charging the buyer (`buyer_paid_cents: 0`, `orders.shipping_promo`); the quote s
 (migration za): at most one points reward per lot, or the show's % code (an entered code covers every lot the buyer
 wins in that show), the bigger saving; never below $0 and never 1–49c left. `orders.discount_kind / discount_cents`
 show it and `orders.total_cents` is what is charged; a $0 lot is paid with `payment_intent_id = 'no_charge_discount'`.
-Points are earned per paid lot (`chargeOrder`). The live "one box per show" postage goes through the same label
-route, so the shipping promos already apply.
+Points are earned per paid lot (`chargeOrder`). A live buyer's boxes go through the same label route, so the
+shipping promos apply to every box (the bundle bonus counts the buyer's lots in the event, not the lots in the box).
 
 Admin (403 for anyone else):
 - `GET /admin/points-settings` → `{ admin_enabled, env_enabled, migrated, enabled, points_per_dollar,

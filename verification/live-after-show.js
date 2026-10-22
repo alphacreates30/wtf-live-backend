@@ -6,8 +6,9 @@
 //              on the lot; their pre-bid on a later lot doesn't count; a new verified card charges the lot at once
 //              and clears both alerts
 //   end        End is refused while a lot is open; Pass closes it with no sale
-//   one box    every lot a buyer wins in a show is in one order group
-//   summary    after the show, ONE "your show wins" email per buyer (lots, declined ones marked, one box); never twice
+//   box group  every lot a buyer wins in a show is in one order group
+//   summary    after the show, ONE "your show wins" email per buyer (lots, declined ones marked, as few boxes as
+//              possible); never twice
 //   re-run     "Re-run now" while the show is on air (host only, only a declined lot): back in this show's lineup,
 //              next or at the end (next_item takes it in that order; new lot numbers); the order is cancelled, points
 //              back; the buyer is told in the room and by email, the host's alert clears, the room sees only the
@@ -135,7 +136,7 @@ const charges = () => lines(CALLS).filter(c => !c.capture);   // not the $1 card
     await sell(L5, 'F', 9);
     await sell(L6, 'P', 40);
     const [o2, o3, o4, o5, o6] = [await settle(L2), await settle(L3), await settle(L4), await settle(L5), await settle(L6)];
-    ok(o2.group_id && o2.group_id === o4.group_id && o3.group_id && o3.group_id !== o2.group_id, `one box per buyer per show: W's two lots share a group; E's is its own`);
+    ok(o2.group_id && o2.group_id === o4.group_id && o3.group_id && o3.group_id !== o2.group_id, `one box group per buyer per show: W's two lots share a group; E's is its own`);
     ok(o3.payment_status === 'failed' && o3.discount_kind === 'points_reward' && o3.total_cents === 1500 && o5.payment_status === 'failed', "E's $40 lot: $25 reward decided, card declined; F declined too");
 
     console.log('\n== A blocked buyer\'s pre-bid; End while a lot is open; Pass ==');
@@ -237,8 +238,8 @@ const charges = () => lines(CALLS).filter(c => !c.capture);   // not the $1 card
     for (let i = 0; i < 40 && wins() < 5; i++) await sleep(250);   // sent one after another
     const wMail = mailsTo(W).filter(m => /Your wins from/.test(m.subject));
     const eMail = mailsTo(E).filter(m => /Your wins from/.test(m.subject)), dMail = mailsTo(D).filter(m => /Your wins from/.test(m.subject));
-    ok(wMail.length === 1 && /2 lots/.test(wMail[0].html) && /ships together in one box/.test(wMail[0].html) && /\$22\.00/.test(wMail[0].html) && !/declined/i.test(wMail[0].html),
-      "W: one email, 2 lots, $22.00 charged, one box");
+    ok(wMail.length === 1 && /2 lots/.test(wMail[0].html) && /combine everything you won into as few boxes as possible/.test(wMail[0].html) && /tracking by email for each box/.test(wMail[0].html) && /\$22\.00/.test(wMail[0].html) && !/declined/i.test(wMail[0].html),
+      "W: one email, 2 lots, $22.00 charged, as few boxes as possible (tracking for each box)");
     ok(eMail.length === 1 && /Card declined/.test(eMail[0].html) && /Points reward/.test(eMail[0].html), 'E: the lot marked "Card declined", the reward line shown');
     ok(dMail.length === 1 && /Paid/.test(dMail[0].html) && !mailsTo(D).some(m => /You won it/.test(m.subject)), 'D: Paid, and no per-lot win email');
     r = await call(srv.url, 'POST', `/__test/live-summaries/${show.id}`);

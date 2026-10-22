@@ -34,7 +34,7 @@ function refuse(text) {
 
 // The host's one-tap pinned replies built in (placeholders for Cowork). The host can add their own in the room.
 const PINNED_REPLIES = [
-  'Everything you win in this show ships together in one box.',
+  'We combine your wins into as few boxes as possible.',
   'Bids are binding: your card is charged when the lot sells.',
   "No buyer's premium in live shows.",
 ];

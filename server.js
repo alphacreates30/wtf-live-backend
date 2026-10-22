@@ -387,15 +387,22 @@ function outbidEmailHtml(item) {
   `);
 }
 
-function shippedEmailHtml(order) {
+// One email per box (one label, one tracking number): every lot in it, and that box's own postage. A buyer whose
+// wins went in two boxes gets two of these, each with its own postage and tracking.
+function shippedEmailHtml(orders) {
+  const order = orders[0];
   const trackingCell = order.tracking_url
     ? `<a href="${escapeHtml(order.tracking_url)}" style="color:#0645ad;">${escapeHtml(order.tracking_number || 'Track shipment')}</a>`
     : escapeHtml(order.tracking_number || 'N/A');
   const postageRow = order.shipping_cost_cents != null
-    ? `<tr><td style="padding:4px 0;color:#555;">Postage charged</td><td style="padding:4px 0;text-align:right;">${formatMoney(order.shipping_cost_cents)}</td></tr>`
+    ? `<tr><td style="padding:4px 0;color:#555;">Postage for this box</td><td style="padding:4px 0;text-align:right;">${order.shipping_cost_cents === 0 && order.shipping_promo ? 'Free' : formatMoney(order.shipping_cost_cents)}</td></tr>`
     : '';
-  return emailHtml('Your item has shipped', `
-    <p><strong>${escapeHtml(order.item_title)}</strong> is on its way.</p>
+  const lots = orders.length === 1
+    ? `<p><strong>${escapeHtml(order.item_title)}</strong> is on its way.</p>`
+    : `<p>A box with <strong>${orders.length} of your lots</strong> is on its way:</p>
+    <ul style="margin:8px 0 0;padding-left:20px;">${orders.map(o => `<li>${escapeHtml(o.item_title)}</li>`).join('')}</ul>`;
+  return emailHtml(orders.length === 1 ? 'Your item has shipped' : 'Your box has shipped', `
+    ${lots}
     <table style="width:100%;border-collapse:collapse;margin:16px 0;">
       <tr><td style="padding:4px 0;color:#555;">Carrier</td><td style="padding:4px 0;text-align:right;">${escapeHtml(order.tracking_carrier || 'N/A')}</td></tr>
       <tr><td style="padding:4px 0;color:#555;">Tracking number</td><td style="padding:4px 0;text-align:right;">${trackingCell}</td></tr>
@@ -645,31 +652,32 @@ async function notifyOutbidIfNeeded(itemId, previousLeader) {
   }
 }
 
-// Idempotent via shipped_email_sent_at - safe to call once per order row
-// matched by the Shippo webhook even if Shippo redelivers the same event.
-async function notifyShipped(orderId) {
+// One email for the box: orderIds are the order rows the Shippo webhook matched by one tracking number (one label).
+// Idempotent via shipped_email_sent_at - each row is claimed once, so a redelivered event sends nothing, and only
+// the rows claimed now are listed.
+async function notifyShipped(orderIds) {
   try {
-    const { data: order, error } = await supabase
+    const { data: orders, error } = await supabase
       .from('orders')
       .update({ shipped_email_sent_at: new Date().toISOString() })
-      .eq('id', orderId)
+      .in('id', orderIds)
       .is('shipped_email_sent_at', null)
-      .select('*')
-      .single();
-    if (error || !order) return;
+      .select('*');
+    if (error || !orders?.length) return;
+    orders.sort((a, b) => String(a.item_title).localeCompare(String(b.item_title), 'en', { numeric: true }));
 
-    const email = await getBuyerEmail(order.buyer_user_id);
+    const email = await getBuyerEmail(orders[0].buyer_user_id);
     if (!email) return;
 
     await sendEmail({
       from: BUYER_FROM,
       to: email,
-      subject: `Your item has shipped: "${order.item_title}"`,
-      html: shippedEmailHtml(order),
+      subject: orders.length === 1 ? `Your item has shipped: "${orders[0].item_title}"` : `Your box of ${orders.length} lots has shipped`,
+      html: shippedEmailHtml(orders),
       kind: 'shipped',
     });
   } catch (e) {
-    console.error('notifyShipped error:', orderId, e.message);
+    console.error('notifyShipped error:', orderIds.join(','), e.message);
   }
 }
 
@@ -1721,7 +1729,8 @@ app.get('/auction/:id', optionalAuth, async (req, res) => {
 const FULFILLMENT_MODES = ['shipping', 'pickup', 'both'];
 // Bump when TERMS_OF_SALE.md changes materially - existing acceptance rows
 // keep the version they actually agreed to, so this never rewrites history.
-const TERMS_VERSION = '1';
+// '2' (Oct 22, 2026): section 12 (live shows) and section 5's postage per parcel.
+const TERMS_VERSION = '2';
 
 app.patch('/auction/:id', requireAdmin, async (req, res) => {
   const { title, description, category, buyers_premium_pct, fulfillment_mode, pickup_address, pickup_town, pickup_starts_at, pickup_ends_at, clock_seconds, auto_pace, starts_at } = req.body;
@@ -2489,8 +2498,9 @@ async function reofferLiveOrder(orderId, targetId, next = false) {
   return out;
 }
 
-// One box per buyer per show (brief §1.6): every lot a buyer wins in a show joins one order group, so packing, the
-// label and the postage charge happen once, through the existing group/label flow. Pickup wins aren't boxed.
+// One box group per buyer per show (brief §1.6): every lot a buyer wins in a show joins one order group, so the
+// packing list keeps them together. The host may still split a big haul into several boxes: each box is one
+// label and one postage charge for the lots picked (MULTI_BOX_AND_WORDING_BRIEF §1). Pickup wins aren't boxed.
 async function joinShowBox(orderId) {
   try {
     const { data: o } = await supabase.from('orders').select('id, auction_id, buyer_user_id, fulfillment_choice, group_id').eq('id', orderId).maybeSingle();
@@ -2552,7 +2562,7 @@ function liveSummaryEmailHtml(show, orders, pickup) {
       <tr><td style="padding:8px 0 0;font-weight:bold;border-top:1px solid #ddd;">Charged to your card</td><td></td><td style="padding:8px 0 0;text-align:right;font-weight:bold;border-top:1px solid #ddd;">${formatMoney(paid.reduce((t, o) => t + (o.total_cents || 0), 0))}</td></tr>
     </table>
     ${declined ? '<p style="margin:16px 0 0;"><strong>Your card was declined for the lots marked above.</strong> Update your card on your profile page and we will charge it straight away. If it isn\'t fixed, those lots may be offered again.</p>' : ''}
-    ${pickup ? pickupBlockHtml(pickup, n > 1) : `<p style="margin:16px 0 0;">Everything you won in this show ships together in one box. Postage is charged once, after it is packed, and you'll get tracking by email.</p>`}
+    ${pickup ? pickupBlockHtml(pickup, n > 1) : `<p style="margin:16px 0 0;">We'll combine everything you won into as few boxes as possible. Postage is charged at cost after packing, and you'll get tracking by email for each box.</p>`}
   `);
 }
 
@@ -2638,7 +2648,7 @@ async function recoverLiveLots() {
       const o = byItem.get(lot.id);
       if (!o) {
         const id = await createOrderOnWin(lot.auction_id, lot.leading_bidder, lot.current_bid, lot.id);
-        if (id) { console.error(`Recovered live lot ${lot.id}: order ${id} created after a missed hammer`); await chargeLiveOrder(id); }
+        if (id) { console.error(`Recovered live lot ${lot.id}: order ${id} created after a missed hammer`); await joinShowBox(id); await chargeLiveOrder(id); }
       } else if ((o.payment_status || 'unpaid') === 'unpaid' && !o.invoice_id && !o.payment_intent_id && Date.parse(o.created_at) < settleBefore) {
         console.error(`Recovered live lot ${lot.id}: order ${o.id} was never charged`);
         await chargeLiveOrder(o.id);
@@ -4379,6 +4389,10 @@ async function loadShippableOrders(order_ids) {
   if (pickupOrders.length) {
     return { error: `Cannot ship - order(s) ${pickupOrders.map(x => x.id).join(', ')} are set to local pickup`, status: 400 };
   }
+  // One box goes to one buyer. chargeShipping refuses a mixed box too, but a free-postage box (G2) never reaches it.
+  if (new Set(orders.map(x => x.buyer_user_id)).size > 1) {
+    return { error: 'Cannot ship - one box can only hold one buyer\'s lots', status: 400 };
+  }
   return { orders };
 }
 
@@ -4392,8 +4406,11 @@ async function shippingPromoForOrders(orders) {
     const auctionIds = [...new Set(orders.map(o => o.auction_id))];
     const promos = await rewards.promosFor(auctionIds);
     if (!promos.length) return null;
+    // Every lot the buyer won in the event, in any box (a split haul's second box still counts the first's lots);
+    // a lot cancelled and offered again (live, card never fixed) is no longer theirs.
     const { data: won } = await supabase.from('orders').select('auction_id')
-      .eq('buyer_user_id', orders[0].buyer_user_id).in('auction_id', auctionIds);
+      .eq('buyer_user_id', orders[0].buyer_user_id).in('auction_id', auctionIds)
+      .or('payment_status.is.null,payment_status.neq.cancelled');
     const lotsWonBy = {};
     for (const o of won || []) lotsWonBy[o.auction_id] = (lotsWonBy[o.auction_id] || 0) + 1;
     return rewardsLib.shippingPromoFor(orders, promos, lotsWonBy);
@@ -4750,8 +4767,9 @@ app.get('/admin/live/:id/checklist', requireAdmin, async (req, res) => {
   }
 });
 
-// After the show (host): the winner list (every sold lot) and the packing list, one box per buyer (the phase 1b
-// order groups; pickup buyers get one entry each, not boxed). Lot numbers, titles, usernames, ship or pickup.
+// After the show (host): the winner list (every sold lot) and the packing list by buyer (the phase 1b order groups;
+// pickup buyers get one entry each, not boxed). Lot numbers, titles, usernames, ship or pickup. A big haul can go in
+// several boxes: label_made marks the lots already in a labelled box, still_to_ship counts the rest.
 app.get('/admin/live/:id/packing', requireAdmin, async (req, res) => {
   const { data: a, error } = await supabase.from('auctions').select('*').eq('id', req.params.id).maybeSingle();   // '*': ended_at (zd)
   if (error) return dbFailure(req, res, error);
@@ -4761,7 +4779,7 @@ app.get('/admin/live/:id/packing', requireAdmin, async (req, res) => {
   if (oErr) return dbFailure(req, res, oErr);
   const { data: lots } = (orders || []).length ? await supabase.from('auction_items').select('id, position, title').in('id', orders.map(o => o.item_id)) : { data: [] };
   const num = new Map((lots || []).map(l => [l.id, l.position + 1])), title = new Map((lots || []).map(l => [l.id, l.title]));
-  const row = o => ({ order_id: o.id, lot_number: num.get(o.item_id) ?? null, title: title.get(o.item_id) ?? o.item_title, amount_cents: o.hammer_cents ?? o.total_cents ?? 0, payment_status: o.payment_status || 'unpaid' });
+  const row = o => ({ order_id: o.id, lot_number: num.get(o.item_id) ?? null, title: title.get(o.item_id) ?? o.item_title, amount_cents: o.hammer_cents ?? o.total_cents ?? 0, payment_status: o.payment_status || 'unpaid', label_made: !!o.status && o.status !== 'pending' });
   const boxes = new Map();
   for (const o of orders || []) {
     const pickup = o.fulfillment_choice === 'pickup';
@@ -4769,7 +4787,8 @@ app.get('/admin/live/:id/packing', requireAdmin, async (req, res) => {
     if (!boxes.has(key)) boxes.set(key, { buyer: o.buyer_username, fulfillment: pickup ? 'pickup' : 'shipping', group_id: pickup ? null : o.group_id || null, lots: [] });
     boxes.get(key).lots.push(row(o));
   }
-  const list = [...boxes.values()].map(b => ({ ...b, lots: b.lots.sort((x, y) => (x.lot_number ?? 0) - (y.lot_number ?? 0)) }))
+  const list = [...boxes.values()].map(b => ({ ...b, lots: b.lots.sort((x, y) => (x.lot_number ?? 0) - (y.lot_number ?? 0)),
+    still_to_ship: b.fulfillment === 'shipping' ? b.lots.filter(l => !l.label_made).length : 0 }))
     .sort((x, y) => x.buyer.localeCompare(y.buyer) || x.fulfillment.localeCompare(y.fulfillment));
   res.json({
     show: { id: a.id, title: a.title, status: a.status, on_air_at: a.on_air_at || null, ended_at: a.ended_at || null },
@@ -4824,10 +4843,9 @@ app.post('/webhook/shippo', async (req, res) => {
           .from('orders').update({ status }).eq('tracking_number', tracking_number)
           .select('id');
         console.log('- Tracking update: ' + tracking_number + ' -> ' + status);
+        // One tracking number = one box: one email listing its lots (a buyer's second box has its own number).
         if (status === 'shipped' && updatedOrders?.length) {
-          for (const o of updatedOrders) {
-            notifyShipped(o.id).catch(e => console.error('notifyShipped error:', e.message));
-          }
+          notifyShipped(updatedOrders.map(o => o.id)).catch(e => console.error('notifyShipped error:', e.message));
         }
       }
     }

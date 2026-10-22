@@ -374,6 +374,13 @@ alone, like the phase 1 live suites.
 | `live-bid-engine.js` | The restart check waits for the lot sold with its order (it slept a fixed 15 s and failed twice in full runs) and judges by the database clock: the hammer within 5 s of ends_at or the new server's boot. |
 | `live-hammer-charge.js` | The recovery check waits for both orders paid (it slept a fixed 4 s). |
 
+**As few boxes as possible** (wtf-handoff `MULTI_BOX_AND_WORDING_BRIEF.md`, 2026-10-22). No migration (needs z).
+
+| Suite | Proves |
+|---|---|
+| `shipping-multi-box.js` | New. Shippo, Stripe and Resend stubbed in the server process. One buyer's 4 live wins split into two boxes: two quotes ($9.40, $6.15), two charges, two labels and tracking numbers; box 2 doesn't overwrite box 1's postage, label or payment; the order group stays together; the packing list counts the lots still to ship (4, 2, 0); a second label for box 1 refused; /my-orders shows each lot its own box. Shipped emails: one per box (lots, that box's postage and tracking), none again on a redelivered event. Bundle bonus: both boxes free (it counts the buyer's lots in the show, not the box's). Two buyers' lots in one box: quote and label 400, nothing bought (before: a free-postage box with another buyer's lot went through). A live show offering pickup (set per show): the show page has the town, never the street; the buyer must choose before bidding; the hammer order keeps the choice (pickup lots not boxed); the packing list lists pickup apart; no label for a pickup lot. |
+| `live-after-show.js`, `live-chat-moderation.js`, `live-host-events.js` | The "as few boxes as possible" wording (after-show email, pinned reply); the packing list's `still_to_ship`. |
+
 ## Not covered
 
 - **Before live shows are switched on (parked 2026-09-27).** The opening-price leak is fixed (live phase 1,

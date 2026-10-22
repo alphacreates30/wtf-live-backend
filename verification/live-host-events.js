@@ -14,7 +14,7 @@
 //   auto-end   on air, no host activity for 60 min, no lot open -> ended (a rehearsal: ended_at, still a draft); never
 //              while a lot is open; not before 60 min.
 //   screens    GET /auction/:id/show-state and /lineup (public: no ids, no maxes), /admin/live/:id/checklist (who is in
-//              the room and can bid) and /admin/live/:id/packing (winner list, one box per buyer), admin only.
+//              the room and can bid) and /admin/live/:id/packing (winner list, packing list by buyer), admin only.
 require('./guard')(__filename);
 const K = require('./live-kit')('hostev');
 const { s, ok, die, ADMIN, mkUser, mkShow, terms, client, ask, call, sleep, boot, BE, dbNow } = K;
@@ -219,8 +219,8 @@ const show = async id => die(await s.from('auctions').select('*').eq('id', id).s
     const boxA = pk.j && pk.j.boxes.find(b => b.buyer === A.username), boxB = pk.j && pk.j.boxes.find(b => b.buyer === B.username);
     ok(pk.s === 200 && pk.j.winners.map(w => `${w.lot_number}:${w.buyer === A.username ? 'A' : 'B'}`).join() === '1:A,3:A,4:B',
       `winner list: ${pk.j && pk.j.winners.map(w => `lot ${w.lot_number} @${w.buyer === A.username ? 'A' : 'B'}`).join(', ')}`);
-    ok(pk.j.boxes.length === 2 && boxA && boxA.lots.map(l => l.lot_number).join() === '1,3' && boxA.fulfillment === 'shipping' && boxA.group_id && boxB && boxB.lots.length === 1,
-      `packing list: one box per buyer (A: lots ${boxA && boxA.lots.map(l => l.lot_number).join(' + ')}, B: lot ${boxB && boxB.lots[0].lot_number}), ship/pickup shown`);
+    ok(pk.j.boxes.length === 2 && boxA && boxA.lots.map(l => l.lot_number).join() === '1,3' && boxA.fulfillment === 'shipping' && boxA.group_id && boxA.still_to_ship === 2 && !boxA.lots.some(l => l.label_made) && boxB && boxB.lots.length === 1,
+      `packing list by buyer, lots still to ship counted (A: lots ${boxA && boxA.lots.map(l => l.lot_number).join(' + ')}, B: lot ${boxB && boxB.lots[0].lot_number}), ship/pickup shown`);
     for (const c of [host, ca, cb, anon]) c.close();
 
     console.log('\n== Auto-pace and Hold ==');

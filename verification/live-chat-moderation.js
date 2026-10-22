@@ -174,7 +174,7 @@ const heard = (c, from, text) => c.events.slice(from).some(e => e.event === 'new
     r = await say(H, reply, { pin: true });
     pinned = await anon.waitFor('chat_settings', p => p.pinned && p.pinned.text === reply, 3000, from);
     ok(r && r.event === 'new_chat' && pinned && pinned.payload.pinned.role === 'host', `a one-tap pinned reply ("${reply}"): posted by the host and pinned`);
-    ok(filter.PINNED_REPLIES.join(' | ') === "Everything you win in this show ships together in one box. | Bids are binding: your card is charged when the lot sells. | No buyer's premium in live shows.",
+    ok(filter.PINNED_REPLIES.join(' | ') === "We combine your wins into as few boxes as possible. | Bids are binding: your card is charged when the lot sells. | No buyer's premium in live shows.",
       'the three built-in replies (placeholder wording)');
     from = anon.mark();
     r = await say(ca, 'buyers cannot pin', { pin: true });
